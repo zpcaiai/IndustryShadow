@@ -1,0 +1,123 @@
+name: release-candidate
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  verify-executable-gates:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHONPATH: backend/src:services/simulator/src:services/collector/src:services/edge-gateway/src
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: "22.14.0"}
+      - name: Install audit and build dependencies
+        run: |
+          python -m pip install --require-hashes -r backend/requirements.lock
+          npm --prefix web ci --ignore-scripts --no-audit --no-fund
+          npm --prefix web exec -- playwright install --with-deps chromium
+      - name: Regression, lint, type and frontend gates
+        run: |
+          make lint typecheck test validate
+          npm --prefix web test
+          npm --prefix web run test:e2e
+          npm --prefix web run build
+      - name: Dependency vulnerability policy
+        run: |
+          make python-audit
+          npm --prefix web audit --audit-level=high
+      - name: Generate Python SBOM
+        run: |
+          mkdir -p artifacts
+          cyclonedx-py environment --output-format JSON --output-file artifacts/python-sbom.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: release-verification
+          path: |
+            artifacts/python-sbom.cdx.json
+            docs/evidence/batch-24
+          if-no-files-found: error
+
+  build-images:
+    needs: verify-executable-gates
+    runs-on: ubuntu-24.04
+    env:
+      REGISTRY: ghcr.io
+      GHCR_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Resolve lowercase candidate image names
+        run: |
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "BACKEND_IMAGE=$REGISTRY/$repository/backend" >> "$GITHUB_ENV"
+          echo "WEB_IMAGE=$REGISTRY/$repository/web" >> "$GITHUB_ENV"
+      - name: Authenticate to the candidate registry
+        run: printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
+      - name: Build and publish immutable backend candidate
+        id: backend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: deploy/compose/Dockerfile.backend
+          push: true
+          tags: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Build and publish immutable web candidate
+        id: web
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: deploy/compose/Dockerfile.web
+          push: true
+          tags: ${{ env.WEB_IMAGE }}:${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Write immutable candidate coordinates
+        env:
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          WEB_DIGEST: ${{ steps.web.outputs.digest }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path("artifacts/release-candidate.json")
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(
+              json.dumps(
+                  {
+                      "schema_version": 1,
+                      "source_revision": os.environ["GITHUB_SHA"],
+                      "backend_image": os.environ["BACKEND_IMAGE"] + "@" + os.environ["BACKEND_DIGEST"],
+                      "web_image": os.environ["WEB_IMAGE"] + "@" + os.environ["WEB_DIGEST"],
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: immutable-release-candidate
+          path: artifacts/release-candidate.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove candidate registry login
+        if: always()
+        run: docker logout "$REGISTRY"

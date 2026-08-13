@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "data_type": {
+      "type": "string"
+    },
+    "endpoint_id": {
+      "type": "string"
+    },
+    "flags": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ingest_version": {
+      "const": 1
+    },
+    "node_id": {
+      "type": "string"
+    },
+    "received_timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "scenario_id": {
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "server_timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "signal_key": {
+      "type": "string"
+    },
+    "source_timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "status_code": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "value": {},
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "tenant_id",
+    "workspace_id",
+    "run_id",
+    "scenario_id",
+    "endpoint_id",
+    "node_id",
+    "signal_key",
+    "data_type",
+    "value",
+    "source_timestamp",
+    "server_timestamp",
+    "received_timestamp",
+    "status_code",
+    "sequence"
+  ],
+  "title": "RawSignalEventV1",
+  "type": "object"
+}

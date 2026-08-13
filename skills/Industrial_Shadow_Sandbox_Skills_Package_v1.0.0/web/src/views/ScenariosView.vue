@@ -1,0 +1,1 @@
+<script setup lang="ts">import ScenarioWorkbench from '../features/scenarios/ScenarioWorkbench.vue'</script><template><section class="view-head"><div><p class="eyebrow">DETERMINISTIC INPUTS</p><h1>Scenarios & suites</h1><p>Preview timelines, publish immutable versions, and expand Gold-free Episodes.</p></div></section><ScenarioWorkbench /></template>

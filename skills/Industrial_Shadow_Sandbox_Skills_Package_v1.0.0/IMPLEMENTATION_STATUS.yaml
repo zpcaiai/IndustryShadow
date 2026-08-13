@@ -1,0 +1,133 @@
+schema_version: 1
+overall_status: implemented_unverified
+scope: S0 simulation, S1 historical import, and S2 real read-only Shadow code paths
+safety_boundary: Real endpoint access is read-only; approved mutations target registered simulators only.
+verification_summary:
+  core_test_command: make test
+  core_tests: 72 passed with 4 subtests passed
+  python_line_coverage: 64% across backend, simulator, collector, and edge packages
+  python_lint: passed
+  python_typecheck: passed with 0 errors
+  python_dependency_audit: full development and reduced production runtime hash locks passed with 0 known vulnerabilities
+  python_runtime_sbom: reproducible CycloneDX 1.6 inventory generated with 58 components and 113 validated dependency edges
+  batch_contracts: 24 passed
+  postgresql_integration: passed at migration head 3 on ephemeral PostgreSQL 17 with a non-owner NOBYPASSRLS role, tenant isolation, child rows, Outbox, and workspace-scoped idempotency
+  local_postgresql_restore_drill: passed on ephemeral PostgreSQL 17 with custom dump/restore, 19-table row-content fingerprints, migration history, 18 RLS policies, online-target and catalog-integrity checks, and bounded archive/RTO checks; not a managed-service or production-role drill
+  compose_contract: passed
+  kubernetes_render: 27 resources parsed with 0 world CIDRs, explicit non-root identities, filesystem groups, and writable bounded temporary volumes
+  container_runtime_smoke: pinned backend and web images passed non-root and read-only-root execution, backend health/version/89-operation OpenAPI checks, web security headers, and source-map denial
+  frontend_api_contract: generated client matches 89 backend operations
+  frontend_tests: 15 passed
+  browser_e2e: 5 passed in local Chrome, covering six permission personas, direct forbidden navigation, authentication fail-closed behavior, keyboard/i18n, and automated WCAG A/AA checks
+  frontend_build: passed
+  frontend_dependency_audit: 0 known vulnerabilities
+  network_opcua: passed with an independent asyncua client in insecure development and self-signed SignAndEncrypt/pinned-client-certificate modes; writes denied
+  synthetic_demo_episodes: 174
+  synthetic_demo_gate: passed_not_certification
+  local_measured_benchmark: passed 174 Episodes (120 fault, 54 normal), Top-1/Top-3 1.0, false-positive rate 0.0, deterministic replay 1.0, all safety red lines 0; bundled deterministic model only
+  production_gate_harnesses: implemented for non-mutating target preflight, live OIDC discovery/JWKS/personas/server RBAC, managed PostgreSQL restore RTO and source/target backup-role checks, external CA current/next rotation/CRL/EKU/KeyUsage/client-key matching, real SignAndEncrypt read-only OPC UA quality/timestamp/subscription checks, S3/KMS/Object Lock/TLS-only policy/account/rotation checks, exact live plane NetworkPolicy and RBAC probes, authenticated immutable backend-and-Web Docker Scout SARIF scanning, bounded warmup/circuit-breaker load, thresholded chaos recovery, exact-image rollback/RTO, release-bound signed security/privacy/human-accessibility assurance, signed formal benchmark recomputation, two-person approval signing, and closure-bound phased Kubernetes deployment with phase/resource allowlists, restricted workload security, narrow runner RBAC checks, exact prior-resource coverage, and verified automatic compensation from the first mutating apply
+  production_acceptance_binding: 15 source gates emit digest-sealed v2 evidence bound to one acceptance_run_id, five candidate/build/simulator/environment/deployment-plan release coordinates, freshness window, and purpose-scoped signer trust-store digest; probe exceptions emit redacted FAILED evidence
+  external_integration_status: NOT_RUN
+batches:
+  - batch: "01"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/common, backend/src/shadow_sandbox/main.py, migrations/0001_core.sql, web]
+    evidence: docs/evidence/batch-01/manifest.json
+  - batch: "02"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/asset_registry, domain-packs/pump-tank-v1]
+    evidence: docs/evidence/batch-02/manifest.json
+  - batch: "03"
+    status: implemented_unverified
+    modules: [services/simulator/src/shadow_simulator/model.py]
+    evidence: docs/evidence/batch-03/manifest.json
+  - batch: "04"
+    status: implemented_unverified
+    modules: [services/simulator/src/shadow_simulator/snapshot.py]
+    evidence: docs/evidence/batch-04/manifest.json
+  - batch: "05"
+    status: implemented_unverified
+    modules: [services/simulator/src/shadow_simulator/opcua]
+    evidence: docs/evidence/batch-05/manifest.json
+  - batch: "06"
+    status: implemented_unverified
+    modules: [services/collector/src/shadow_collector, backend/src/shadow_sandbox/ingestion]
+    evidence: docs/evidence/batch-06/manifest.json
+  - batch: "07"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/scenarios, schemas/scenarios]
+    evidence: docs/evidence/batch-07/manifest.json
+  - batch: "08"
+    status: implemented_unverified
+    modules: [services/simulator/src/shadow_simulator/faults.py, domain-packs/pump-tank-v1/faults]
+    evidence: docs/evidence/batch-08/manifest.json
+  - batch: "09"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/evaluation/gold.py, backend/src/shadow_sandbox/scenarios]
+    evidence: docs/evidence/batch-09/manifest.json
+  - batch: "10"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/runtime]
+    evidence: docs/evidence/batch-10/manifest.json
+  - batch: "11"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/quality]
+    evidence: docs/evidence/batch-11/manifest.json
+  - batch: "12"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/diagnosis/residuals]
+    evidence: docs/evidence/batch-12/manifest.json
+  - batch: "13"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/diagnosis/evidence]
+    evidence: docs/evidence/batch-13/manifest.json
+  - batch: "14"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/diagnosis/hypotheses, backend/src/shadow_sandbox/diagnosis/graph, domain-packs/pump-tank-v1/graph]
+    evidence: docs/evidence/batch-14/manifest.json
+  - batch: "15"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/planning, domain-packs/pump-tank-v1/checks]
+    evidence: docs/evidence/batch-15/manifest.json
+  - batch: "16"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/integrations/control_plane, schemas/tools]
+    evidence: docs/evidence/batch-16/manifest.json
+  - batch: "17"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/approvals]
+    evidence: docs/evidence/batch-17/manifest.json
+  - batch: "18"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/actions, backend/src/shadow_sandbox/action_api.py]
+    evidence: docs/evidence/batch-18/manifest.json
+  - batch: "19"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/replay]
+    evidence: docs/evidence/batch-19/manifest.json
+  - batch: "20"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/evaluation/metrics, backend/src/shadow_sandbox/reports]
+    evidence: docs/evidence/batch-20/manifest.json
+  - batch: "21"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/security, backend/src/shadow_sandbox/admin, web]
+    evidence: docs/evidence/batch-21/manifest.json
+  - batch: "22"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/integrations/imports]
+    evidence: docs/evidence/batch-22/manifest.json
+  - batch: "23"
+    status: implemented_unverified
+    modules: [services/edge-gateway/src/shadow_edge, backend/src/shadow_sandbox/shadow_pilot]
+    evidence: docs/evidence/batch-23/manifest.json
+  - batch: "24"
+    status: implemented_unverified
+    modules: [backend/src/shadow_sandbox/release, backend/src/shadow_sandbox/operations, backend/src/shadow_sandbox/observability, deploy, .github/workflows]
+    evidence: docs/evidence/batch-24/manifest.json
+known_limits:
+  - Real external-CA OPC UA rotation/revocation and collector subscription soak against real OT are NOT_RUN; generated-CA and independent-client local checks do not replace them.
+  - Local Chrome persona/keyboard/automated WCAG A/AA checks passed; live-provider OIDC and independent human accessibility review remain NOT_RUN.
+  - Docker Scout registry/image vulnerability scanning for both immutable backend and Web images is NOT_RUN because this workstation has no authenticated Docker ID; package-level Python and npm audits passed but do not replace OS-image scans.
+  - Managed PostgreSQL restore, live-provider OIDC personas, real S3/KMS/Object Lock, target NetworkPolicy, load, chaos, upgrade, rollback, target Kubernetes deployment, external security/privacy/human-accessibility assessment, and production release gates remain NOT_RUN; stronger preflight, v2 evidence, trusted-signer, candidate-publication, and phased-deployment code do not replace target execution.
+  - The local measured 174-Episode benchmark passed only against the bundled deterministic pump-tank model; the independently signed formal target measurement bundle is NOT_RUN and no production certification is claimed.

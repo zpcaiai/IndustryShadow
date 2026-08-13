@@ -1,0 +1,1 @@
+<script setup lang="ts">import EvaluationDashboard from '../features/evaluation/EvaluationDashboard.vue'</script><template><section class="view-head"><div><p class="eyebrow">NON-COMPENSABLE RED LINES</p><h1>Evaluation & release gate</h1><p>Frozen Episodes, slice-aware metrics, and exact-bundle promotion.</p></div></section><EvaluationDashboard /></template>

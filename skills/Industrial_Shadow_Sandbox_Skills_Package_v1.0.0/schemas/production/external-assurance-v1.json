@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:external-assurance:v1",
+  "$comment": "Deprecated local contract. Production acceptance accepts external-assurance-report-v2 only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["gate", "assessment_id", "assessor", "started_at", "completed_at", "checks", "artifacts", "limitations", "public_key_b64", "report_digest", "signature_b64"],
+  "properties": {
+    "gate": {"enum": ["security", "privacy"]},
+    "assessment_id": {"type": "string", "minLength": 1},
+    "assessor": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "passed"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "details": {"type": "object"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "public_key_b64": {"type": "string", "minLength": 40},
+    "report_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "signature_b64": {"type": "string", "minLength": 80}
+  }
+}

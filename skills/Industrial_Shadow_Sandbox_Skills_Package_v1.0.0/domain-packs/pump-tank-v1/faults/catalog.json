@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "faults": [
+    {"id":"F01","cause":"sensor_bias","target":"Tank101.Level","operator":"bias","parameters":{"value":1.0}},
+    {"id":"F02","cause":"flow_sensor_stuck","target":"Tank101.InletFlow","operator":"stuck_at","parameters":{}},
+    {"id":"F03","cause":"pressure_sensor_noise","target":"Tank101.Pressure","operator":"noise_increase","parameters":{"sigma":3000}},
+    {"id":"F04","cause":"inlet_valve_stiction","target":"Valve101.PositionCommand","operator":"stiction","parameters":{"deadband":12}},
+    {"id":"F05","cause":"pump_efficiency_loss","target":"Process.PumpEfficiency","operator":"ramp","parameters":{"from":1.0,"to":0.55,"ramp_seconds":120}},
+    {"id":"F06","cause":"bearing_friction","target":"Process.PumpBearing","operator":"friction_increase","parameters":{"fraction":0.6}},
+    {"id":"F07","cause":"outlet_blockage","target":"Process.Outlet","operator":"blockage","parameters":{"fraction":0.55}},
+    {"id":"F08","cause":"tank_leak","target":"Process.Tank","operator":"leak","parameters":{"flow_m3s":0.01}},
+    {"id":"F09","cause":"heater_stuck","target":"Process.Heater","operator":"heater_stuck","parameters":{"power_kw":80}},
+    {"id":"F10","cause":"communication_failure","target":"System.Communication","operator":"dropout","parameters":{"every_frames":4}}
+  ]
+}
+

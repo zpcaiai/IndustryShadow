@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:target-profile:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "collected_at", "runner_os", "runner_architecture", "cpu_count", "memory_bytes", "orchestrator_version", "cluster_uid_digest", "candidate_image", "build_digest", "simulator_build_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "runner_os": {"type": "string", "minLength": 1},
+    "runner_architecture": {"type": "string", "minLength": 1},
+    "cpu_count": {"type": "integer", "minimum": 1},
+    "memory_bytes": {"type": "integer", "minimum": 536870912},
+    "orchestrator_version": {"type": "string", "minLength": 1},
+    "cluster_uid_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "candidate_image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
+    "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "simulator_build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

@@ -1,0 +1,228 @@
+{
+  "batch": "13",
+  "status": "partial",
+  "generated_at_epoch": 1786210368.0748942,
+  "source_digest": "05fc79a723937f3d52da6ecdd42bb7a2713e53e54c97571ae321aca6571373f7",
+  "source_file_count": 425,
+  "commands": [
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pytest -q",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/core-tests.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python implement-industrial-shadow-sandbox/scripts/validate_batch_contracts.py implement-industrial-shadow-sandbox",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/skill-package-validation.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m shadow_sandbox.cli schemas --output schemas",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/schema-generation.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/production_gate.py benchmark_local --output artifacts/measured-benchmark/gate-evidence.json --summary artifacts/measured-benchmark/summary.json",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/measured-benchmark.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m shadow_sandbox.cli demo --database .runtime/evidence.db --output artifacts/evidence-demo",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/synthetic-demo.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m ruff check backend/src services tests tools",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/python-lint.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pyright backend/src services",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/python-typecheck.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/generate_frontend_client.py --check",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/frontend-contract.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.lock",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/python-dependency-audit.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.runtime.lock",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/python-runtime-dependency-audit.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/build_runtime_sbom.py --output artifacts/python-runtime-sbom.cdx.json",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/python-runtime-sbom.log"
+    },
+    {
+      "command": "npm --prefix web test",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/frontend-tests.log"
+    },
+    {
+      "command": "npm --prefix web run test:e2e",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/browser-e2e.log"
+    },
+    {
+      "command": "npm --prefix web run build",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/frontend-build.log"
+    },
+    {
+      "command": "npm --prefix web audit --package-lock-only --audit-level=moderate --registry=https://registry.npmjs.org",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/frontend-audit.log"
+    },
+    {
+      "command": "make deploy-validate",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/deployment-render.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_container_runtime.py --build",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/container-runtime-smoke.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_postgresql.py",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/postgresql-validation.log"
+    },
+    {
+      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_local_postgresql_restore.py --output artifacts/local-postgresql-restore-evidence.json",
+      "exit_code": 0,
+      "log": "docs/evidence/batch-13/local-postgresql-restore.log"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "docs/evidence/batch-13/core-tests.log",
+      "sha256": "e287585aba0905fb78467ed8b6a3e63adc40b4c3422a6169b94afeb6bfe8269f"
+    },
+    {
+      "path": "docs/evidence/batch-13/skill-package-validation.log",
+      "sha256": "04751a240cd555001d9785bb1ca512bb36d7d02b677427ea9a745f7adac54660"
+    },
+    {
+      "path": "docs/evidence/batch-13/schema-generation.log",
+      "sha256": "a406a25fd4b988fa86154ca683fa0e03c36b5b863ba3cf7c75f6741f1af9fbdc"
+    },
+    {
+      "path": "docs/evidence/batch-13/measured-benchmark.log",
+      "sha256": "138ea3997ab15d500b26fdb452cf33e6fb774b82e275aeb2f133d21e8f48a231"
+    },
+    {
+      "path": "docs/evidence/batch-13/synthetic-demo.log",
+      "sha256": "a406a25fd4b988fa86154ca683fa0e03c36b5b863ba3cf7c75f6741f1af9fbdc"
+    },
+    {
+      "path": "docs/evidence/batch-13/python-lint.log",
+      "sha256": "e5ddc8ccf1e9967e0f465462d051db8b9fd6cc60fabd59ab6d2d83e750803b1d"
+    },
+    {
+      "path": "docs/evidence/batch-13/python-typecheck.log",
+      "sha256": "2c4c385d925e95f6c56c9686397e644e30a3ad19a26a834563d9726850607064"
+    },
+    {
+      "path": "docs/evidence/batch-13/frontend-contract.log",
+      "sha256": "7b84252a5702fbd6e954897250fb995ee8576b3a6c66603fb1495e5a57dfa551"
+    },
+    {
+      "path": "docs/evidence/batch-13/python-dependency-audit.log",
+      "sha256": "d1d7c6ad81a46a7499d72505f4865dc7a51070789f0236c0158584e31635fa0b"
+    },
+    {
+      "path": "docs/evidence/batch-13/python-runtime-dependency-audit.log",
+      "sha256": "d1d7c6ad81a46a7499d72505f4865dc7a51070789f0236c0158584e31635fa0b"
+    },
+    {
+      "path": "docs/evidence/batch-13/python-runtime-sbom.log",
+      "sha256": "545be7b75aba80951653cd0fd175419469228f3a4ded4006571996dc801b21b5"
+    },
+    {
+      "path": "docs/evidence/batch-13/frontend-tests.log",
+      "sha256": "f90158d6aef611266888e394c6d7b6e1d89b8440e7265531e8fd545801d68d4a"
+    },
+    {
+      "path": "docs/evidence/batch-13/browser-e2e.log",
+      "sha256": "3b7a2b2fb6a66d412c52eaa6f113ad89fe47e4c3a53009c1376a1a2dc536e555"
+    },
+    {
+      "path": "docs/evidence/batch-13/frontend-build.log",
+      "sha256": "32367ea289322fff96f1d3f73601ee1425d0c71ffb955662edcaed8f867eaf09"
+    },
+    {
+      "path": "docs/evidence/batch-13/frontend-audit.log",
+      "sha256": "325d6467e3ad9470616870cb3bc849da984f74c7ec3f3fe6bcbfb41663401edb"
+    },
+    {
+      "path": "docs/evidence/batch-13/deployment-render.log",
+      "sha256": "5c888e800bcf0f29c6162265369484d55fcfd19e6dc9eee7b8c36fdc482e6441"
+    },
+    {
+      "path": "docs/evidence/batch-13/container-runtime-smoke.log",
+      "sha256": "5bffe6335a5ac9826e0baa8b0f0bdbd399d73c587e72fdc1c2bc7e3dbb339fb4"
+    },
+    {
+      "path": "docs/evidence/batch-13/postgresql-validation.log",
+      "sha256": "703968b7f79be441a62a4d8ff30a125ff83f0aa8194d6aa4d7e6ad2035b80b0f"
+    },
+    {
+      "path": "docs/evidence/batch-13/local-postgresql-restore.log",
+      "sha256": "0419967abe0daff8dd6473c1e1067adae154aef4047216f234b9a6551d2fdefd"
+    },
+    {
+      "path": "docs/evidence/batch-13/synthetic-demo-summary.json",
+      "sha256": "f5bf025dc775e2355d1523877715fccf8bd22bf64c185449fa97c57e5ffe0c36"
+    }
+  ],
+  "tests": [
+    {
+      "suite": "pytest-core-unit-contract-safety-production-adapters",
+      "passed": 72,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "suite": "vitest-frontend-api-client",
+      "passed": 15,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "suite": "playwright-personas-accessibility",
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0
+    }
+  ],
+  "safety_assertions": [
+    {
+      "id": "real_endpoint_actions_denied_in_core",
+      "result": "passed"
+    },
+    {
+      "id": "gold_service_boundary_enforced_in_core",
+      "result": "passed"
+    },
+    {
+      "id": "numeric_claims_require_same_run_evidence",
+      "result": "passed"
+    }
+  ],
+  "known_limits": [
+    "Ephemeral local PostgreSQL migration head, non-owner RLS denial, child-row visibility, Outbox isolation, and workspace-scoped idempotency passed; a disposable local dump/restore and catalog-integrity drill also passed; managed production PostgreSQL restore remains NOT_RUN.",
+    "Generated frontend route contract, frontend unit tests, a local desktop Chrome six-persona navigation run, automated WCAG A/AA scan, production TypeScript/Vite build, and dependency audit passed; live-provider OIDC and independent human accessibility review are NOT_RUN.",
+    "No real OT endpoint, production OIDC tenant, KMS key, S3 bucket, credentials, certificates, or production secrets were used.",
+    "Production Kubernetes rollout, load, chaos, backup restore, upgrade, and rollback drills are NOT_RUN.",
+    "Pinned backend/web images passed local non-root, read-only runtime checks, and Compose/Kubernetes manifests rendered successfully; Docker Scout is NOT_RUN without Docker ID authentication, and a target-cluster rollout is NOT_RUN.",
+    "The bundled deterministic 174-Episode measured benchmark passed locally; it is not a real-site or target-hardware certification."
+  ]
+}

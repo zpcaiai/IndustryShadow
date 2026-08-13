@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:assessor-trust-store:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "store_id", "issued_at", "signers", "digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "store_id": {"type": "string", "minLength": 1},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "signers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["identity", "purposes", "public_key_sha256", "valid_from", "valid_until", "status"],
+        "properties": {
+          "identity": {"type": "string", "minLength": 1},
+          "purposes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["security_assessment", "privacy_assessment", "accessibility_assessment", "formal_measurement", "closure_release_owner", "closure_security_owner"]}},
+          "public_key_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "valid_from": {"type": "string", "format": "date-time"},
+          "valid_until": {"type": "string", "format": "date-time"},
+          "status": {"enum": ["active", "revoked"]}
+        }
+      }
+    },
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

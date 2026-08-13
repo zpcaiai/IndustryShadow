@@ -1,0 +1,1 @@
+<script setup lang="ts">import AssetsWorkbench from '../features/assets/AssetsWorkbench.vue'</script><template><section class="view-head"><div><p class="eyebrow">REGISTRY</p><h1>Assets & signals</h1><p>Canonical units, access modes, NodeIds, hierarchy, and topology.</p></div></section><AssetsWorkbench /></template>

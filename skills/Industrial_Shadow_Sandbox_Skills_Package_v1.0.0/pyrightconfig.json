@@ -1,0 +1,12 @@
+{
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false,
+  "extraPaths": [
+    "backend/src",
+    "services/simulator/src",
+    "services/collector/src",
+    "services/edge-gateway/src"
+  ],
+  "exclude": ["**/__pycache__", ".runtime", "artifacts", "web"]
+}

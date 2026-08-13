@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "store_id": "example-not-for-production",
+  "issued_at": "2026-08-01T00:00:00Z",
+  "signers": [
+    {"identity": "security-lab@example.invalid", "purposes": ["security_assessment"], "public_key_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"},
+    {"identity": "privacy-lab@example.invalid", "purposes": ["privacy_assessment"], "public_key_sha256": "2222222222222222222222222222222222222222222222222222222222222222", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"},
+    {"identity": "accessibility-lab@example.invalid", "purposes": ["accessibility_assessment"], "public_key_sha256": "6666666666666666666666666666666666666666666666666666666666666666", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"},
+    {"identity": "measurement-lab@example.invalid", "purposes": ["formal_measurement"], "public_key_sha256": "3333333333333333333333333333333333333333333333333333333333333333", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"},
+    {"identity": "release-owner@example.invalid", "purposes": ["closure_release_owner"], "public_key_sha256": "4444444444444444444444444444444444444444444444444444444444444444", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"},
+    {"identity": "security-owner@example.invalid", "purposes": ["closure_security_owner"], "public_key_sha256": "5555555555555555555555555555555555555555555555555555555555555555", "valid_from": "2026-01-01T00:00:00Z", "valid_until": "2026-12-31T23:59:59Z", "status": "active"}
+  ],
+  "digest": "e79132e7f86302778c7635bbdd8346157744d8c5b2eb3992f7ab6013fd0eb92c"
+}

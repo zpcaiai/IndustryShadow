@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: shadow-postgres-backup}
+spec:
+  schedule: "17 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata: {labels: {app: backup, plane: data}}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: shadow-backup-storage
+          automountServiceAccountToken: true
+          securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: backup
+              image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+              args: ["python", "-m", "shadow_sandbox.operations.backup_job"]
+              envFrom:
+                - configMapRef: {name: shadow-runtime}
+                - secretRef: {name: shadow-backup-secrets}
+              securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+              volumeMounts: [{name: tmp, mountPath: /tmp}]
+              resources:
+                requests: {cpu: 100m, memory: 256Mi}
+                limits: {cpu: "1", memory: 1Gi}
+          volumes: [{name: tmp, emptyDir: {sizeLimit: 20Gi}}]

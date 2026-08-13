@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["run_id", "environment_type", "allowed_signal_keys", "row_budget", "call_budget"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "environment_type": {"enum": ["simulator", "historical", "real_readonly"]},
+    "allowed_signal_keys": {"type": "array", "items": {"type": "string"}},
+    "row_budget": {"type": "integer", "minimum": 1, "maximum": 10000},
+    "call_budget": {"type": "integer", "minimum": 1, "maximum": 100}
+  },
+  "additionalProperties": false
+}
+

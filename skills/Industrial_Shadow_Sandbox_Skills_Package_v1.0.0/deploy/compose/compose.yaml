@@ -1,0 +1,129 @@
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    environment:
+      POSTGRES_DB: shadow_sandbox
+      POSTGRES_USER: shadow_app
+      POSTGRES_PASSWORD: ${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shadow_app -d shadow_sandbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data-plane]
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    command: ["python", "-m", "shadow_sandbox.cli", "migrate"]
+    environment:
+      SHADOW_DATABASE_URL: postgresql+psycopg://shadow_app:${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}@postgres/shadow_sandbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [data-plane]
+  control-api:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    environment:
+      SHADOW_DATABASE_URL: postgresql+psycopg://shadow_app:${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}@postgres/shadow_sandbox
+      SHADOW_ENVIRONMENT: development
+      SHADOW_ALLOWED_ORIGINS: http://localhost:8080
+      SHADOW_ACTION_SERVICE_URL: http://action-executor:8020
+      SHADOW_INTERNAL_SERVICE_TOKEN: ${SHADOW_INTERNAL_SERVICE_TOKEN:?set a 32+ character SHADOW_INTERNAL_SERVICE_TOKEN}
+      SHADOW_AUTO_MIGRATE: "false"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports: ["8000:8000"]
+    networks: [platform, data-plane, action-control]
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    command: ["python", "-m", "shadow_sandbox.worker"]
+    environment:
+      SHADOW_DATABASE_URL: postgresql+psycopg://shadow_app:${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}@postgres/shadow_sandbox
+      SHADOW_ENVIRONMENT: development
+      SHADOW_AUTO_MIGRATE: "false"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [data-plane]
+  action-executor:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    command: ["uvicorn", "shadow_sandbox.action_api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8020"]
+    environment:
+      SHADOW_DATABASE_URL: postgresql+psycopg://shadow_app:${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}@postgres/shadow_sandbox
+      SHADOW_ENVIRONMENT: development
+      SHADOW_INTERNAL_SERVICE_TOKEN: ${SHADOW_INTERNAL_SERVICE_TOKEN:?set a 32+ character SHADOW_INTERNAL_SERVICE_TOKEN}
+      SHADOW_SIMULATOR_URL: http://simulator:8010
+      SHADOW_SIMULATOR_ID: default
+      SHADOW_SIMULATOR_DIGEST: ${SHADOW_SIMULATOR_DIGEST:?set the attested simulator identity digest}
+      SHADOW_AUTO_MIGRATE: "false"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      simulator:
+        condition: service_started
+    profiles: ["integration"]
+    networks: [data-plane, action-control, sandbox]
+  simulator:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    command: ["uvicorn", "shadow_simulator.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      SHADOW_ENVIRONMENT: development
+      SHADOW_INTERNAL_SERVICE_TOKEN: ${SHADOW_INTERNAL_SERVICE_TOKEN:?set a 32+ character SHADOW_INTERNAL_SERVICE_TOKEN}
+      SHADOW_SIMULATOR_BUILD_DIGEST: ${SHADOW_SIMULATOR_BUILD_DIGEST:?set the simulator image digest}
+      SHADOW_OPCUA_ENABLED: "true"
+      SHADOW_OPCUA_ALLOW_INSECURE: "true"
+      SHADOW_OPCUA_ENDPOINT: opc.tcp://0.0.0.0:4840/shadow
+      SHADOW_OPCUA_APPLICATION_URI: urn:industrial-shadow:simulator
+      SHADOW_OPCUA_NAMESPACE_URI: urn:industrial-shadow:pump-tank
+    profiles: ["integration"]
+    networks: [sandbox, simulator-readonly]
+  collector:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.backend
+    command: ["python", "-m", "shadow_collector.runner"]
+    environment:
+      SHADOW_DATABASE_URL: postgresql+psycopg://shadow_app:${SHADOW_DEV_DB_PASSWORD:?set SHADOW_DEV_DB_PASSWORD}@postgres/shadow_sandbox
+      SHADOW_ENDPOINT_URI: opc.tcp://simulator:4840/shadow
+      SHADOW_APPLICATION_URI: urn:industrial-shadow:simulator
+      SHADOW_CERTIFICATE_FINGERPRINT: ${SHADOW_SIMULATOR_CERTIFICATE_FINGERPRINT:?set SHADOW_SIMULATOR_CERTIFICATE_FINGERPRINT}
+      SHADOW_NAMESPACE_URI: urn:industrial-shadow:pump-tank
+      SHADOW_NODE_ALLOWLIST: ${SHADOW_NODE_ALLOWLIST:?set SHADOW_NODE_ALLOWLIST}
+      SHADOW_TRUSTED_RUN_CONTEXT: ${SHADOW_TRUSTED_RUN_CONTEXT:?set SHADOW_TRUSTED_RUN_CONTEXT}
+      SHADOW_AUTO_MIGRATE: "false"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      simulator:
+        condition: service_started
+    profiles: ["integration"]
+    networks: [data-plane, simulator-readonly]
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.web
+    ports: ["8080:8080"]
+    depends_on: [control-api]
+    networks: [platform]
+
+networks:
+  platform: {}
+  data-plane:
+    internal: true
+  action-control:
+    internal: true
+  simulator-readonly:
+    internal: true
+  sandbox:
+    internal: true

@@ -1,0 +1,42 @@
+{
+  "base_url": "https://shadow.example.invalid",
+  "health_path": "/api/v1/health/ready",
+  "profiles": [
+    {
+      "name": "public-version",
+      "target": {"path": "/api/v1/version", "method": "GET", "expected_status": 200},
+      "requests_per_second": 50,
+      "concurrency": 20,
+      "duration_seconds": 300,
+      "p95_limit_ms": 500,
+      "maximum_error_rate": 0.001
+      ,"warmup_requests": 10
+      ,"maximum_consecutive_errors": 20
+      ,"minimum_achieved_rate_ratio": 0.95
+    },
+    {
+      "name": "authenticated-me",
+      "target": {"path": "/api/v1/me", "method": "GET", "expected_status": 200},
+      "requests_per_second": 25,
+      "concurrency": 10,
+      "duration_seconds": 300,
+      "p95_limit_ms": 750,
+      "maximum_error_rate": 0.001
+      ,"warmup_requests": 10
+      ,"maximum_consecutive_errors": 20
+      ,"minimum_achieved_rate_ratio": 0.95
+    },
+    {
+      "name": "web-console",
+      "target": {"path": "/", "method": "GET", "expected_status": 200},
+      "requests_per_second": 50,
+      "concurrency": 20,
+      "duration_seconds": 300,
+      "p95_limit_ms": 500,
+      "maximum_error_rate": 0.001
+      ,"warmup_requests": 10
+      ,"maximum_consecutive_errors": 20
+      ,"minimum_achieved_rate_ratio": 0.95
+    }
+  ]
+}

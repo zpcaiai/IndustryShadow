@@ -1,0 +1,14 @@
+--- attempt 1/1 ---
+
+> industrial-shadow-sandbox-web@0.1.0 test
+> vitest run
+
+
+ RUN  v4.1.10 /Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/web
+
+
+ Test Files  4 passed (4)
+      Tests  15 passed (15)
+   Start at  01:33:12
+   Duration  200ms (transform 141ms, setup 0ms, import 196ms, tests 61ms, environment 1ms)
+

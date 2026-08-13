@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:deployment-plan:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plan_id", "namespace", "backend_image", "web_image", "bootstrap_manifest", "migration_manifest", "runtime_manifest", "rollback_manifest", "migration_job", "workloads", "digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "plan_id": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"},
+    "namespace": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"},
+    "backend_image": {"type": "string", "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"},
+    "web_image": {"type": "string", "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"},
+    "bootstrap_manifest": {"$ref": "#/$defs/artifact"},
+    "migration_manifest": {"$ref": "#/$defs/artifact"},
+    "runtime_manifest": {"$ref": "#/$defs/artifact"},
+    "rollback_manifest": {"$ref": "#/$defs/artifact"},
+    "migration_job": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"},
+    "workloads": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "name", "container", "image", "readiness_url"],
+        "properties": {
+          "kind": {"enum": ["deployment", "statefulset"]},
+          "name": {"type": "string", "minLength": 1},
+          "container": {"type": "string", "minLength": 1},
+          "image": {"enum": ["backend", "web"]},
+          "readiness_url": {"type": "string"}
+        }
+      }
+    },
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    }
+  }
+}

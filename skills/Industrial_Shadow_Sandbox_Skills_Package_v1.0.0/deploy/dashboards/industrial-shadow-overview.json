@@ -1,0 +1,43 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {
+      "title": "API request rate",
+      "type": "timeseries",
+      "targets": [{"expr": "sum by (status) (rate(shadow_http_requests_total[5m]))"}],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "title": "API p95 latency",
+      "type": "timeseries",
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(shadow_http_request_duration_seconds_bucket[5m])))"}],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "title": "Safety policy violations",
+      "type": "stat",
+      "targets": [{"expr": "sum(increase(shadow_safety_policy_violations_total[24h]))"}],
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 8}
+    },
+    {
+      "title": "Virtual action terminal states",
+      "type": "timeseries",
+      "targets": [{"expr": "sum by (state, outcome) (increase(shadow_virtual_actions_total[1h]))"}],
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 8}
+    },
+    {
+      "title": "Ingestion age",
+      "type": "timeseries",
+      "targets": [{"expr": "time() - shadow_ingestion_last_received_timestamp_seconds"}],
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 8}
+    }
+  ],
+  "schemaVersion": 40,
+  "tags": ["industrial-shadow", "safety", "slo"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Industrial Shadow Production Overview",
+  "uid": "industrial-shadow-overview",
+  "version": 1
+}

@@ -1,0 +1,2 @@
+--- attempt 1/1 ---
+{"digest":"3949ba836ebae02185a214b1917497ab99ca1534ebbae10fe6582e2db3fe9a00","evidence":"artifacts/measured-benchmark/gate-evidence.json","gate":"benchmark_local","status":"PASSED"}

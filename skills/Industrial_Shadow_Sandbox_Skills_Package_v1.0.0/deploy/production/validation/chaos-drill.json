@@ -1,0 +1,37 @@
+{
+  "namespace": "industrial-shadow",
+  "scenarios": [
+    {
+      "name": "control-api-pod-loss",
+      "category": "api",
+      "operation": "pod_termination",
+      "workload": "control-api",
+      "maximum_recovery_seconds": 300,
+      "readiness_url": "https://shadow.example.invalid/api/v1/health/ready"
+    },
+    {
+      "name": "worker-outage",
+      "category": "worker",
+      "operation": "scale_outage",
+      "kind": "deployment",
+      "maximum_recovery_seconds": 600,
+      "workload": "worker"
+    },
+    {
+      "name": "collector-outage",
+      "category": "collector",
+      "operation": "scale_outage",
+      "kind": "deployment",
+      "maximum_recovery_seconds": 600,
+      "workload": "collector"
+    },
+    {
+      "name": "simulator-outage",
+      "category": "simulator",
+      "operation": "scale_outage",
+      "kind": "statefulset",
+      "maximum_recovery_seconds": 900,
+      "workload": "simulator"
+    }
+  ]
+}

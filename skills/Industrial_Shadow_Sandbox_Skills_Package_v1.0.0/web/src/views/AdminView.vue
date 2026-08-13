@@ -1,0 +1,1 @@
+<script setup lang="ts">import AdminPanel from '../features/admin/AdminPanel.vue'</script><template><section class="view-head"><div><p class="eyebrow">OPERATIONS</p><h1>Administration & audit</h1><p>Health, quotas, versions, endpoint policies, retention, and append-only audit.</p></div></section><AdminPanel /></template>

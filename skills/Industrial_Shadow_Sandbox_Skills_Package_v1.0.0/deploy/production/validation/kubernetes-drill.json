@@ -1,0 +1,8 @@
+{
+  "namespace": "industrial-shadow",
+  "deployment": "control-api",
+  "container": "api",
+  "migration_job": "shadow-migrate",
+  "readiness_url": "https://shadow.example.invalid/api/v1/health/ready"
+  ,"maximum_rollback_seconds": 900
+}

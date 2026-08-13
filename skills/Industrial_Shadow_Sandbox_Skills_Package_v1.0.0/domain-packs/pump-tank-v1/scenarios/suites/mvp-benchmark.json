@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "suite_id": "mvp-benchmark",
+  "faults": ["F01","F02","F03","F04","F05","F06","F07","F08","F09","F10"],
+  "severity": ["low","medium","high"],
+  "load": ["low","nominal","high"],
+  "fault_seeds_by_load": {"low":[11],"nominal":[11,29],"high":[11]},
+  "normal_scenarios": ["startup","shutdown","load-step","valve-step","heater-cycle","network-jitter"],
+  "normal_load": ["low","nominal","high"],
+  "normal_seeds": [3,17,41],
+  "expected_fault_episodes": 120,
+  "expected_normal_episodes": 54,
+  "split": "certification"
+}

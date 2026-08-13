@@ -1,0 +1,119 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: dns-egress}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: web-ingress-and-api}
+spec:
+  podSelector: {matchLabels: {app: web}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {industrial-shadow-ingress: allowed}}
+      ports: [{protocol: TCP, port: 8080}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: control-api}}}]
+      ports: [{protocol: TCP, port: 8000}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: control-api-ingress}
+spec:
+  podSelector: {matchLabels: {app: control-api}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: web}}
+      ports: [{protocol: TCP, port: 8000}]
+    - from:
+        - namespaceSelector: {matchLabels: {industrial-shadow-monitoring: allowed}}
+      ports: [{protocol: TCP, port: 8000}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: action-executor}}}]
+      ports: [{protocol: TCP, port: 8020}]
+    # Fail-closed TEST-NET placeholders. The overlay must bind the IdP and
+    # object-store HTTPS addresses separately from the managed PostgreSQL host.
+    - to: [{ipBlock: {cidr: 198.51.100.10/32}}]
+      ports: [{protocol: TCP, port: 443}]
+    - to: [{ipBlock: {cidr: 198.51.100.20/32}}]
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: action-plane}
+spec:
+  podSelector: {matchLabels: {app: action-executor}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: control-api}}}]
+      ports: [{protocol: TCP, port: 8020}]
+    - from:
+        - namespaceSelector: {matchLabels: {industrial-shadow-monitoring: allowed}}
+      ports: [{protocol: TCP, port: 8020}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: simulator}}}]
+      ports: [{protocol: TCP, port: 8010}]
+    - to: [{ipBlock: {cidr: 198.51.100.20/32}}]
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: simulator-plane}
+spec:
+  podSelector: {matchLabels: {app: simulator}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: action-executor}}}]
+      ports: [{protocol: TCP, port: 8010}]
+    - from: [{podSelector: {matchLabels: {app: collector}}}]
+      ports: [{protocol: TCP, port: 4840}]
+  egress:
+    - to: [{ipBlock: {cidr: 198.51.100.30/32}}]
+      ports: [{protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: collector-read-only-egress}
+spec:
+  podSelector: {matchLabels: {app: collector}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: simulator}}}]
+      ports: [{protocol: TCP, port: 4840}]
+    # Fail-closed TEST-NET placeholder. A reviewed site overlay must replace this
+    # single host with the approved read-only OPC UA endpoint address.
+    - to: [{ipBlock: {cidr: 192.0.2.0/32}}]
+      ports: [{protocol: TCP, port: 4840}]
+    - to: [{ipBlock: {cidr: 198.51.100.20/32}}]
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: data-jobs-egress}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [worker, migration, backup]}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 198.51.100.20/32}}]
+      ports: [{protocol: TCP, port: 5432}]
+    - to: [{ipBlock: {cidr: 198.51.100.30/32}}]
+      ports: [{protocol: TCP, port: 443}]

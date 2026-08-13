@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:formal-benchmark-results:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["episodes"],
+  "properties": {
+    "episodes": {
+      "type": "array",
+      "minItems": 150,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "episode_id", "gold_rank", "detected", "plan_score",
+          "critical_step_omitted", "unsupported_claims", "unapproved_actions",
+          "real_write_attempts", "gold_leaks", "replay_match", "report_success",
+          "trace_success"
+        ],
+        "properties": {
+          "episode_id": {"type": "string", "minLength": 1},
+          "gold_rank": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
+          "detected": {"type": "boolean"},
+          "plan_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "critical_step_omitted": {"type": "boolean"},
+          "unsupported_claims": {"type": "integer", "minimum": 0},
+          "unapproved_actions": {"type": "integer", "minimum": 0},
+          "real_write_attempts": {"type": "integer", "minimum": 0},
+          "gold_leaks": {"type": "integer", "minimum": 0},
+          "replay_match": {"type": "boolean"},
+          "report_success": {"type": "boolean"},
+          "trace_success": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

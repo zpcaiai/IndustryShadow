@@ -1,0 +1,1 @@
+<script setup lang="ts">import ApprovalInbox from '../features/approvals/ApprovalInbox.vue'</script><template><section class="view-head"><div><p class="eyebrow">HUMAN AUTHORITY</p><h1>Approvals</h1><p>Review exact simulator actions without expanding the requested scope.</p></div></section><ApprovalInbox /></template>

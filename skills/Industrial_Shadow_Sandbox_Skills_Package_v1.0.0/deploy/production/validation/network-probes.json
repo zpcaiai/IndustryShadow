@@ -1,0 +1,31 @@
+{
+  "namespace": "industrial-shadow",
+  "policy_path": "deploy/production/network-policies.yaml",
+  "timeout_seconds": 120,
+  "probes": [
+    {
+      "plane": "control-api",
+      "image": "registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cases": [
+        {"name": "approved-idp", "host": "198.51.100.10", "port": 443, "expect_allowed": true},
+        {"name": "ot-denied", "host": "192.0.2.10", "port": 4840, "expect_allowed": false}
+      ]
+    },
+    {
+      "plane": "action-executor",
+      "image": "registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cases": [
+        {"name": "postgres", "host": "198.51.100.20", "port": 5432, "expect_allowed": true},
+        {"name": "ot-denied", "host": "192.0.2.10", "port": 4840, "expect_allowed": false}
+      ]
+    },
+    {
+      "plane": "collector",
+      "image": "registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cases": [
+        {"name": "approved-ot", "host": "192.0.2.10", "port": 4840, "expect_allowed": true},
+        {"name": "web-denied", "host": "198.51.100.10", "port": 443, "expect_allowed": false}
+      ]
+    }
+  ]
+}

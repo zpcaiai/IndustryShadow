@@ -1,0 +1,1 @@
+<script setup lang="ts">import EdgeHealth from '../features/edge/EdgeHealth.vue'</script><template><section class="view-head"><div><p class="eyebrow">REAL READ-ONLY</p><h1>Edge shadow</h1><p>Signed configuration, device identity, encrypted spool, sequence integrity, and human feedback.</p></div></section><EdgeHealth /></template>

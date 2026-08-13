@@ -1,0 +1,2 @@
+--- attempt 1/1 ---
+Local disposable PostgreSQL restore passed: 19 tables, 13 rows, 18 RLS policies, restore 0.104s.

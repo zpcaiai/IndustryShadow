@@ -1,0 +1,1 @@
+<script setup lang="ts">import RunWorkbench from '../features/runs/RunWorkbench.vue'</script><template><section class="view-head"><div><p class="eyebrow">ORCHESTRATION</p><h1>Runs</h1><p>Launch, observe, pause, retry, and cancel digest-pinned validation runs.</p></div></section><RunWorkbench /></template>

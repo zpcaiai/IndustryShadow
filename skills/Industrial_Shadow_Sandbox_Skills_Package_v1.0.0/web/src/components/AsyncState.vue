@@ -1,0 +1,2 @@
+<script setup lang="ts">import { useI18n } from '../i18n';defineProps<{ loading?: boolean; error?: string; empty?: boolean; emptyText?: string }>();const {t}=useI18n()</script>
+<template><div v-if="loading" class="state-card" role="status" aria-live="polite">{{t('state.loading')}}</div><div v-else-if="error" class="state-card error" role="alert">{{ error }}</div><div v-else-if="empty" class="state-card">{{ emptyText ?? t('state.empty') }}</div><slot v-else /></template>

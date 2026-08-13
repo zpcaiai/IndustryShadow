@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:scenario:v1",
+  "type": "object",
+  "required": ["schema_version", "scenario_id", "scenario_version", "process_model_ref", "asset_model_ref", "seed", "clock", "timeline"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "scenario_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$"},
+    "scenario_version": {"type": "integer", "minimum": 1},
+    "process_model_ref": {"type": "string"},
+    "asset_model_ref": {"type": "string"},
+    "seed": {"type": "integer"},
+    "clock": {"type": "object"},
+    "timeline": {"type": "array"}
+  },
+  "not": {"anyOf": [{"required": ["gold"]}, {"required": ["gold_spec"]}, {"required": ["root_causes"]}]},
+  "additionalProperties": false
+}
+

@@ -1,0 +1,14 @@
+interface:
+  display_name: Industrial Shadow Sandbox
+  short_description: Build and verify the 24-batch industrial Shadow platform
+  default_prompt: Use $implement-industrial-shadow-sandbox to implement the next Industrial
+    Shadow Sandbox batch with executable evidence.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

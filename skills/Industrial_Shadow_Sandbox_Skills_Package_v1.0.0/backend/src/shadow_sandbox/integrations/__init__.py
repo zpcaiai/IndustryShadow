@@ -1,0 +1,1 @@
+"""Bounded external-system adapters."""

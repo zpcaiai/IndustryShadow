@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:formal-measurement-log:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "started_at", "completed_at", "episode_ids", "completed_episode_ids", "failed_episode_ids", "target_profile_digest", "result_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "episode_ids": {"type": "array", "minItems": 150, "uniqueItems": true, "items": {"type": "string"}},
+    "completed_episode_ids": {"type": "array", "minItems": 150, "uniqueItems": true, "items": {"type": "string"}},
+    "failed_episode_ids": {"type": "array", "maxItems": 0},
+    "target_profile_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "result_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

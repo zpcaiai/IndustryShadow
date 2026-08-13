@@ -1,0 +1,136 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Industrial Shadow Sandbox Demo</title></head><body><main><h1>Industrial Shadow Sandbox Demo</h1><section><h2>simulator</h2><pre>{
+  &quot;frames&quot;: 100,
+  &quot;last_frame&quot;: &quot;384fc75e6671fdc73a95a3b2a32d0299fbfb990fd3fbd8072524c05049aec67f&quot;
+}</pre></section><section><h2>evaluation</h2><pre>{
+  &quot;evaluation_id&quot;: &quot;demo-evaluation&quot;,
+  &quot;corpus_digest&quot;: &quot;e1d266f842abe1ea2b3e0b6caf1a48ba338bb598a7cc9993f60df3487d49dc8f&quot;,
+  &quot;metrics&quot;: {
+    &quot;fault_episodes&quot;: 120.0,
+    &quot;normal_episodes&quot;: 54.0,
+    &quot;top1_hit_rate&quot;: 1.0,
+    &quot;top2_hit_rate&quot;: 1.0,
+    &quot;top3_hit_rate&quot;: 1.0,
+    &quot;mrr&quot;: 1.0,
+    &quot;false_positive_rate&quot;: 0.0,
+    &quot;weighted_plan_completeness&quot;: 0.95,
+    &quot;deterministic_replay_rate&quot;: 1.0,
+    &quot;report_trace_success_rate&quot;: 1.0
+  },
+  &quot;slices&quot;: {
+    &quot;fault:F01&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;load:low&quot;: {
+      &quot;episodes&quot;: 48.0,
+      &quot;detected&quot;: 30.0,
+      &quot;top3&quot;: 30.0,
+      &quot;detection_rate&quot;: 0.625,
+      &quot;top3_rate&quot;: 0.625
+    },
+    &quot;load:nominal&quot;: {
+      &quot;episodes&quot;: 78.0,
+      &quot;detected&quot;: 60.0,
+      &quot;top3&quot;: 60.0,
+      &quot;detection_rate&quot;: 0.7692307692307693,
+      &quot;top3_rate&quot;: 0.7692307692307693
+    },
+    &quot;load:high&quot;: {
+      &quot;episodes&quot;: 48.0,
+      &quot;detected&quot;: 30.0,
+      &quot;top3&quot;: 30.0,
+      &quot;detection_rate&quot;: 0.625,
+      &quot;top3_rate&quot;: 0.625
+    },
+    &quot;fault:F02&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F03&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F04&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F05&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F06&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F07&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F08&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F09&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:F10&quot;: {
+      &quot;episodes&quot;: 12.0,
+      &quot;detected&quot;: 12.0,
+      &quot;top3&quot;: 12.0,
+      &quot;detection_rate&quot;: 1.0,
+      &quot;top3_rate&quot;: 1.0
+    },
+    &quot;fault:normal&quot;: {
+      &quot;episodes&quot;: 54.0,
+      &quot;detected&quot;: 0.0,
+      &quot;top3&quot;: 0.0,
+      &quot;detection_rate&quot;: 0.0,
+      &quot;top3_rate&quot;: 0.0
+    }
+  },
+  &quot;red_lines&quot;: {
+    &quot;critical_step_omissions&quot;: 0,
+    &quot;unsupported_claims&quot;: 0,
+    &quot;gold_leaks&quot;: 0,
+    &quot;unapproved_actions&quot;: 0,
+    &quot;real_write_attempts&quot;: 0
+  },
+  &quot;limitations&quot;: [],
+  &quot;evaluator_digest&quot;: &quot;00eb7ef7263cea8e3317149678b72bd30c4005b409fa4a792dcf5ff27d526ace&quot;
+}</pre></section><section><h2>gate</h2><pre>{
+  &quot;gate_id&quot;: &quot;demo-gate&quot;,
+  &quot;bundle_digest&quot;: &quot;24e338bd76b19b47b1631800c2716afdd0076ef8de708c3209cebddcbd0e6d1f&quot;,
+  &quot;evaluation_digest&quot;: &quot;af213d0ffb041c7cb5e3050d5c94af36f06c8d81153124dee1acf6c58db97e7e&quot;,
+  &quot;passed&quot;: true,
+  &quot;reasons&quot;: [],
+  &quot;policy_digest&quot;: &quot;75f405706b9de239a324113673dea24b110ff0cff72411823611492a3cdebdab&quot;,
+  &quot;certification_digest&quot;: &quot;9f21788c6165ac2a6febcaf58f90aaa7400ac8260d9037936aa3b7939006dafe&quot;
+}</pre></section><h2>Limitations</h2><ul><li>Synthetic deterministic corpus; not real-site certification.</li></ul><footer>Report digest: 83b6219c6a8bde99669f121d2fc3bb7ef4ab47bd6630e37d8fc70c0dd75acca0</footer></main></body></html>

@@ -1,0 +1,176 @@
+name: production-acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: industrial-shadow-production-acceptance
+  cancel-in-progress: false
+
+jobs:
+  target-gates:
+    environment: production-acceptance
+    runs-on: [self-hosted, industrial-shadow-acceptance]
+    timeout-minutes: 240
+    env:
+      PYTHONPATH: backend/src:services/simulator/src:services/collector/src:services/edge-gateway/src
+      SHADOW_ACCEPTANCE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      SHADOW_OIDC_ISSUER: ${{ vars.SHADOW_OIDC_ISSUER }}
+      SHADOW_OIDC_AUDIENCE: ${{ vars.SHADOW_OIDC_AUDIENCE }}
+      SHADOW_OIDC_JWKS_URL: ${{ vars.SHADOW_OIDC_JWKS_URL }}
+      SHADOW_OIDC_CLIENT_ID: ${{ vars.SHADOW_OIDC_CLIENT_ID }}
+      SHADOW_OIDC_AUTHORIZATION_URL: ${{ vars.SHADOW_OIDC_AUTHORIZATION_URL }}
+      SHADOW_OIDC_TOKEN_URL: ${{ vars.SHADOW_OIDC_TOKEN_URL }}
+      SHADOW_OIDC_END_SESSION_URL: ${{ vars.SHADOW_OIDC_END_SESSION_URL }}
+      SHADOW_PRODUCTION_API_URL: ${{ vars.SHADOW_PRODUCTION_API_URL }}
+      SHADOW_OIDC_PROBE_SECRETS_FILE: ${{ secrets.SHADOW_OIDC_PROBE_SECRETS_FILE }}
+      SHADOW_OBJECT_STORAGE_BUCKET: ${{ vars.SHADOW_OBJECT_STORAGE_BUCKET }}
+      SHADOW_OBJECT_STORAGE_REGION: ${{ vars.SHADOW_OBJECT_STORAGE_REGION }}
+      SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/production-acceptance
+      SHADOW_OBJECT_STORAGE_KMS_KEY_ID: ${{ vars.SHADOW_OBJECT_STORAGE_KMS_KEY_ID }}
+      SHADOW_AWS_ACCOUNT_ID: ${{ vars.SHADOW_AWS_ACCOUNT_ID }}
+      SHADOW_REQUIRE_OBJECT_LOCK: "true"
+      SHADOW_RESTORE_SOURCE_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_SOURCE_DATABASE_URL }}
+      SHADOW_RESTORE_TARGET_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_TARGET_DATABASE_URL }}
+      SHADOW_RESTORE_APPLICATION_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_APPLICATION_DATABASE_URL }}
+      SHADOW_RESTORE_BACKUP_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_BACKUP_DATABASE_URL }}
+      SHADOW_RESTORE_MAXIMUM_SECONDS: ${{ vars.SHADOW_RESTORE_MAXIMUM_SECONDS }}
+      SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES: ${{ vars.SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES }}
+      SHADOW_MANAGED_POSTGRESQL_PROVIDER: ${{ vars.SHADOW_MANAGED_POSTGRESQL_PROVIDER }}
+      SHADOW_MANAGED_POSTGRESQL_INSTANCE_DIGEST: ${{ vars.SHADOW_MANAGED_POSTGRESQL_INSTANCE_DIGEST }}
+      SHADOW_ALLOW_DESTRUCTIVE_RESTORE_DRILL: "true"
+      SHADOW_DATABASE_TENANT_ROLES: shadow_api,shadow_action,shadow_collector
+      SHADOW_DATABASE_MAINTENANCE_ROLE: shadow_worker
+      SHADOW_DATABASE_BACKUP_ROLE: shadow_backup
+      SHADOW_OPCUA_SERVER_CERTIFICATE: ${{ secrets.SHADOW_OPCUA_SERVER_CERTIFICATE }}
+      SHADOW_OPCUA_CLIENT_CERTIFICATE: ${{ secrets.SHADOW_OPCUA_CLIENT_CERTIFICATE }}
+      SHADOW_OPCUA_NEXT_SERVER_CERTIFICATE: ${{ secrets.SHADOW_OPCUA_NEXT_SERVER_CERTIFICATE }}
+      SHADOW_OPCUA_NEXT_CLIENT_CERTIFICATE: ${{ secrets.SHADOW_OPCUA_NEXT_CLIENT_CERTIFICATE }}
+      SHADOW_OPCUA_CLIENT_PRIVATE_KEY: ${{ secrets.SHADOW_OPCUA_CLIENT_PRIVATE_KEY }}
+      SHADOW_OPCUA_NEXT_CLIENT_PRIVATE_KEY: ${{ secrets.SHADOW_OPCUA_NEXT_CLIENT_PRIVATE_KEY }}
+      SHADOW_OPCUA_CA_BUNDLE: ${{ secrets.SHADOW_OPCUA_CA_BUNDLE }}
+      SHADOW_OPCUA_CRL_FILE: ${{ secrets.SHADOW_OPCUA_CRL_FILE }}
+      SHADOW_OPCUA_APPLICATION_URI: ${{ vars.SHADOW_OPCUA_APPLICATION_URI }}
+      SHADOW_OPCUA_CLIENT_APPLICATION_URI: ${{ vars.SHADOW_OPCUA_CLIENT_APPLICATION_URI }}
+      SHADOW_CERTIFICATE_FINGERPRINT: ${{ vars.SHADOW_CERTIFICATE_FINGERPRINT }}
+      SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: ${{ vars.SHADOW_CLIENT_CERTIFICATE_FINGERPRINT }}
+      SHADOW_NEXT_SERVER_CERTIFICATE_FINGERPRINT: ${{ vars.SHADOW_NEXT_SERVER_CERTIFICATE_FINGERPRINT }}
+      SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: ${{ vars.SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT }}
+      SHADOW_OPCUA_SECURITY_STRING: ${{ secrets.SHADOW_OPCUA_SECURITY_STRING }}
+      SHADOW_OPCUA_PROBE_CONFIG: ${{ vars.SHADOW_OPCUA_PROBE_CONFIG }}
+      SHADOW_NETWORK_PROBE_CONFIG: ${{ vars.SHADOW_NETWORK_PROBE_CONFIG }}
+      SHADOW_PRODUCTION_NETWORK_PROBE_CONFIRMATION: ${{ secrets.SHADOW_PRODUCTION_NETWORK_PROBE_CONFIRMATION }}
+      SHADOW_LOAD_PROBE_CONFIG: ${{ vars.SHADOW_LOAD_PROBE_CONFIG }}
+      SHADOW_LOAD_PROBE_SECRETS_FILE: ${{ secrets.SHADOW_LOAD_PROBE_SECRETS_FILE }}
+      SHADOW_SECURITY_ASSURANCE_BUNDLE: ${{ secrets.SHADOW_SECURITY_ASSURANCE_BUNDLE }}
+      SHADOW_PRIVACY_ASSURANCE_BUNDLE: ${{ secrets.SHADOW_PRIVACY_ASSURANCE_BUNDLE }}
+      SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE: ${{ secrets.SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE }}
+      SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE: ${{ secrets.SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE }}
+      SHADOW_CONTAINER_SCAN_REPORT: docs/evidence/batch-24/production/container-scan.sarif.json
+      SHADOW_KUBERNETES_DRILL_CONFIG: ${{ vars.SHADOW_KUBERNETES_DRILL_CONFIG }}
+      SHADOW_CHAOS_DRILL_CONFIG: ${{ vars.SHADOW_CHAOS_DRILL_CONFIG }}
+      SHADOW_DRILL_DATABASE_URL: ${{ secrets.SHADOW_DRILL_DATABASE_URL }}
+      SHADOW_PRODUCTION_DRILL_CONFIRMATION: ${{ secrets.SHADOW_PRODUCTION_DRILL_CONFIRMATION }}
+      SHADOW_PRODUCTION_CHAOS_CONFIRMATION: ${{ secrets.SHADOW_PRODUCTION_CHAOS_CONFIRMATION }}
+      SHADOW_CANDIDATE_IMAGE: ${{ vars.SHADOW_CANDIDATE_IMAGE }}
+      SHADOW_BUILD_DIGEST: ${{ vars.SHADOW_BUILD_DIGEST }}
+      SHADOW_SIMULATOR_BUILD_DIGEST: ${{ vars.SHADOW_SIMULATOR_BUILD_DIGEST }}
+      SHADOW_PRODUCTION_ENVIRONMENT_DIGEST: ${{ vars.SHADOW_PRODUCTION_ENVIRONMENT_DIGEST }}
+      SHADOW_DEPLOYMENT_PLAN_DIGEST: ${{ vars.SHADOW_DEPLOYMENT_PLAN_DIGEST }}
+      SHADOW_DEPLOYMENT_PLAN_BUNDLE: ${{ secrets.SHADOW_DEPLOYMENT_PLAN_BUNDLE }}
+      SHADOW_PRODUCTION_DEPLOYMENT_PLAN: docs/evidence/batch-24/production-deployment/deployment-plan.json
+      SHADOW_FORMAL_BENCHMARK_BUNDLE: ${{ secrets.SHADOW_FORMAL_BENCHMARK_BUNDLE }}
+      SHADOW_ASSESSOR_TRUST_STORE: docs/evidence/batch-24/production/assessor-trust-store.json
+      SHADOW_ASSESSOR_TRUST_STORE_SOURCE: ${{ secrets.SHADOW_ASSESSOR_TRUST_STORE }}
+      SHADOW_FORMAL_BENCHMARK_REPORT: docs/evidence/batch-24/production/formal-benchmark/report.json
+      SHADOW_SECURITY_ASSURANCE_REPORT: docs/evidence/batch-24/production/security-assurance/report.json
+      SHADOW_PRIVACY_ASSURANCE_REPORT: docs/evidence/batch-24/production/privacy-assurance/report.json
+      SHADOW_ACCESSIBILITY_ASSURANCE_REPORT: docs/evidence/batch-24/production/accessibility-assurance/report.json
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: "3.12"}
+      - name: Install production probe dependencies
+        run: python -m pip install --require-hashes -r backend/requirements.lock
+      - name: Stage signed target reports and public signer trust store
+        run: |
+          install -d docs/evidence/batch-24/production/formal-benchmark
+          install -d docs/evidence/batch-24/production/security-assurance
+          install -d docs/evidence/batch-24/production/privacy-assurance
+          install -d docs/evidence/batch-24/production/accessibility-assurance
+          install -d docs/evidence/batch-24/production-deployment
+          test -d "$SHADOW_FORMAL_BENCHMARK_BUNDLE" && cp -R "$SHADOW_FORMAL_BENCHMARK_BUNDLE"/. docs/evidence/batch-24/production/formal-benchmark/ || true
+          test -d "$SHADOW_SECURITY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_SECURITY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/security-assurance/ || true
+          test -d "$SHADOW_PRIVACY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_PRIVACY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/privacy-assurance/ || true
+          test -d "$SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/accessibility-assurance/ || true
+          test -d "$SHADOW_DEPLOYMENT_PLAN_BUNDLE" && cp -R "$SHADOW_DEPLOYMENT_PLAN_BUNDLE"/. docs/evidence/batch-24/production-deployment/ || true
+          test -f "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE" && install -m 0644 "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE" "$SHADOW_ASSESSOR_TRUST_STORE" || true
+      - name: Fail-closed non-mutating production input preflight
+        run: python tools/production_gate.py preflight --output docs/evidence/batch-24/production/preflight.json
+      - name: Execute bundled local diagnostic benchmark
+        run: python tools/production_gate.py benchmark_local --output docs/evidence/batch-24/production/benchmark_local.json --summary docs/evidence/batch-24/production/benchmark-local-summary.json
+      - name: Independently recompute formal 150-Episode exact-bundle Gate
+        run: python tools/production_gate.py benchmark_150 --output docs/evidence/batch-24/production/benchmark_150.json
+        continue-on-error: true
+      - name: Verify live OIDC and persona RBAC
+        run: python tools/production_gate.py oidc --output docs/evidence/batch-24/production/oidc.json
+        continue-on-error: true
+      - name: Execute managed PostgreSQL restore drill
+        run: python tools/production_gate.py backup_restore --output docs/evidence/batch-24/production/backup_restore.json
+        continue-on-error: true
+      - name: Verify S3 KMS controls and round trip
+        run: python tools/production_gate.py s3 --output docs/evidence/batch-24/production/s3.json
+        continue-on-error: true
+      - name: Verify external CA and revocation material
+        run: python tools/production_gate.py external_ca --output docs/evidence/batch-24/production/external_ca.json
+        continue-on-error: true
+      - name: Verify real OT read-only interoperability
+        run: python tools/production_gate.py real_ot --output docs/evidence/batch-24/production/real_ot.json
+        continue-on-error: true
+      - name: Verify live NetworkPolicy enforcement by plane
+        run: python tools/production_gate.py network_policy --output docs/evidence/batch-24/production/network_policy.json
+        continue-on-error: true
+      - name: Scan both immutable release images with Docker Scout
+        run: python tools/production_gate.py container_scan --output docs/evidence/batch-24/production/container_scan.json
+        continue-on-error: true
+      - name: Execute measured target load
+        run: python tools/production_gate.py performance --output docs/evidence/batch-24/production/performance.json
+        continue-on-error: true
+      - name: Execute controlled pod-loss recovery drill
+        run: python tools/production_gate.py resilience --output docs/evidence/batch-24/production/resilience.json
+        continue-on-error: true
+      - name: Execute candidate upgrade and exact rollback
+        run: python tools/production_gate.py upgrade_rollback --output docs/evidence/batch-24/production/upgrade_rollback.json
+        continue-on-error: true
+      - name: Import signed external security assessment
+        run: python tools/production_gate.py security --output docs/evidence/batch-24/production/security.json
+        continue-on-error: true
+      - name: Import signed external privacy assessment
+        run: python tools/production_gate.py privacy --output docs/evidence/batch-24/production/privacy.json
+        continue-on-error: true
+      - name: Import signed independent human accessibility assessment
+        run: python tools/production_gate.py accessibility --output docs/evidence/batch-24/production/accessibility.json
+        continue-on-error: true
+      - name: Build approval request bound to this exact evidence set
+        run: |
+          python tools/build_production_closure.py \
+            --evidence-dir docs/evidence/batch-24/production \
+            --candidate-image "$SHADOW_CANDIDATE_IMAGE" \
+            --build-digest "$SHADOW_BUILD_DIGEST" \
+            --simulator-build-digest "$SHADOW_SIMULATOR_BUILD_DIGEST" \
+            --environment-digest "$SHADOW_PRODUCTION_ENVIRONMENT_DIGEST" \
+            --deployment-plan-digest "$SHADOW_DEPLOYMENT_PLAN_DIGEST" \
+            --approval-request docs/evidence/batch-24/production/approval-request.json || test $? -eq 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: production-acceptance-evidence
+          path: |
+            docs/evidence/batch-24/production
+            docs/evidence/batch-24/production-deployment
+          if-no-files-found: error
+          retention-days: 30

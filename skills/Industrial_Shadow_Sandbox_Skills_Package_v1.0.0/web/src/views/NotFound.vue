@@ -1,0 +1,1 @@
+<template><section class="panel"><p class="eyebrow">404</p><h1>Workspace not found</h1><p>The requested route is not registered or unavailable for this identity.</p><RouterLink to="/">Return to overview</RouterLink></section></template>

@@ -1,0 +1,15 @@
+{
+  "model_id": "pump-tank-process",
+  "version": 1,
+  "step_ms": 100,
+  "non_safety_model": true,
+  "parameters": {
+    "tank_area_m2": 6.0,
+    "tank_capacity_m": 10.0,
+    "pump_max_flow_m3s": 0.08,
+    "outlet_coefficient": 0.028,
+    "thermal_capacity_j_per_c": 3000000,
+    "heat_loss_w_per_c": 900
+  }
+}
+

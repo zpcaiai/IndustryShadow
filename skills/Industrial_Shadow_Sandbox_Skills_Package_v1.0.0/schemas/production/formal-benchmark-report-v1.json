@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:formal-benchmark-report:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "benchmark_id", "assessor", "started_at", "completed_at",
+    "candidate_image", "build_digest", "simulator_build_digest", "suite_digest",
+    "bundle_digest", "result_digest", "evaluation_digest", "certification_digest",
+    "target_profile_digest", "artifacts", "limitations", "public_key_b64",
+    "report_digest", "signature_b64"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "benchmark_id": {"type": "string", "minLength": 1},
+    "assessor": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "candidate_image": {"type": "string", "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"},
+    "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "simulator_build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "suite_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "bundle_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "result_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "evaluation_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "certification_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "target_profile_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "path", "sha256"],
+        "properties": {
+          "kind": {"enum": ["episode_results", "measurement_log", "target_profile"]},
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "limitations": {"type": "array", "maxItems": 0},
+    "public_key_b64": {"type": "string", "minLength": 40},
+    "report_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "signature_b64": {"type": "string", "minLength": 80}
+  }
+}

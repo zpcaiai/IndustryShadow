@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:production-closure-input:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "approval", "gates", "red_lines", "artifacts", "attestations", "signatories"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "status": {"const": "verified"},
+    "approval": {
+      "type": "object",
+      "required": ["schema_version", "acceptance_run_id", "release_digest", "trust_store_digest", "gate_digests", "attestation_digests", "release_coordinates", "scope", "exclusions", "approval_digest"]
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["production_preflight", "postgresql_migration", "backup_restore", "oidc", "s3", "opcua_interoperability", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"],
+      "properties": {
+        "production_preflight": {"const": "PASSED"},
+        "postgresql_migration": {"const": "PASSED"},
+        "backup_restore": {"const": "PASSED"},
+        "oidc": {"const": "PASSED"},
+        "s3": {"const": "PASSED"},
+        "opcua_interoperability": {"const": "PASSED"},
+        "network_policy": {"const": "PASSED"},
+        "container_scan": {"const": "PASSED"},
+        "security": {"const": "PASSED"},
+        "resilience": {"const": "PASSED"},
+        "performance": {"const": "PASSED"},
+        "privacy": {"const": "PASSED"},
+        "accessibility": {"const": "PASSED"},
+        "upgrade_rollback": {"const": "PASSED"},
+        "benchmark_150": {"const": "PASSED"}
+      }
+    },
+    "red_lines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["real_write_attempts", "unauthorized_actions", "gold_exposures"],
+      "properties": {
+        "real_write_attempts": {"const": 0},
+        "unauthorized_actions": {"const": 0},
+        "gold_exposures": {"const": 0}
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "path", "sha256", "evidence_digest"],
+        "properties": {
+          "gate": {"enum": ["preflight", "oidc", "backup_restore", "s3", "external_ca", "real_ot", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"]},
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "evidence_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "attestations": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "report_path", "report_sha256", "report_digest", "trust_store_digest", "artifacts"],
+        "properties": {
+          "gate": {"enum": ["security", "privacy", "accessibility", "benchmark_150"]},
+          "report_path": {"type": "string", "minLength": 1},
+          "report_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "report_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "trust_store_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "artifacts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "sha256"],
+              "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "signatories": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["identity", "role", "approved", "signed_at", "approval_digest", "public_key_b64", "signature_b64"],
+        "properties": {
+          "identity": {"type": "string", "minLength": 1},
+          "role": {"enum": ["release_owner", "security_owner"]},
+          "approved": {"const": true},
+          "signed_at": {"type": "string", "format": "date-time"},
+          "approval_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "public_key_b64": {"type": "string", "minLength": 40},
+          "signature_b64": {"type": "string", "minLength": 80}
+        }
+      }
+    }
+  }
+}

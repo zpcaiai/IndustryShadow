@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "nodes": ["pump_efficiency_loss","bearing_friction","inlet_valve_stiction","outlet_blockage","tank_leak","heater_stuck","communication_failure","flow-response-low","mass-deficit","vibration-excess","multi-signal-stale"],
+  "edges": [
+    ["pump_efficiency_loss","flow-response-low","causes"],
+    ["bearing_friction","vibration-excess","causes"],
+    ["outlet_blockage","flow-response-low","causes"],
+    ["tank_leak","mass-deficit","causes"],
+    ["communication_failure","multi-signal-stale","causes"]
+  ],
+  "maximum_traversal_depth": 3
+}
+

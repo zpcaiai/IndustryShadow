@@ -1,0 +1,50 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: industrial-shadow-slos
+  labels: {owner: shadow-operations}
+spec:
+  groups:
+    - name: industrial-shadow.safety
+      rules:
+        - alert: IndustrialShadowSafetyPolicyViolation
+          expr: increase(shadow_safety_policy_violations_total[5m]) > 0
+          for: 0m
+          labels: {severity: critical, owner: security}
+          annotations:
+            summary: Safety boundary violation was denied
+            runbook_url: docs/runbooks/policy-violation.md
+        - alert: IndustrialShadowActionRecoveryRequired
+          expr: increase(shadow_virtual_actions_total{state="RECOVERY_REQUIRED"}[5m]) > 0
+          for: 0m
+          labels: {severity: critical, owner: runtime}
+          annotations:
+            summary: Virtual action could not verify rollback
+            runbook_url: docs/runbooks/rollback.md
+    - name: industrial-shadow.availability
+      rules:
+        - alert: IndustrialShadowApiErrorBudgetBurn
+          expr: >-
+            sum(rate(shadow_http_requests_total{status=~"5.."}[10m]))
+            / clamp_min(sum(rate(shadow_http_requests_total[10m])), 0.001) > 0.01
+          for: 10m
+          labels: {severity: warning, owner: platform}
+          annotations:
+            summary: Control API 5xx ratio exceeds one percent
+            runbook_url: docs/runbooks/incident-handling.md
+        - alert: IndustrialShadowApiLatency
+          expr: >-
+            histogram_quantile(0.95,
+            sum by (le) (rate(shadow_http_request_duration_seconds_bucket[10m]))) > 2
+          for: 15m
+          labels: {severity: warning, owner: platform}
+          annotations:
+            summary: Control API p95 latency exceeds two seconds
+            runbook_url: docs/runbooks/incident-handling.md
+        - alert: IndustrialShadowIngestionStale
+          expr: time() - max(shadow_ingestion_last_received_timestamp_seconds) > 60
+          for: 5m
+          labels: {severity: critical, owner: data-platform}
+          annotations:
+            summary: No persisted signal event within the freshness budget
+            runbook_url: docs/runbooks/collector-edge-outage.md

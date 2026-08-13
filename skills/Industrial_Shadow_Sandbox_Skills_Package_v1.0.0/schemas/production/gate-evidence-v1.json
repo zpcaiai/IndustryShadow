@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:gate-evidence:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gate", "status", "target_digest", "started_at", "completed_at", "checks", "metrics", "limitations", "tool_version", "digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "gate": {"type": "string", "minLength": 1},
+    "status": {"enum": ["PASSED", "FAILED", "NOT_RUN"]},
+    "target_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "passed", "details"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "passed": {"type": "boolean"},
+          "details": {"type": "object"}
+        }
+      }
+    },
+    "metrics": {"type": "object"},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "tool_version": {"const": "production-gate-v1"},
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:industrial-shadow:external-assurance-report:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "gate", "assessment_id", "assessor", "started_at", "completed_at", "candidate_image", "build_digest", "environment_digest", "deployment_plan_digest", "checks", "artifacts", "limitations", "public_key_b64", "report_digest", "signature_b64"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "gate": {"enum": ["security", "privacy", "accessibility"]},
+    "assessment_id": {"type": "string", "minLength": 1},
+    "assessor": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "completed_at": {"type": "string", "format": "date-time"},
+    "candidate_image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
+    "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "environment_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "deployment_plan_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "checks": {"type": "array", "minItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["name", "passed"], "properties": {"name": {"type": "string"}, "passed": {"type": "boolean"}, "details": {"type": "object"}}}},
+    "artifacts": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}}},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "public_key_b64": {"type": "string", "minLength": 40},
+    "report_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "signature_b64": {"type": "string", "minLength": 80}
+  }
+}

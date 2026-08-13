@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shadow-migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: migration, plane: data}}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: migrate
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["python", "-m", "shadow_sandbox.operations.database_roles"]
+          envFrom:
+            - configMapRef: {name: shadow-database-roles}
+            - secretRef: {name: shadow-migration-secrets}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]

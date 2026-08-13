@@ -1,0 +1,219 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-api
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: control-api}}
+  template:
+    metadata: {labels: {app: control-api, plane: control}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: api
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["uvicorn", "shadow_sandbox.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-release-coordinates}
+            - secretRef: {name: shadow-api-secrets}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /api/v1/health/ready, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /api/v1/health/live, port: http}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: runtime, mountPath: /app/.runtime}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: runtime, emptyDir: {sizeLimit: 1Gi}}
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: control-api}
+spec:
+  selector: {app: control-api}
+  ports: [{name: http, port: 8000, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: worker}}
+  template:
+    metadata: {labels: {app: worker, plane: data}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: worker
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["python", "-m", "shadow_sandbox.worker"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-release-coordinates}
+            - secretRef: {name: shadow-worker-secrets}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: action-executor}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: action-executor}}
+  template:
+    metadata: {labels: {app: action-executor, plane: action}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: action-executor
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["uvicorn", "shadow_sandbox.action_api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8020"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-release-coordinates}
+            - secretRef: {name: shadow-action-secrets}
+          ports: [{name: http, containerPort: 8020}]
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: action-executor}
+spec:
+  selector: {app: action-executor}
+  ports: [{name: http, port: 8020, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: simulator}
+spec:
+  serviceName: simulator
+  replicas: 1
+  selector: {matchLabels: {app: simulator}}
+  template:
+    metadata: {labels: {app: simulator, plane: simulator}}
+    spec:
+      serviceAccountName: shadow-simulator-storage
+      automountServiceAccountToken: true
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: simulator
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["uvicorn", "shadow_simulator.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8010"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-release-coordinates}
+            - secretRef: {name: shadow-simulator-secrets}
+          env:
+            - {name: SHADOW_DATABASE_PATH, value: /var/lib/shadow/simulator.db}
+            - {name: SHADOW_OPCUA_CERTIFICATE_PATH, value: /var/run/shadow-pki/server.crt}
+            - {name: SHADOW_OPCUA_PRIVATE_KEY_PATH, value: /var/run/shadow-pki/server.key}
+          ports:
+            - {name: http, containerPort: 8010}
+            - {name: opcua, containerPort: 4840}
+          readinessProbe: {httpGet: {path: /internal/v1/health, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /internal/v1/health, port: http}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: simulator-state, mountPath: /var/lib/shadow}
+            - {name: simulator-pki, mountPath: /var/run/shadow-pki, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: simulator-pki
+          secret: {secretName: shadow-simulator-pki, defaultMode: 0400}
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+  volumeClaimTemplates:
+    - metadata: {name: simulator-state}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: simulator}
+spec:
+  selector: {app: simulator}
+  ports:
+    - {name: http, port: 8010, targetPort: http}
+    - {name: opcua, port: 4840, targetPort: opcua}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: collector}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: collector}}
+  template:
+    metadata: {labels: {app: collector, plane: collector}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: collector
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["python", "-m", "shadow_collector.runner"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-collector-binding}
+            - secretRef: {name: shadow-collector-secrets}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web, plane: ingress}}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 101, runAsGroup: 101, fsGroup: 101, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: web
+          image: registry.example.invalid/industrial-shadow/web@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /, port: http}, periodSeconds: 20}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web}
+spec:
+  selector: {app: web}
+  ports: [{name: http, port: 80, targetPort: http}]

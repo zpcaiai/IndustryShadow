@@ -1,0 +1,2 @@
+--- attempt 1/1 ---
+PostgreSQL migrations, non-owner RLS denial, tenant-scoped resources, child rows, outbox, and idempotency passed at head 3.

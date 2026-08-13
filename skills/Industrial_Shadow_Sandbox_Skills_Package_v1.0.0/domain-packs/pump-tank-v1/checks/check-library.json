@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {"id":"verify_data_quality","category":"quality","risk":0,"simulation_only":false},
+    {"id":"compare_command_actual","category":"noninvasive","risk":0,"simulation_only":false},
+    {"id":"pressure_flow_curve","category":"residual","risk":0,"simulation_only":false},
+    {"id":"current_vibration","category":"residual","risk":0,"simulation_only":false},
+    {"id":"mass_balance","category":"residual","risk":0,"simulation_only":false},
+    {"id":"virtual_step_test","category":"active","risk":2,"simulation_only":true,"rollback":"restore_snapshot"},
+    {"id":"post_recovery_verification","category":"verification","risk":0,"simulation_only":false}
+  ]
+}
+

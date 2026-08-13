@@ -1,0 +1,1 @@
+<script setup lang="ts">import ImportWorkbench from '../features/imports/ImportWorkbench.vue'</script><template><section class="view-head"><div><p class="eyebrow">DATA ONBOARDING</p><h1>Historical imports</h1><p>Preserve source values, timestamps, units, quality, rejects, and lineage.</p></div></section><ImportWorkbench /></template>

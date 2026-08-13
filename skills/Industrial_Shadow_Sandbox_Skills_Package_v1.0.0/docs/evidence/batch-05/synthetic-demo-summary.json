@@ -1,0 +1,8 @@
+{
+  "frames": 100,
+  "episodes": 174,
+  "fault_episodes": 120,
+  "normal_episodes": 54,
+  "gate_passed": true,
+  "gate_reasons": []
+}
