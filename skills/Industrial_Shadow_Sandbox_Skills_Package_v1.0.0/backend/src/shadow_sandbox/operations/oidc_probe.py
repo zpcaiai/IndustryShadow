@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from typing import Any, ClassVar
 from urllib.error import HTTPError
@@ -15,6 +16,21 @@ from shadow_sandbox.security.oidc import OidcValidator
 from .evidence import GateCheck, GateEvidence, complete
 
 HttpGet = Callable[[str, Mapping[str, str]], tuple[int, Mapping[str, Any]]]
+DIGEST = re.compile(r"^[a-f0-9]{64}$")
+RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+BROWSER_BINDING_KEYS = frozenset(
+    {
+        "acceptance_run_id",
+        "release_digest",
+        "candidate_image_digest",
+        "web_candidate_image_digest",
+        "build_digest",
+        "simulator_build_digest",
+        "environment_digest",
+        "deployment_plan_digest",
+    }
+)
+BROWSER_MAXIMUM_GATE_LAG_SECONDS = 10 * 60
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -120,6 +136,7 @@ class OidcLiveProbe:
         web_base_url: str | None = None,
         service_client_ids: tuple[str, ...] = (),
         algorithms: tuple[str, ...] = ("RS256",),
+        browser_binding: Mapping[str, str],
         http_get: HttpGet = _http_get,
         validator: OidcValidator | None = None,
     ) -> None:
@@ -164,6 +181,22 @@ class OidcLiveProbe:
         self.algorithms = tuple(algorithms)
         if not self.algorithms:
             raise DomainError("OIDC_PROBE_ALGORITHMS_INVALID", "OIDC algorithms are required")
+        if (
+            set(browser_binding) != BROWSER_BINDING_KEYS
+            or not RUN_ID.fullmatch(str(browser_binding.get("acceptance_run_id", "")))
+            or any(
+                not DIGEST.fullmatch(str(browser_binding.get(name, "")))
+                or str(browser_binding.get(name, "")) == "0" * 64
+                for name in BROWSER_BINDING_KEYS.difference({"acceptance_run_id"})
+            )
+        ):
+            raise DomainError(
+                "OIDC_BROWSER_BINDING_INVALID",
+                "browser journey binding must name one acceptance run and immutable release",
+            )
+        self.browser_binding = {
+            name: str(browser_binding[name]) for name in BROWSER_BINDING_KEYS
+        }
         self.validator = validator or OidcValidator(
             self.issuer,
             audience,
@@ -314,7 +347,7 @@ class OidcLiveProbe:
                 GateCheck("invalid_token_denied", invalid_status == 401),
             )
         )
-        checks.extend(self._browser_checks(browser_journey))
+        checks.extend(self._browser_checks(browser_journey, gate_started_at=started))
         return complete(
             "oidc",
             started_at=started,
@@ -334,9 +367,20 @@ class OidcLiveProbe:
             },
         )
 
-    def _browser_checks(self, journey: Mapping[str, Any] | None) -> list[GateCheck]:
+    def _browser_checks(
+        self,
+        journey: Mapping[str, Any] | None,
+        *,
+        gate_started_at: str,
+    ) -> list[GateCheck]:
+        failed = [
+            GateCheck("browser_journey_run_binding", False),
+            GateCheck("browser_journey_freshness", False),
+            GateCheck("browser_pkce_journey", False),
+        ]
         if journey is None or set(journey) != {
             "schema_version",
+            *BROWSER_BINDING_KEYS,
             "started_at",
             "completed_at",
             "web_origin",
@@ -345,23 +389,34 @@ class OidcLiveProbe:
             "personas",
             "checks",
         }:
-            return [GateCheck("browser_pkce_journey", False)]
+            return failed
         try:
             started = dt.datetime.fromisoformat(str(journey["started_at"]))
             completed = dt.datetime.fromisoformat(str(journey["completed_at"]))
+            gate_started = dt.datetime.fromisoformat(gate_started_at)
         except (ValueError, TypeError):
-            return [GateCheck("browser_pkce_journey", False)]
+            return failed
         values = journey.get("checks")
         personas = journey.get("personas")
         expected_origin = (
             f"{urlsplit(self.web_base_url).scheme}://{urlsplit(self.web_base_url).netloc}"
         )
-        valid = (
-            journey.get("schema_version") == 1
-            and started.tzinfo is not None
+        binding_valid = all(
+            journey.get(name) == value for name, value in self.browser_binding.items()
+        )
+        freshness_valid = (
+            started.tzinfo is not None
             and completed.tzinfo is not None
+            and gate_started.tzinfo is not None
             and started <= completed
-            and (dt.datetime.now(dt.UTC) - completed.astimezone(dt.UTC)).total_seconds() <= 4 * 3600
+            and 0
+            <= (
+                gate_started.astimezone(dt.UTC) - completed.astimezone(dt.UTC)
+            ).total_seconds()
+            <= BROWSER_MAXIMUM_GATE_LAG_SECONDS
+        )
+        functional_valid = (
+            journey.get("schema_version") == 2
             and journey.get("web_origin") == expected_origin
             and journey.get("issuer") == self.issuer
             and journey.get("client_id_digest")
@@ -372,7 +427,15 @@ class OidcLiveProbe:
             and set(values) == self.BROWSER_CHECKS
             and all(value is True for value in values.values())
         )
-        return [GateCheck("browser_pkce_journey", valid)]
+        return [
+            GateCheck("browser_journey_run_binding", binding_valid),
+            GateCheck(
+                "browser_journey_freshness",
+                freshness_valid,
+                {"maximum_gate_lag_seconds": BROWSER_MAXIMUM_GATE_LAG_SECONDS},
+            ),
+            GateCheck("browser_pkce_journey", functional_valid),
+        ]
 
 
 def canonical_browser_digest(journey: Mapping[str, Any] | None) -> str:

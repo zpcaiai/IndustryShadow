@@ -30,7 +30,11 @@ release before any live OIDC, database, storage, OT, network, load, chaos, or ro
    pod-loss injection.
 4. Confirm the OPC UA account, certificate, NodeId list, and CNI route expose only
    Browse/Read/Subscribe. The real probe has no Write, Call, or HistoryUpdate method.
-5. Confirm OIDC and load bearer files are owned by the runner account with mode `0600`.
+5. Confirm OIDC and load bearer files are runner-owned, single-link regular files with
+   exact mode `0400` or `0600`. The browser reader opens the OIDC secret with
+   `O_NOFOLLOW`, performs a bounded read through that one descriptor, and rejects any
+   owner, mode, link-count, size, inode, modification-time, or change-time drift between
+   its before/after `fstat` calls.
 6. Replace every TEST-NET and `.invalid` value in the environment overlay. Unchanged
    examples are expected to fail.
 7. Stage a signed formal benchmark bundle containing sanitized results for the exact 174
@@ -43,6 +47,17 @@ release before any live OIDC, database, storage, OT, network, load, chaos, or ro
    deployment-plan digest as the five release coordinates. Every production gate emits v2
    evidence carrying the same run ID and release digest; mixed-run or mixed-release evidence
    is rejected.
+   Set `SHADOW_OIDC_BROWSER_JOURNEY` only to
+   `web/test-results/production-oidc-journey-${SHADOW_ACCEPTANCE_RUN_ID}.json`. Preflight
+   validates that pristine output target and does not require a browser result before
+   Playwright runs. The workflow removes only that run-attempt-qualified target, and the
+   browser creates it without overwriting an existing file. Its version 2 payload carries
+   the exact acceptance run ID, release digest, backend/Web image digests, build and
+   simulator digests, target-profile digest, and deployment-plan digest. Run the OIDC gate
+   immediately afterward: it rejects a mismatched binding, a future completion time, or a
+   completion more than ten minutes before the gate started. The gate reopens the final
+   `0600`, single-link result with the same bounded, non-following descriptor discipline.
+   A result from another run or an earlier attempt cannot satisfy production OIDC evidence.
 9. Supply a runner-owned Docker Scout credential JSON with mode `0400` or `0600` and the
    exact keys `username` and `personal_access_token`. The probe authenticates inside an
    ephemeral Docker configuration, scans both immutable backend and Web digests from the
@@ -54,15 +69,59 @@ release before any live OIDC, database, storage, OT, network, load, chaos, or ro
    must exactly match the Docker ID credential so a second login cannot replace Scout
    authentication. GHCR acceptance also requires the workflow-scoped `GH_TOKEN` for
    attestation verification.
-10. Supply `SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE` as a runner-owned `0600` JSON
-    object with exact `backup` and `snapshot` session contracts. Each contract selects an
-    explicit AWS profile or a short-lived WebIdentity role session; the gate never reuses
-    the acceptance runner's ambient administrative identity. Configure distinct signed
+10. Treat the runner-side `production-probes` write as a separate, one-run mutation.
+    After the acceptance workflow exposes its run ID and attempt, but before approving the
+    `production-acceptance` environment, provision
+    `SHADOW_PRODUCTION_S3_CONTROL_PLANE_CONFIRMATION` in that environment. Its exact value
+    is the canonical digest returned below; it binds the signed target-profile digest,
+    signed bucket and acceptance prefix, and `${github.run_id}-${github.run_attempt}`. A
+    value copied from another run, bucket, prefix, or target profile is rejected. The probe
+    completes the bucket-owner/location/public-access/TLS/versioning/KMS/rotation/Object
+    Lock checks, all three lifecycle-prefix checks, and both pre-created immutable sentinel
+    bindings before it compares this confirmation or performs any `PutObject`/`DeleteObject`:
+
+    ```sh
+    PYTHONPATH=backend/src python - <<'PY'
+    import os
+    from shadow_sandbox.operations.storage_probe import s3_control_plane_mutation_confirmation
+
+    print(s3_control_plane_mutation_confirmation(
+        bucket=os.environ["SHADOW_OBJECT_STORAGE_BUCKET"],
+        prefix=os.environ["SHADOW_OBJECT_STORAGE_PREFIX"],
+        acceptance_run_id=os.environ["SHADOW_ACCEPTANCE_RUN_ID"],
+        signed_target_profile_digest=os.environ["SHADOW_PRODUCTION_ENVIRONMENT_DIGEST"],
+    ))
+    PY
+    ```
+
+11. Supply `SHADOW_PRODUCTION_S3_WORKLOAD_IDENTITY_CONFIRMATION` as the exact
+    `<namespace>:s3-workload-identity-probe` secret. The gate creates two bounded Jobs in
+    the signed target namespace, runs them with the sealed backup and snapshot
+    ServiceAccounts and their ambient workload identities, then foreground-deletes the
+    Jobs and verifies that no owned Pods remain. Before the first Job mutation, it verifies
+    the storage context's exact RBAC and both raw ServiceAccount role annotations. Each live
+    Pod must contain only the audience-bound IRSA token projection and read-only mount,
+    regional S3/STS coordinates, and an explicit IMDS prohibition. Runner profiles and
+    runner-side WebIdentity token files are not accepted as workload evidence. Configure
+    `SHADOW_REQUIRE_OBJECT_LOCK=true`; both Jobs pass that exact contract into the
+    inside-Pod probe, treat retained-version delete denial as safe disposition without
+    calling the retention API, and use the workload-specific KMS encryption context
+    `{"application":"industrial-shadow","purpose":"backup"}` or
+    `{"application":"industrial-shadow","purpose":"snapshot"}`.
+    Configure
+    distinct signed
     `SHADOW_BACKUP_OBJECT_STORAGE_PREFIX`, `SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX`, and
     acceptance-only `SHADOW_OBJECT_STORAGE_PREFIX` values plus a
     pre-created forbidden sentinel under the opposite prefix for each identity. Both roles
     must complete a version-pinned KMS round trip and receive AccessDenied for the
-    cross-prefix sentinel.
+    cross-prefix sentinel. The sealed/live `storage-identity-probe-egress` NetworkPolicy
+    must resolve its fail-closed endpoint placeholders to the exact regional S3 and STS
+    HTTPS addresses before the network gate authorizes either Job.
+12. Configure four distinct kubeconfig contexts for the same signed cluster:
+    `SHADOW_KUBERNETES_NETWORK_CONTEXT`, `SHADOW_KUBERNETES_STORAGE_CONTEXT`,
+    `SHADOW_KUBERNETES_CHAOS_CONTEXT`, and `SHADOW_KUBERNETES_ROLLBACK_CONTEXT`.
+    Each gate independently verifies the cluster UID and API CA, then requires its own
+    exact least-privilege RBAC set. A shared over-privileged acceptance identity is rejected.
 
 ## Trusted signer registry
 
@@ -223,6 +282,50 @@ readiness. Any runtime rollout or readiness failure reapplies the prior manifest
 for every rollback rollout before returning failed evidence. This workflow remains NOT_RUN
 until a real closure artifact and target cluster are supplied.
 
+Each deployment writes an immutable `deployment-binding.json` before cluster mutation. It
+binds the exact signed closure input and approval digests, release and deployment-plan
+digests, target cluster UID and API CA digests, current candidate images, sealed rollback
+image set, repository, checked-out source revision, closure workflow run and run attempt,
+immutable closure artifact ID and SHA-256 digest, and deployment workflow run and run
+attempt. The workflow requires exactly one non-expired closure artifact whose creation
+time falls inside the selected latest run attempt; a constant-name artifact left by an
+older rerun attempt fails closed. Before the first mutating `kubectl`, an immutable recovery
+envelope binds that record to the workflow run, closure, plan, namespace, cluster UID, and
+API CA. The publisher then fsyncs `candidate_mutation_started` before its first apply, so a
+terminated process cannot misclassify a partial apply as a no-op. A final execution envelope
+binds the immutable record to the digest-valid deployment evidence and completed journal by
+their SHA-256 digests.
+
+On a failed or cancelled deploy step, the same workflow attempt invokes the separately
+authorized recovery entry point with the exact `<namespace>:<plan-id>:rollback` protected
+secret. It validates the original binding, recovery envelope, and strict journal before any
+write. A journal that is only an authentic read-only preflight prefix produces a verified
+no-op; an unfinished mutation restores the sealed prior bundle; an already completed
+rollback is read back without another apply. Each outcome receives its own binding,
+recovery envelope, journal, evidence, and final execution envelope. The original deploy
+failure/cancellation remains visible even when recovery succeeds.
+
+For later recovery, select `restore-prior-bundle`, supply the failed or cancelled deployment
+run ID, and provide that same rollback-specific secret. The workflow downloads the exact
+run-attempt-qualified artifact. A normally failed run must contain digest-valid failed
+deployment evidence plus its final execution envelope. A cancelled run may lack those final
+files, but it is eligible only when its immutable recovery envelope and strict journal prove
+that candidate mutation began and the rollback remains unfinished. The new restore binding
+also records the selected prior artifact ID and SHA-256 digest. A deploy authorization cannot
+call either recovery entry point, a rollback authorization cannot publish candidate
+manifests, and a completed deployment/rollback or mismatched candidate, plan, closure, run,
+artifact, source, or cluster blocks recovery before Kubernetes mutation.
+
+The repository-visible weekly `.github/workflows/scheduled-closure-revalidation.yml`
+entrypoint is rendered from the package `recertification.yml` template and deliberately
+named `scheduled-closure-revalidation`. It re-runs deterministic/policy checks and verifies the
+previously signed closure only after applying the same exact run-attempt, artifact ID,
+artifact SHA-256, source revision, and creation-time checks, then publishes a status
+artifact that keeps
+`live_production_recertification=NOT_RUN`. It is not a new production acceptance, external
+review, human sign-off, or certification. Those require a fresh release candidate,
+production-acceptance run, signed closure, and their new evidence.
+
 Never sign evidence from one run and attach it to a second run. The closure builder and
 independent checker require all 17 source gates to carry the same acceptance run ID and
 release digest, verify evidence freshness, and bind all report, artifact, trust-store, and
@@ -241,7 +344,13 @@ digests, bounded metrics, signed assessor statements, and artifact hashes.
   probe version is deliberately retained and must expire through the verified lifecycle
   policy; attempting to bypass retention would invalidate the control being tested.
 - Network probe Pods are deleted in a `finally` path.
-- If the Kubernetes workflow is interrupted outside its `finally` path, deploy the captured
-  rollback digest and run `kubectl rollout status` before reopening traffic.
+- Let the same-run recovery step finish whenever a deployment step fails or is cancelled;
+  it uses the rollback-specific confirmation and never clears the original workflow
+  outcome. If the journal proves an unfinished mutation after that attempt, use
+  `restore-prior-bundle` with the exact failed/cancelled run artifact. Normal failures require
+  final failed evidence and an execution envelope; cancellation recovery requires the
+  immutable activation envelope and strict unfinished journal. Missing or inconsistent
+  records fail closed, so the incident commander must use the separately reviewed cluster
+  recovery procedure rather than fabricating resumable evidence.
 - Any real write attempt, Gold exposure, unauthorized action, evidence digest mismatch, or
   missing second signature blocks release without waiver.

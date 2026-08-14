@@ -12,7 +12,10 @@ from typing import Any
 from jsonschema import Draft202012Validator, FormatChecker
 
 from shadow_sandbox.common.models import canonical_digest
-from shadow_sandbox.evaluation.formal_benchmark import FormalBenchmarkImporter
+from shadow_sandbox.evaluation.formal_benchmark import (
+    FormalBenchmarkImporter,
+    validate_s3_closure_evidence,
+)
 from shadow_sandbox.operations.container_scan import DockerScoutImageProbe
 from shadow_sandbox.operations.evidence import read_evidence
 from shadow_sandbox.operations.external_assurance import ExternalAssuranceImporter
@@ -304,6 +307,7 @@ def main() -> int:
             raise ValueError("candidate coordinates mismatch")
     except Exception:  # noqa: BLE001 - invalid candidate bundle blocks release
         errors.append("release candidate manifest is missing, invalid, or not closure-bound")
+    deployment_plan: ProductionDeploymentPlan | None = None
     try:
         deployment_plan = ProductionDeploymentPlan.load(
             ROOT,
@@ -351,6 +355,7 @@ def main() -> int:
         errors.append("approval trust store digest mismatch")
     attestation_digests: dict[str, str] = {}
     attestation_gates: set[str] = set()
+    signed_target_profile: dict[str, Any] | None = None
     for attestation in data.get("attestations", []):
         gate = str(attestation.get("gate", ""))
         if (
@@ -421,7 +426,7 @@ def main() -> int:
                     ),
                 ).import_report(report)
             else:
-                reproduced = FormalBenchmarkImporter(
+                reproduced, target_profile = FormalBenchmarkImporter(
                     ROOT,
                     candidate_image=str(release_coordinates.get("candidate_image", "")),
                     build_digest=str(release_coordinates.get("build_digest", "")),
@@ -435,7 +440,8 @@ def main() -> int:
                     deployment_plan_digest=str(
                         release_coordinates.get("deployment_plan_digest", "")
                     ),
-                ).import_report(report)
+                ).import_report_with_target_profile(report)
+                signed_target_profile = dict(target_profile)
             if reproduced.digest != observed_gate_digests.get(gate):
                 raise ValueError("attestation does not reproduce gate evidence")
             attestation_digests[gate] = canonical_digest(attestation)
@@ -448,6 +454,16 @@ def main() -> int:
         "benchmark_150",
     }:
         errors.append("source attestation set is incomplete")
+    try:
+        if deployment_plan is None or signed_target_profile is None:
+            raise ValueError("storage release binding prerequisites are incomplete")
+        validate_s3_closure_evidence(
+            observed_evidence["s3"], signed_target_profile, deployment_plan
+        )
+    except Exception:  # noqa: BLE001 - any storage binding failure blocks release
+        errors.append(
+            "S3 evidence is not independently bound to the signed target profile and plan"
+        )
 
     claimed_approval_digest = approval.get("approval_digest")
     approval_payload = {

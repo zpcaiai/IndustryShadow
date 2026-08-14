@@ -13,15 +13,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from shadow_sandbox.common.models import DomainError, canonical_digest, utc_now
+from shadow_sandbox.common.object_storage import validate_object_key
 from shadow_sandbox.common.opcua_readonly import (
+    normalize_opcua_fingerprint,
     normalize_opcua_security_string,
     opcua_runtime_binding_digest,
 )
+from shadow_sandbox.common.secure_files import read_private_file
 
 from .backup_job import database_coordinate_digest
 from .evidence import GateCheck, GateEvidence, complete
 from .production_deployment import ProductionDeploymentPlan
 from .restore_drill import BackupRestoreReceipt
+from .storage_probe import s3_control_plane_mutation_confirmation
 from .supply_chain import ReleaseCandidate
 from .trust_store import SignerTrustStore
 
@@ -52,7 +56,10 @@ REQUIRED_ENV = (
     "SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS",
     "SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS",
     "SHADOW_PRODUCTION_DEPLOYMENT_PLAN",
-    "SHADOW_KUBERNETES_CONTEXT",
+    "SHADOW_KUBERNETES_NETWORK_CONTEXT",
+    "SHADOW_KUBERNETES_STORAGE_CONTEXT",
+    "SHADOW_KUBERNETES_CHAOS_CONTEXT",
+    "SHADOW_KUBERNETES_ROLLBACK_CONTEXT",
     "SHADOW_ASSESSOR_TRUST_STORE",
     "SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION",
     "SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY",
@@ -93,7 +100,8 @@ REQUIRED_ENV = (
     "SHADOW_MANAGED_POSTGRESQL_RESTORE_RESOURCE_ARN",
     "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN",
     "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN",
-    "SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE",
+    "SHADOW_PRODUCTION_S3_CONTROL_PLANE_CONFIRMATION",
+    "SHADOW_PRODUCTION_S3_WORKLOAD_IDENTITY_CONFIRMATION",
     "SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY",
     "SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY",
     "SHADOW_ALLOW_DESTRUCTIVE_RESTORE_DRILL",
@@ -143,7 +151,6 @@ CONFIG_PATHS = (
     "SHADOW_SECURITY_ASSURANCE_REPORT",
     "SHADOW_PRIVACY_ASSURANCE_REPORT",
     "SHADOW_ACCESSIBILITY_ASSURANCE_REPORT",
-    "SHADOW_OIDC_BROWSER_JOURNEY",
 )
 PUBLIC_FILES = (
     "SHADOW_RELEASE_CANDIDATE_MANIFEST",
@@ -167,7 +174,6 @@ SECRET_FILES = (
     "SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE",
     "SHADOW_IMAGE_REGISTRY_CREDENTIALS_FILE",
     "SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE",
-    "SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE",
 )
 
 
@@ -192,6 +198,41 @@ def _postgres_tls(url: str) -> bool:
 
 def _release_digest(value: str) -> bool:
     return bool(DIGEST.fullmatch(value) and value != "0" * 64)
+
+
+def validate_oidc_browser_journey_output_target(
+    repository_root: Path,
+    path_value: str,
+    acceptance_run_id: str,
+) -> bool:
+    """Require a pristine, run-attempt-qualified output below web/test-results."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", acceptance_run_id):
+        return False
+    expected = Path(
+        "web",
+        "test-results",
+        f"production-oidc-journey-{acceptance_run_id}.json",
+    )
+    raw = Path(path_value)
+    if raw.is_absolute() or path_value != expected.as_posix():
+        return False
+    parent = repository_root / expected.parent
+    if not parent.is_dir():
+        return False
+    cursor = repository_root
+    for part in expected.parent.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            return False
+    parent_stat = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+    ):
+        return False
+    target = repository_root / expected
+    return not target.exists() and not target.is_symlink()
 
 
 def _docker_scout_available() -> bool:
@@ -222,13 +263,30 @@ class ProductionPreflight:
     def run(self) -> GateEvidence:
         started = utc_now()
         missing = [name for name in REQUIRED_ENV if not self._value(name)]
+        repository_root = Path(__file__).resolve().parents[4]
+        oidc_browser_journey_output_target_valid = validate_oidc_browser_journey_output_target(
+            repository_root,
+            self._value("SHADOW_OIDC_BROWSER_JOURNEY"),
+            self._value("SHADOW_ACCEPTANCE_RUN_ID"),
+        )
         files = [*CONFIG_PATHS, *PUBLIC_FILES, *SECRET_FILES, "SHADOW_ASSESSOR_TRUST_STORE"]
-        existing_files = [name for name in files if Path(self._value(name)).is_file()]
-        secret_modes = [
-            stat.S_IMODE(Path(self._value(name)).stat().st_mode)
-            for name in SECRET_FILES
-            if Path(self._value(name)).is_file()
+        public_file_names = [
+            *CONFIG_PATHS,
+            *PUBLIC_FILES,
+            "SHADOW_ASSESSOR_TRUST_STORE",
         ]
+        existing_files = [name for name in public_file_names if Path(self._value(name)).is_file()]
+        secure_secret_files: list[str] = []
+        for name in SECRET_FILES:
+            try:
+                read_private_file(
+                    self._value(name),
+                    code="PREFLIGHT_SECRET_FILE_INVALID",
+                )
+            except DomainError:
+                continue
+            secure_secret_files.append(name)
+        existing_files.extend(secure_secret_files)
         configs: dict[str, Mapping[str, Any]] = {}
         placeholder_free = True
         try:
@@ -261,6 +319,24 @@ class ProductionPreflight:
         simulator_digest = self._value("SHADOW_SIMULATOR_BUILD_DIGEST")
         environment_digest = self._value("SHADOW_PRODUCTION_ENVIRONMENT_DIGEST")
         deployment_plan_digest = self._value("SHADOW_DEPLOYMENT_PLAN_DIGEST")
+        kubernetes_contexts = tuple(
+            self._value(name)
+            for name in (
+                "SHADOW_KUBERNETES_NETWORK_CONTEXT",
+                "SHADOW_KUBERNETES_STORAGE_CONTEXT",
+                "SHADOW_KUBERNETES_CHAOS_CONTEXT",
+                "SHADOW_KUBERNETES_ROLLBACK_CONTEXT",
+            )
+        )
+        kubernetes_contexts_isolated = bool(
+            len(set(kubernetes_contexts)) == 4
+            and all(
+                value
+                and len(value) <= 253
+                and not any(character.isspace() or ord(character) < 0x20 for character in value)
+                for value in kubernetes_contexts
+            )
+        )
         deployment_plan: ProductionDeploymentPlan | None = None
         release_candidate: ReleaseCandidate | None = None
         backup_receipt: BackupRestoreReceipt | None = None
@@ -279,9 +355,7 @@ class ProductionPreflight:
                 self._value("SHADOW_RELEASE_CANDIDATE_MANIFEST"),
                 expected_repository=self._value("SHADOW_RELEASE_REPOSITORY"),
                 expected_run_id=self._value("SHADOW_RELEASE_RUN_ID"),
-                expected_run_attempt=int(
-                    self._value("SHADOW_RELEASE_RUN_ATTEMPT")
-                ),
+                expected_run_attempt=int(self._value("SHADOW_RELEASE_RUN_ATTEMPT")),
             )
         except Exception:  # noqa: BLE001 - invalid release candidates fail preflight
             release_candidate = None
@@ -294,78 +368,15 @@ class ProductionPreflight:
             )
         except Exception:  # noqa: BLE001 - malformed restore receipts fail preflight
             backup_receipt = None
-        workload_sessions_valid = False
-        try:
-            sessions = _json_file(self._value("SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE"))
-            if set(sessions) != {"backup", "snapshot"}:
-                raise DomainError(
-                    "PREFLIGHT_WORKLOAD_IDENTITY_INVALID", "two workload sessions are required"
-                )
-            for name in ("backup", "snapshot"):
-                value = sessions[name]
-                if not isinstance(value, Mapping) or set(value) != {
-                    "method",
-                    "profile",
-                    "role_arn",
-                    "web_identity_token_file",
-                    "role_session_name",
-                }:
-                    raise DomainError(
-                        "PREFLIGHT_WORKLOAD_IDENTITY_INVALID",
-                        "workload session fields are invalid",
-                    )
-                method = value.get("method")
-                profile = str(value.get("profile", ""))
-                role = str(value.get("role_arn", ""))
-                token = str(value.get("web_identity_token_file", ""))
-                session_name = str(value.get("role_session_name", ""))
-                expected_role = self._value(
-                    "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"
-                    if name == "backup"
-                    else "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"
-                )
-                token_file_valid = True
-                if method == "web_identity":
-                    token_path = Path(token)
-                    try:
-                        token_status = token_path.lstat()
-                    except OSError:
-                        token_status = None
-                    token_file_valid = bool(
-                        token_status is not None
-                        and stat.S_ISREG(token_status.st_mode)
-                        and token_status.st_nlink == 1
-                        and 1 <= token_status.st_size <= 1024 * 1024
-                        and not stat.S_IMODE(token_status.st_mode) & 0o077
-                    )
-                if (
-                    (method == "profile" and (not profile or role or token or session_name))
-                    or (
-                        method == "web_identity"
-                        and (
-                            profile
-                            or role != expected_role
-                            or not token_file_valid
-                            or not re.fullmatch(
-                                r"[A-Za-z0-9][A-Za-z0-9+=,.@_-]{1,63}",
-                                session_name,
-                            )
-                        )
-                    )
-                    or not re.fullmatch(
-                        r"arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/"
-                        r"[A-Za-z0-9+=,.@_/-]+",
-                        expected_role,
-                    )
-                    or method not in {"profile", "web_identity"}
-                ):
-                    raise DomainError(
-                        "PREFLIGHT_WORKLOAD_IDENTITY_INVALID",
-                        "workload session mode is not bound to the signed role",
-                    )
-            workload_sessions_valid = True
-        except Exception:  # noqa: BLE001 - malformed session contracts fail closed
-            workload_sessions_valid = False
+        workload_identity_probe_contract_valid = bool(
+            deployment_plan is not None
+            and self._value("SHADOW_PRODUCTION_S3_WORKLOAD_IDENTITY_CONFIRMATION")
+            == f"{deployment_plan.namespace}:s3-workload-identity-probe"
+            and validate_object_key(self._value("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY"))
+            == self._value("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY")
+            and validate_object_key(self._value("SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"))
+            == self._value("SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY")
+        )
         try:
             benchmark = configs["SHADOW_FORMAL_BENCHMARK_REPORT"]
             target_records = [
@@ -383,9 +394,9 @@ class ProductionPreflight:
                     "formal benchmark target profile binding is invalid",
                 )
             repository_root = Path(__file__).resolve().parents[4]
-            target_path = (
-                repository_root / str(target_records[0].get("path", ""))
-            ).resolve(strict=True)
+            target_path = (repository_root / str(target_records[0].get("path", ""))).resolve(
+                strict=True
+            )
             if repository_root.resolve() not in target_path.parents or target_path.is_symlink():
                 raise DomainError(
                     "PREFLIGHT_TARGET_PROFILE_INVALID", "target profile path is unsafe"
@@ -397,6 +408,22 @@ class ProductionPreflight:
             target_profile = _json_file(str(target_path))
         except Exception:  # noqa: BLE001 - target bindings must fail preflight closed
             target_profile = None
+        try:
+            s3_control_plane_mutation_authorized = bool(
+                target_profile is not None
+                and target_profile.get("s3_bucket") == self._value("SHADOW_OBJECT_STORAGE_BUCKET")
+                and target_profile.get("s3_probe_prefix")
+                == self._value("SHADOW_OBJECT_STORAGE_PREFIX")
+                and self._value("SHADOW_PRODUCTION_S3_CONTROL_PLANE_CONFIRMATION")
+                == s3_control_plane_mutation_confirmation(
+                    bucket=self._value("SHADOW_OBJECT_STORAGE_BUCKET"),
+                    prefix=self._value("SHADOW_OBJECT_STORAGE_PREFIX"),
+                    acceptance_run_id=self._value("SHADOW_ACCEPTANCE_RUN_ID"),
+                    signed_target_profile_digest=environment_digest,
+                )
+            )
+        except DomainError:
+            s3_control_plane_mutation_authorized = False
         real_ot_probe_binding_digest = ""
         try:
             ot_binding = configs["SHADOW_OPCUA_PROBE_CONFIG"]
@@ -414,19 +441,40 @@ class ProductionPreflight:
                     code="PREFLIGHT_OT_BINDING_INVALID",
                 )
             )
+            server_fingerprint = normalize_opcua_fingerprint(
+                str(ot_binding.get("certificate_fingerprint", "")),
+                code="PREFLIGHT_OT_BINDING_INVALID",
+            )
+            client_fingerprint = normalize_opcua_fingerprint(
+                str(ot_binding.get("client_certificate_fingerprint", "")),
+                code="PREFLIGHT_OT_BINDING_INVALID",
+            )
+            if (
+                server_fingerprint
+                != normalize_opcua_fingerprint(
+                    self._value("SHADOW_CERTIFICATE_FINGERPRINT"),
+                    code="PREFLIGHT_OT_BINDING_INVALID",
+                )
+                or client_fingerprint
+                != normalize_opcua_fingerprint(
+                    self._value("SHADOW_CLIENT_CERTIFICATE_FINGERPRINT"),
+                    code="PREFLIGHT_OT_BINDING_INVALID",
+                )
+                or ot_binding.get("application_uri") != self._value("SHADOW_OPCUA_APPLICATION_URI")
+                or ot_binding.get("client_application_uri")
+                != self._value("SHADOW_OPCUA_CLIENT_APPLICATION_URI")
+            ):
+                raise DomainError(
+                    "PREFLIGHT_OT_BINDING_INVALID",
+                    "real-OT probe and external-CA coordinates must be identical",
+                )
             real_ot_probe_binding_digest = opcua_runtime_binding_digest(
                 endpoint_uri=str(ot_binding.get("endpoint_uri", "")),
                 application_uri=str(ot_binding.get("application_uri", "")),
-                client_application_uri=str(
-                    ot_binding.get("client_application_uri", "")
-                ),
+                client_application_uri=str(ot_binding.get("client_application_uri", "")),
                 namespace_uri=str(ot_binding.get("namespace_uri", "")),
-                server_certificate_fingerprint=str(
-                    ot_binding.get("certificate_fingerprint", "")
-                ),
-                client_certificate_fingerprint=self._value(
-                    "SHADOW_CLIENT_CERTIFICATE_FINGERPRINT"
-                ),
+                server_certificate_fingerprint=server_fingerprint,
+                client_certificate_fingerprint=client_fingerprint,
                 next_client_certificate_fingerprint=self._value(
                     "SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT"
                 ),
@@ -473,6 +521,30 @@ class ProductionPreflight:
         chaos_namespace = str(chaos.get("namespace", ""))
         rollback_namespace = str(rollback.get("namespace", ""))
         rollback_deployment = str(rollback.get("deployment", ""))
+        storage_prefixes = tuple(
+            self._value(name)
+            for name in (
+                "SHADOW_OBJECT_STORAGE_PREFIX",
+                "SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX",
+                "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX",
+            )
+        )
+        storage_segments = tuple(tuple(value.split("/")) for value in storage_prefixes)
+        try:
+            storage_prefixes_canonical = all(
+                validate_object_key(value) == value for value in storage_prefixes
+            )
+        except DomainError:
+            storage_prefixes_canonical = False
+        storage_prefixes_isolated = (
+            storage_prefixes_canonical
+            and len(set(storage_prefixes)) == 3
+            and not any(
+                left == right[: len(left)] or right == left[: len(right)]
+                for index, left in enumerate(storage_segments)
+                for right in storage_segments[index + 1 :]
+            )
+        )
         policy_path = Path(str(network.get("policy_path", "")))
         policy_ready = policy_path.is_file() and not PLACEHOLDER.search(
             policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
@@ -490,15 +562,18 @@ class ProductionPreflight:
             == deployment_plan.snapshot_workload_identity_arn_digest
             and target_profile.get("backup_workload_identity_arn_digest")
             == deployment_plan.backup_workload_identity_arn_digest
-            and real_ot_probe_binding_digest
-            == deployment_plan.real_ot_runtime_binding_digest
+            and real_ot_probe_binding_digest == deployment_plan.real_ot_runtime_binding_digest
         )
         checks = (
             GateCheck("required_inputs", not missing, {"missing": len(missing)}),
             GateCheck("input_files", len(existing_files) == len(files), {"files": len(files)}),
             GateCheck(
+                "oidc_browser_journey_output_target",
+                oidc_browser_journey_output_target_valid,
+            ),
+            GateCheck(
                 "secret_file_permissions",
-                bool(secret_modes) and all(not mode & 0o077 for mode in secret_modes),
+                len(secure_secret_files) == len(SECRET_FILES),
             ),
             GateCheck(
                 "no_placeholders",
@@ -517,6 +592,11 @@ class ProductionPreflight:
                 "deployment_plan",
                 deployment_plan is not None,
                 {"workloads": len(deployment_plan.workloads) if deployment_plan else 0},
+            ),
+            GateCheck(
+                "kubernetes_probe_identities_isolated",
+                kubernetes_contexts_isolated,
+                {"contexts": len(set(kubernetes_contexts))},
             ),
             GateCheck(
                 "release_candidate",
@@ -571,18 +651,18 @@ class ProductionPreflight:
                         self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
                     )
                 )
-                and self._value("SHADOW_REQUIRE_OBJECT_LOCK") == "true",
+                and self._value("SHADOW_REQUIRE_OBJECT_LOCK") == "true"
+                and not self._value("SHADOW_OBJECT_STORAGE_ENDPOINT"),
             ),
             GateCheck(
                 "storage_prefix_isolation",
-                len(
-                    {
-                        self._value("SHADOW_OBJECT_STORAGE_PREFIX").rstrip("/"),
-                        self._value("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX").rstrip("/"),
-                        self._value("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX").rstrip("/"),
-                    }
-                )
-                == 3,
+                storage_prefixes_isolated
+                and self._value("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN")
+                != self._value("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
+            ),
+            GateCheck(
+                "s3_control_plane_mutation_authorization",
+                s3_control_plane_mutation_authorized,
             ),
             GateCheck(
                 "signed_cloud_coordinates",
@@ -590,14 +670,10 @@ class ProductionPreflight:
                 and target_profile.get("candidate_image") == candidate
                 and target_profile.get("build_digest") == build_digest
                 and target_profile.get("simulator_build_digest") == simulator_digest
-                and target_profile.get("deployment_plan_digest")
-                == deployment_plan_digest
-                and target_profile.get("aws_account_id")
-                == self._value("SHADOW_AWS_ACCOUNT_ID")
-                and target_profile.get("aws_region")
-                == self._value("SHADOW_OBJECT_STORAGE_REGION")
-                and target_profile.get("s3_bucket")
-                == self._value("SHADOW_OBJECT_STORAGE_BUCKET")
+                and target_profile.get("deployment_plan_digest") == deployment_plan_digest
+                and target_profile.get("aws_account_id") == self._value("SHADOW_AWS_ACCOUNT_ID")
+                and target_profile.get("aws_region") == self._value("SHADOW_OBJECT_STORAGE_REGION")
+                and target_profile.get("s3_bucket") == self._value("SHADOW_OBJECT_STORAGE_BUCKET")
                 and target_profile.get("s3_probe_prefix")
                 == self._value("SHADOW_OBJECT_STORAGE_PREFIX")
                 and target_profile.get("snapshot_object_storage_prefix")
@@ -605,24 +681,14 @@ class ProductionPreflight:
                 and target_profile.get("backup_object_storage_prefix")
                 == self._value("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX")
                 and target_profile.get("kms_key_id_digest")
-                == canonical_digest(
-                    {"kms_key_id": self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID")}
-                )
+                == canonical_digest({"kms_key_id": self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID")})
                 and target_profile.get("backup_workload_identity_arn_digest")
                 == canonical_digest(
-                    {
-                        "workload_identity_arn": self._value(
-                            "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"
-                        )
-                    }
+                    {"workload_identity_arn": self._value("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN")}
                 )
                 and target_profile.get("snapshot_workload_identity_arn_digest")
                 == canonical_digest(
-                    {
-                        "workload_identity_arn": self._value(
-                            "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"
-                        )
-                    }
+                    {"workload_identity_arn": self._value("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN")}
                 )
                 and backup_receipt is not None
                 and target_profile.get("backup_restore_receipt_digest")
@@ -630,13 +696,9 @@ class ProductionPreflight:
                 and target_profile.get("oidc_issuer")
                 == self._value("SHADOW_OIDC_ISSUER").rstrip("/")
                 and target_profile.get("oidc_audience_digest")
-                == canonical_digest(
-                    {"audience": self._value("SHADOW_OIDC_AUDIENCE")}
-                )
+                == canonical_digest({"audience": self._value("SHADOW_OIDC_AUDIENCE")})
                 and target_profile.get("oidc_human_client_id_digest")
-                == canonical_digest(
-                    {"client_id": self._value("SHADOW_OIDC_CLIENT_ID")}
-                )
+                == canonical_digest({"client_id": self._value("SHADOW_OIDC_CLIENT_ID")})
                 and target_profile.get("oidc_service_client_ids_digest")
                 == canonical_digest(
                     sorted(
@@ -667,8 +729,8 @@ class ProductionPreflight:
                 ),
             ),
             GateCheck(
-                "workload_identity_sessions",
-                workload_sessions_valid
+                "target_pod_workload_identity_contract",
+                workload_identity_probe_contract_valid
                 and self._value("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY").startswith(
                     self._value("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX").rstrip("/") + "/"
                 )
@@ -744,12 +806,19 @@ class ProductionPreflight:
                 "config_digests": {
                     name: canonical_digest(value) for name, value in sorted(configs.items())
                 },
+                "oidc_browser_journey_target_digest": canonical_digest(
+                    {
+                        "acceptance_run_id": self._value("SHADOW_ACCEPTANCE_RUN_ID"),
+                        "path": self._value("SHADOW_OIDC_BROWSER_JOURNEY"),
+                    }
+                ),
                 "trust_store_digest": trust_store.digest if trust_store else "invalid",
             },
             checks=checks,
             metrics={
                 "required_inputs": len(REQUIRED_ENV),
                 "config_files": len(configs),
+                "oidc_browser_journey_output_targets": 1,
                 "network_planes": len(network_planes),
                 "chaos_categories": len(chaos_categories),
             },

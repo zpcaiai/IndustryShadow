@@ -21,6 +21,7 @@ from .evidence import GateCheck, GateEvidence, complete
 from .production_deployment import (
     ProductionDeploymentPlan,
     cluster_identity,
+    storage_probe_network_policy_exact,
     validate_exact_rbac,
 )
 
@@ -99,12 +100,25 @@ def validate_policy_contract(path: str | Path) -> tuple[GateCheck, ...]:
         "real-ot-collector-read-only-egress",
         "simulator-collector-read-only-egress",
         "data-jobs-egress",
+        "storage-identity-probe-egress",
     }
+    storage_probe_policies = [
+        policy
+        for policy in policies
+        if policy.get("metadata", {}).get("name") == "storage-identity-probe-egress"
+    ]
     return (
         GateCheck("default_deny", "default-deny" in names),
         GateCheck("required_plane_policies", required.issubset(names)),
         GateCheck("no_world_cidrs", not broad, {"broad_cidrs": len(broad)}),
         GateCheck("valid_cidrs", not invalid_cidrs, {"invalid_cidrs": len(invalid_cidrs)}),
+        GateCheck(
+            "storage_probe_https_egress_exact",
+            len(storage_probe_policies) == 1
+            and storage_probe_network_policy_exact(
+                storage_probe_policies[0].get("spec")
+            ),
+        ),
     )
 
 

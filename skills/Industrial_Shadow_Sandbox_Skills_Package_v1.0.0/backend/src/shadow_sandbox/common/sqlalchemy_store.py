@@ -154,6 +154,31 @@ class SqlAlchemyStore:
                 dict(row) for row in connection.execute(statement, values).mappings().fetchall()
             ]
 
+    def iterate(
+        self,
+        sql: str,
+        parameters: Sequence[Any] = (),
+        *,
+        batch_size: int = 128,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream a read query through a server-side cursor with bounded buffering."""
+
+        if batch_size < 1 or batch_size > 4096:
+            raise DomainError(
+                "SQL_BATCH_SIZE_INVALID", "streaming query batch size must be between 1 and 4096"
+            )
+        with self.engine.connect() as connection:
+            self._bind_workspace(connection)
+            connection.exec_driver_sql("SET LOCAL TIME ZONE 'UTC'")
+            statement, values = _statement(sql, parameters)
+            result = connection.execution_options(
+                stream_results=True,
+                max_row_buffer=batch_size,
+                yield_per=batch_size,
+            ).execute(statement, values)
+            for row in result.mappings():
+                yield dict(row)
+
     def put_artifact(
         self,
         *,

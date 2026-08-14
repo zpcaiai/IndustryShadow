@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from shadow_sandbox.asset_registry import pump_tank_model
 from shadow_sandbox.common.models import DomainError, canonical_digest, utc_now
@@ -114,6 +114,256 @@ TARGET_PROFILE_KEYS = frozenset(
         "deployment_plan_digest",
     }
 )
+
+STORAGE_PREFIX_FIELDS = (
+    "s3_probe_prefix",
+    "snapshot_object_storage_prefix",
+    "backup_object_storage_prefix",
+)
+STORAGE_DIGEST_FIELDS = (
+    "cluster_uid_digest",
+    "kubernetes_api_ca_digest",
+    "kms_key_id_digest",
+    "backup_workload_identity_arn_digest",
+    "snapshot_workload_identity_arn_digest",
+    "deployment_plan_digest",
+)
+S3_CLOSURE_REQUIRED_METRICS = {
+    "cloud_control_plane_verified": 1,
+    "mutation_authorizations_verified": 1,
+    "lifecycle_prefixes_verified": 3,
+    "workload_identities_verified": 2,
+    "target_pod_identities_verified": 2,
+    "sentinel_bindings_verified": 2,
+}
+S3_CLOSURE_REQUIRED_CHECKS = frozenset(
+    {
+        "control_plane",
+        "control_bucket_owner_expected",
+        "control_bucket_location",
+        "control_bucket_versioning",
+        "control_public_access_block",
+        "control_default_kms_encryption",
+        "control_bucket_policy_not_public",
+        "control_bucket_policy_tls_only",
+        "control_kms_key_enabled_and_pinned",
+        "control_kms_automatic_rotation",
+        "control_aws_account_identity",
+        "control_lifecycle_policy",
+        "control_lifecycle_acceptance_prefix",
+        "control_lifecycle_snapshot_prefix",
+        "control_lifecycle_backup_prefix",
+        "control_backup_sentinel_retained",
+        "control_snapshot_sentinel_retained",
+        "control_mutation_authorization_bound",
+        "control_object_lock",
+        "control_probe_object_kms",
+        "control_probe_object_integrity",
+        "control_probe_object_disposition",
+        "backup_identity",
+        "backup_service_account_role_exact",
+        "backup_job_owner_bound",
+        "backup_candidate_image_exact",
+        "backup_evidence_contract_exact",
+        "backup_exact_workload_role",
+        "backup_versioned_kms_roundtrip",
+        "backup_cross_prefix_exact_version_get_denied",
+        "backup_cross_prefix_exact_version_head_denied",
+        "backup_cross_prefix_list_denied",
+        "backup_cross_prefix_version_list_denied",
+        "backup_cross_prefix_denial_not_kms_only",
+        "backup_cross_prefix_denied",
+        "backup_probe_object_disposition",
+        "snapshot_identity",
+        "snapshot_service_account_role_exact",
+        "snapshot_job_owner_bound",
+        "snapshot_candidate_image_exact",
+        "snapshot_evidence_contract_exact",
+        "snapshot_exact_workload_role",
+        "snapshot_versioned_kms_roundtrip",
+        "snapshot_cross_prefix_exact_version_get_denied",
+        "snapshot_cross_prefix_exact_version_head_denied",
+        "snapshot_cross_prefix_list_denied",
+        "snapshot_cross_prefix_version_list_denied",
+        "snapshot_cross_prefix_denial_not_kms_only",
+        "snapshot_cross_prefix_denied",
+        "snapshot_probe_object_disposition",
+        "target_pod_workload_identities",
+        "storage_probe_rbac_exact",
+        "object_lock_disposition_required",
+        "probe_jobs_foreground_deleted",
+    }
+)
+
+
+class ProductionStorageDeploymentPlan(Protocol):
+    digest: str
+    backend_image: str
+    snapshot_object_storage_prefix: str
+    backup_object_storage_prefix: str
+    backup_workload_identity_arn_digest: str
+    snapshot_workload_identity_arn_digest: str
+
+
+def validate_production_storage_target(
+    profile: Mapping[str, Any],
+) -> dict[str, str | int]:
+    """Return the canonical, non-secret storage coordinates from a target profile."""
+    if profile.get("schema_version") != 1:
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "target profile schema version is invalid",
+        )
+    prefixes: dict[str, str] = {}
+    prefix_segments: dict[str, tuple[str, ...]] = {}
+    for name in STORAGE_PREFIX_FIELDS:
+        value = profile.get(name)
+        if not isinstance(value, str) or (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,511}", value)
+            or value != value.strip("/")
+            or "//" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise DomainError(
+                "PRODUCTION_STORAGE_TARGET_INVALID",
+                "target object-storage prefixes must be canonical",
+            )
+        prefixes[name] = value
+        prefix_segments[name] = tuple(value.split("/"))
+    for left_name, left in prefix_segments.items():
+        for right_name, right in prefix_segments.items():
+            if left_name != right_name and left == right[: len(left)]:
+                raise DomainError(
+                    "PRODUCTION_STORAGE_TARGET_INVALID",
+                    "target object-storage prefixes must be pairwise non-nested",
+                )
+
+    digests = {name: str(profile.get(name, "")) for name in STORAGE_DIGEST_FIELDS}
+    if any(not DIGEST.fullmatch(value) for value in digests.values()) or (
+        digests["backup_workload_identity_arn_digest"]
+        == digests["snapshot_workload_identity_arn_digest"]
+    ):
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "storage target digests or workload identity separation are invalid",
+        )
+    account_id = str(profile.get("aws_account_id", ""))
+    region = str(profile.get("aws_region", ""))
+    bucket = str(profile.get("s3_bucket", ""))
+    candidate_image = str(profile.get("candidate_image", ""))
+    if (
+        not re.fullmatch(r"\d{12}", account_id)
+        or not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-[1-9][0-9]*", region)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket)
+        or not re.fullmatch(r"[^@\s]+@sha256:[a-f0-9]{64}", candidate_image)
+    ):
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "storage target cloud coordinates are invalid",
+        )
+    return {
+        "schema_version": 1,
+        "candidate_image": candidate_image,
+        "aws_account_id": account_id,
+        "aws_region": region,
+        "s3_bucket": bucket,
+        **prefixes,
+        **digests,
+    }
+
+
+def production_storage_binding_digest(
+    profile: Mapping[str, Any],
+    deployment_plan: ProductionStorageDeploymentPlan,
+) -> str:
+    """Independently bind a signed target profile to its sealed deployment plan."""
+    target = validate_production_storage_target(profile)
+    plan = {
+        "deployment_plan_digest": str(deployment_plan.digest),
+        "candidate_image": str(deployment_plan.backend_image),
+        "snapshot_object_storage_prefix": str(deployment_plan.snapshot_object_storage_prefix),
+        "backup_object_storage_prefix": str(deployment_plan.backup_object_storage_prefix),
+        "backup_workload_identity_arn_digest": str(
+            deployment_plan.backup_workload_identity_arn_digest
+        ),
+        "snapshot_workload_identity_arn_digest": str(
+            deployment_plan.snapshot_workload_identity_arn_digest
+        ),
+    }
+    for name, value in plan.items():
+        if target.get(name) != value:
+            raise DomainError(
+                "PRODUCTION_STORAGE_BINDING_MISMATCH",
+                "sealed deployment plan and signed target storage coordinates differ",
+            )
+    return canonical_digest(
+        {
+            "schema_version": 1,
+            "signed_target_profile": target,
+            "sealed_deployment_plan": plan,
+        }
+    )
+
+
+def validate_s3_closure_evidence(
+    evidence: GateEvidence,
+    profile: Mapping[str, Any],
+    deployment_plan: ProductionStorageDeploymentPlan,
+) -> str:
+    """Fail closed unless S3 evidence proves the exact production storage contract."""
+    expected_binding = production_storage_binding_digest(profile, deployment_plan)
+    evidence.verify()
+    if (
+        evidence.gate != "s3"
+        or evidence.schema_version != 2
+        or evidence.status != "PASSED"
+        or evidence.limitations
+    ):
+        raise DomainError(
+            "CLOSURE_S3_EVIDENCE_INVALID",
+            "S3 evidence is not an unqualified acceptance-run PASS",
+        )
+    for name, expected in S3_CLOSURE_REQUIRED_METRICS.items():
+        value = evidence.metrics.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise DomainError(
+                "CLOSURE_S3_EVIDENCE_INVALID",
+                "S3 evidence control-plane metrics are incomplete or inexact",
+            )
+    if evidence.metrics.get("storage_binding_digest") != expected_binding:
+        raise DomainError(
+            "CLOSURE_S3_BINDING_MISMATCH",
+            "S3 evidence is not bound to the signed target profile and deployment plan",
+        )
+    sentinel_digests = {
+        identity: evidence.metrics.get(f"{identity}_sentinel_binding_digest")
+        for identity in ("backup", "snapshot")
+    }
+    if (
+        any(
+            not isinstance(value, str) or not DIGEST.fullmatch(value)
+            for value in sentinel_digests.values()
+        )
+        or len(set(sentinel_digests.values())) != 2
+        or evidence.metrics.get("sentinel_binding_digest") != canonical_digest(sentinel_digests)
+    ):
+        raise DomainError(
+            "CLOSURE_S3_EVIDENCE_INVALID",
+            "S3 evidence does not bind two distinct immutable sentinel versions",
+        )
+    checks = {check.name: check for check in evidence.checks}
+    missing_checks = S3_CLOSURE_REQUIRED_CHECKS - checks.keys()
+    failed_checks = {
+        name
+        for name in S3_CLOSURE_REQUIRED_CHECKS & checks.keys()
+        if checks[name].passed is not True
+    }
+    if missing_checks or failed_checks:
+        raise DomainError(
+            "CLOSURE_S3_EVIDENCE_INVALID",
+            "S3 evidence is missing required control, lifecycle, identity, or sentinel checks",
+        )
+    return expected_binding
 
 
 class FormalBenchmarkImporter:
@@ -304,6 +554,13 @@ class FormalBenchmarkImporter:
             raise DomainError(
                 "FORMAL_TARGET_PROFILE_INVALID", "target profile timestamp is invalid"
             ) from error
+        try:
+            validate_production_storage_target(profile)
+        except DomainError as error:
+            raise DomainError(
+                "FORMAL_TARGET_PROFILE_INVALID",
+                "target profile storage contract is invalid",
+            ) from error
         if (
             set(profile) != TARGET_PROFILE_KEYS
             or profile.get("schema_version") != 1
@@ -329,27 +586,6 @@ class FormalBenchmarkImporter:
                 r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]",
                 str(profile.get("s3_bucket", "")),
             )
-            or any(
-                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,511}", str(profile.get(name, "")))
-                or "//" in str(profile.get(name, ""))
-                or any(part in {"", ".", ".."} for part in str(profile.get(name, "")).split("/"))
-                for name in (
-                    "s3_probe_prefix",
-                    "snapshot_object_storage_prefix",
-                    "backup_object_storage_prefix",
-                )
-            )
-            or len(
-                {
-                    str(profile.get(name, ""))
-                    for name in (
-                        "s3_probe_prefix",
-                        "snapshot_object_storage_prefix",
-                        "backup_object_storage_prefix",
-                    )
-                }
-            )
-            != 3
             or not str(profile.get("oidc_issuer", "")).startswith("https://")
             or any(
                 not DIGEST.fullmatch(str(profile.get(name, "")))
@@ -380,6 +616,40 @@ class FormalBenchmarkImporter:
         ):
             raise DomainError("FORMAL_TARGET_PROFILE_INVALID", "target profile contract is invalid")
         return profile
+
+    def import_report_with_target_profile(
+        self, report: Mapping[str, Any]
+    ) -> tuple[GateEvidence, Mapping[str, Any]]:
+        """Verify the signed report, then return its exact digest-bound target profile."""
+        evidence = self.import_report(report)
+        artifact_values = report.get("artifacts", ())
+        if not isinstance(artifact_values, list):
+            raise DomainError(
+                "FORMAL_BENCHMARK_ARTIFACT_INVALID",
+                "measurement artifacts must be a list",
+            )
+        target_items = [
+            item
+            for item in artifact_values
+            if isinstance(item, Mapping) and item.get("kind") == "target_profile"
+        ]
+        if len(target_items) != 1:
+            raise DomainError(
+                "FORMAL_BENCHMARK_ARTIFACT_INVALID",
+                "exactly one signed target-profile artifact is required",
+            )
+        _kind, path, check = self._artifact(target_items[0])
+        target_profile_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if (
+            check.passed is not True
+            or target_profile_digest != report.get("target_profile_digest")
+            or target_profile_digest != self.environment_digest
+        ):
+            raise DomainError(
+                "FORMAL_TARGET_PROFILE_INVALID",
+                "signed target-profile artifact digest does not match the release environment",
+            )
+        return evidence, self._validate_target_profile(path)
 
     def _validate_measurement_log(
         self,
@@ -485,9 +755,7 @@ class FormalBenchmarkImporter:
                 "FORMAL_BENCHMARK_ENVIRONMENT_REQUIRED",
                 "an exact target environment digest is required",
             )
-        if not self.deployment_plan_digest or not DIGEST.fullmatch(
-            self.deployment_plan_digest
-        ):
+        if not self.deployment_plan_digest or not DIGEST.fullmatch(self.deployment_plan_digest):
             raise DomainError(
                 "FORMAL_BENCHMARK_DEPLOYMENT_PLAN_REQUIRED",
                 "an exact deployment plan digest is required",
@@ -532,8 +800,7 @@ class FormalBenchmarkImporter:
             and report.get("candidate_image") == self.candidate_image
             and report.get("build_digest") == self.build_digest
             and report.get("simulator_build_digest") == self.simulator_build_digest
-            and report.get("deployment_plan_digest")
-            == self.deployment_plan_digest
+            and report.get("deployment_plan_digest") == self.deployment_plan_digest
             and report.get("suite_digest") == self.suite_digest
             and report.get("bundle_digest") == self.bundle_digest
             and report.get("result_digest") == result_digest
@@ -541,8 +808,7 @@ class FormalBenchmarkImporter:
             and report.get("certification_digest") == gate.certification_digest
             and report.get("target_profile_digest") == target_profile_digest
             and report.get("target_profile_digest") == self.environment_digest
-            and target_profile.get("deployment_plan_digest")
-            == self.deployment_plan_digest
+            and target_profile.get("deployment_plan_digest") == self.deployment_plan_digest
             and measurement_log.get("run_id") == report.get("benchmark_id")
             and measurement_log.get("started_at") == started
             and measurement_log.get("completed_at") == completed

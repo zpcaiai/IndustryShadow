@@ -25,9 +25,10 @@ Method Call. Database URLs are environment secrets.
 The independently signed formal target profile records both
 `cluster_uid_digest = sha256(canonical_json({api_server_ca_sha256,
 kube_system_namespace_uid}))` and the separate `kubernetes_api_ca_digest`. Every live
-Kubernetes gate and the publisher resolve these values through the explicitly approved
-`SHADOW_KUBERNETES_CONTEXT`; a namespace UID, API CA, context, or plan namespace mismatch
-fails before mutation.
+Kubernetes gate resolves these values through its separately approved network, storage,
+chaos, or rollback context; the publisher uses its own deployment context. A namespace UID,
+API CA, context, or plan namespace mismatch fails before mutation, and each gate rejects a
+credential whose exact least-privilege RBAC set belongs to another gate.
 
 The NetworkPolicy suite first verifies the runner's narrow probe RBAC and exact live-vs-approved
 policy set/specification. It then launches short-lived, credential-free pods with the same `app`
@@ -64,10 +65,11 @@ configuration, targets the exact backend and Web `@sha256:` references from the 
 deployment plan, retains a separate SARIF report for each image, and fails on any critical
 or high finding. Missing Docker ID authentication never becomes a PASS.
 
-The workload-identity session file is a runner-owned `0600` JSON object with exact
-`backup` and `snapshot` members. Each member has the keys `method`, `profile`, `role_arn`,
-`web_identity_token_file`, and `role_session_name`; unused values are empty strings. A
-`profile` method uses only the named AWS profile. A `web_identity` method uses only the
-declared role, private token file, and short-lived session name. The two forbidden sentinel
-keys must already exist under the opposite workload prefix and must not be readable by the
-identity being tested.
+S3 workload-identity acceptance uses a dedicated, least-privilege Kubernetes context. It
+first proves exact RBAC, the signed cluster UID/API CA, and the two live ServiceAccount role
+annotations without mutation. It then creates one bounded Job per identity, requires the
+admission result to contain only the exact audience-bound IRSA token projection and regional
+AWS endpoints with IMDS disabled, validates the candidate image ID and sealed evidence, and
+foreground-deletes both Jobs and all owned Pods. Runner profiles and runner-side WebIdentity
+token files are not evidence. The two forbidden sentinel keys must already exist under the
+opposite workload prefix and must not be readable by the identity being tested.

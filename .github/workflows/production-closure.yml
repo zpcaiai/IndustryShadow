@@ -1,3 +1,5 @@
+# Generated root entrypoint; edit the package template and sync deliberately.
+# Template: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.github/workflows/production-closure.yml
 name: production-closure
 
 on:
@@ -16,6 +18,10 @@ concurrency:
   group: industrial-shadow-production-closure
   cancel-in-progress: false
 
+defaults:
+  run:
+    working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
+
 jobs:
   verify-two-person-closure:
     environment: production-closure
@@ -31,6 +37,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+        working-directory: ${{ github.workspace }}
         run: |
           [[ "$ACCEPTANCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_record="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt] | @tsv')"
@@ -57,6 +64,7 @@ jobs:
           ACCEPTANCE_HEAD_SHA: ${{ steps.acceptance-run.outputs.source_revision }}
           EXPECTED_ACCEPTANCE_RUN_ID: ${{ steps.acceptance-run.outputs.acceptance_run_id }}
           CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-acceptance/production/supply-chain/release-candidate.json
+        working-directory: ${{ github.workspace }}
         run: |
           acceptance_head_sha="$ACCEPTANCE_HEAD_SHA"
           expected_acceptance_run_id="$EXPECTED_ACCEPTANCE_RUN_ID"
@@ -115,7 +123,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: production-acceptance-evidence-${{ inputs.acceptance_run_id }}-${{ steps.acceptance-run.outputs.run_attempt }}
-          path: docs/evidence/batch-24
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24
           github-token: ${{ github.token }}
           run-id: ${{ inputs.acceptance_run_id }}
       - name: Export candidate and approval-bound release coordinates
@@ -173,8 +181,8 @@ jobs:
         with:
           name: production-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            docs/evidence/batch-24/production
-            docs/evidence/batch-24/production-deployment
-            docs/evidence/batch-24/production-closure-input.json
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production-deployment
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production-closure-input.json
           if-no-files-found: error
           retention-days: 90

@@ -30,9 +30,11 @@ three distinct, signed prefixes. `SHADOW_OBJECT_STORAGE_PREFIX` exists only in t
 acceptance runner; the sealed runtime ConfigMap carries
 `SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX` and
 `SHADOW_BACKUP_OBJECT_STORAGE_PREFIX`. Do not collapse them in an overlay. The acceptance
-gate uses separate short-lived backup and snapshot identity sessions, proves a
-version-pinned KMS round trip in each runtime prefix, and requires AccessDenied when each
-identity reads a pre-created sentinel in the opposite prefix.
+gate creates two bounded Jobs in the signed target cluster and uses the backup and snapshot
+ServiceAccounts' ambient IRSA identities. It accepts neither runner profiles nor runner-side
+WebIdentity token files. Each Job proves a version-pinned KMS round trip in its runtime
+prefix and requires AccessDenied when its identity reads a pre-created sentinel in the
+opposite prefix.
 
 The API, action, Collector, worker, migration, and backup secrets each carry a distinct
 `SHADOW_DATABASE_URL`; the three internal services also carry their scoped copy of

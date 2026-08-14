@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto'
-import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { expect, test, type Page } from '@playwright/test'
+import { readPrivateJsonObject } from './secure-private-json'
 
 const PERSONA_ROLES = {
   viewer: 'Viewer',
@@ -28,21 +30,86 @@ type BrowserSecrets = {
   logout_steps: LoginStep[]
   personas: Record<Persona, PersonaSecret>
 }
+type JourneyBinding = {
+  acceptance_run_id: string
+  release_digest: string
+  candidate_image_digest: string
+  web_candidate_image_digest: string
+  build_digest: string
+  simulator_build_digest: string
+  environment_digest: string
+  deployment_plan_digest: string
+}
 
 const productionURL = process.env.SHADOW_E2E_PRODUCTION_URL?.replace(/\/+$/, '')
 const secretsPath = process.env.SHADOW_OIDC_BROWSER_SECRETS_FILE
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+const DIGEST = /^[a-f0-9]{64}$/
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/
 test.skip(!productionURL || !secretsPath, 'real production OIDC inputs are not configured')
 
 function exactKeys(value: object, expected: string[]): boolean {
   return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort())
 }
 
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]
+  if (!value) throw new Error(`${name} is required for the production OIDC journey`)
+  return value
+}
+
+function exactDigest(name: string): string {
+  const value = requiredEnvironment(name)
+  if (!DIGEST.test(value) || value === '0'.repeat(64))
+    throw new Error(`${name} must be a non-zero SHA-256 digest`)
+  return value
+}
+
+function immutableImageDigest(name: string): string {
+  const value = requiredEnvironment(name)
+  const match = /^[^@\s]+@sha256:([a-f0-9]{64})$/.exec(value)
+  if (!match || match[1] === '0'.repeat(64))
+    throw new Error(`${name} must be an immutable non-zero image digest`)
+  return match[1]
+}
+
+function canonicalJson(value: Record<string, string>): string {
+  return JSON.stringify(
+    Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])),
+  )
+}
+
+function journeyBinding(): JourneyBinding {
+  const acceptanceRunId = requiredEnvironment('SHADOW_ACCEPTANCE_RUN_ID')
+  if (!RUN_ID.test(acceptanceRunId)) throw new Error('acceptance run ID is invalid')
+  const coordinates = {
+    candidate_image: requiredEnvironment('SHADOW_CANDIDATE_IMAGE'),
+    build_digest: exactDigest('SHADOW_BUILD_DIGEST'),
+    simulator_build_digest: exactDigest('SHADOW_SIMULATOR_BUILD_DIGEST'),
+    environment_digest: exactDigest('SHADOW_PRODUCTION_ENVIRONMENT_DIGEST'),
+    deployment_plan_digest: exactDigest('SHADOW_DEPLOYMENT_PLAN_DIGEST'),
+  }
+  return {
+    acceptance_run_id: acceptanceRunId,
+    release_digest: createHash('sha256').update(canonicalJson(coordinates)).digest('hex'),
+    candidate_image_digest: immutableImageDigest('SHADOW_CANDIDATE_IMAGE'),
+    web_candidate_image_digest: immutableImageDigest('SHADOW_WEB_CANDIDATE_IMAGE'),
+    build_digest: coordinates.build_digest,
+    simulator_build_digest: coordinates.simulator_build_digest,
+    environment_digest: coordinates.environment_digest,
+    deployment_plan_digest: coordinates.deployment_plan_digest,
+  }
+}
+
+function journeyOutput(binding: JourneyBinding): string {
+  const configured = requiredEnvironment('SHADOW_OIDC_BROWSER_JOURNEY')
+  const expected = `web/test-results/production-oidc-journey-${binding.acceptance_run_id}.json`
+  if (configured !== expected) throw new Error('OIDC journey output is not run-attempt bound')
+  return resolve(PACKAGE_ROOT, configured)
+}
+
 function loadSecrets(pathValue: string): BrowserSecrets {
-  const path = resolve(pathValue)
-  const stat = lstatSync(path)
-  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
-    throw new Error('OIDC browser secrets must be a private regular file')
-  const value = JSON.parse(readFileSync(path, 'utf8')) as BrowserSecrets
+  const value = readPrivateJsonObject<BrowserSecrets>(resolve(PACKAGE_ROOT, pathValue))
   if (
     !value ||
     !exactKeys(value, [
@@ -92,6 +159,8 @@ async function executeSteps(page: Page, steps: LoginStep[], secret: PersonaSecre
 
 test('six personas complete signed S256 PKCE login, API use, and logout', async ({ browser, request }) => {
   if (!productionURL || !secretsPath) throw new Error('production OIDC configuration is absent')
+  const binding = journeyBinding()
+  const output = journeyOutput(binding)
   const productionOrigin = new URL(productionURL).origin
   if (new URL(productionURL).protocol !== 'https:') throw new Error('production web URL must use HTTPS')
   const secrets = loadSecrets(secretsPath)
@@ -164,9 +233,9 @@ test('six personas complete signed S256 PKCE login, API use, and logout', async 
   }
 
   expect(safeProtocolRequests).toBe(true)
-  const output = resolve('test-results/production-oidc-journey.json')
   const summary = {
-    schema_version: 1,
+    schema_version: 2,
+    ...binding,
     started_at: startedAt,
     completed_at: new Date().toISOString(),
     web_origin: productionOrigin,
@@ -185,6 +254,14 @@ test('six personas complete signed S256 PKCE login, API use, and logout', async 
   }
   mkdirSync(dirname(output), { recursive: true })
   const temporary = `${output}.${process.pid}.tmp`
-  writeFileSync(temporary, `${JSON.stringify(summary)}\n`, { encoding: 'utf8', mode: 0o600 })
-  renameSync(temporary, output)
+  writeFileSync(temporary, `${JSON.stringify(summary)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+    flag: 'wx',
+  })
+  try {
+    linkSync(temporary, output)
+  } finally {
+    unlinkSync(temporary)
+  }
 })

@@ -1,3 +1,5 @@
+# Generated root entrypoint; edit the package template and sync deliberately.
+# Template: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.github/workflows/recertification.yml
 name: scheduled-closure-revalidation
 
 on:
@@ -14,6 +16,10 @@ permissions:
   actions: read
   contents: read
 
+defaults:
+  run:
+    working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
+
 jobs:
   revalidate-protected-closure:
     runs-on: ubuntu-24.04
@@ -26,6 +32,7 @@ jobs:
         env:
           REQUESTED_RUN_ID: ${{ inputs.closure_run_id || vars.SHADOW_ACTIVE_PRODUCTION_CLOSURE_RUN_ID }}
           GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ github.workspace }}
         run: |
           [[ "$REQUESTED_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_record="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/runs/$REQUESTED_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt,.run_started_at,.updated_at] | @tsv')"
@@ -77,6 +84,7 @@ jobs:
         env:
           CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-closure-${{ github.run_id }}-${{ github.run_attempt }}/production/supply-chain/release-candidate.json
           EXPECTED_SOURCE_REVISION: ${{ steps.closure.outputs.source_revision }}
+        working-directory: ${{ github.workspace }}
         run: |
           source_revision="$(python3 - "$CANDIDATE_MANIFEST" "$EXPECTED_SOURCE_REVISION" <<'PY'
           import hashlib
@@ -161,7 +169,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: ${{ steps.closure.outputs.artifact_name }}
-          path: docs/evidence/batch-24
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24
           github-token: ${{ github.token }}
           run-id: ${{ steps.closure.outputs.run_id }}
       - name: Re-evaluate the protected closure without bypass
@@ -229,6 +237,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: scheduled-closure-revalidation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/closure-revalidation/scheduled-closure-revalidation.json
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/closure-revalidation/scheduled-closure-revalidation.json
           if-no-files-found: error
           retention-days: 90

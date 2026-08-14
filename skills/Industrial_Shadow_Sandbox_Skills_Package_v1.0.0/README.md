@@ -54,6 +54,12 @@ non-root, read-only runtime behavior, backend health/OpenAPI/build-digest contra
 security headers/source-map denial. Deployment rendering uses explicit contract-only
 values and never starts services; real runtime secrets remain mandatory for deployment.
 
+The historical results recorded in `IMPLEMENTATION_STATUS.yaml` predate the latest
+production-closure hardening. The post-hardening full `make smoke` matrix has **not** been
+run because the shared host is still inside an exclusive low-disk resource window; no new
+large pytest, npm, image-build, or Docker workload is started while that window is active.
+Those prior baselines are not presented as verification of the current tree.
+
 For the real PostgreSQL adapter and RLS probe, point only at a disposable database owned by
 a migration role:
 
@@ -91,7 +97,19 @@ order.
 `IMPLEMENTATION_STATUS.yaml` deliberately remains `implemented_unverified`. Local gates
 cannot certify a production environment. `tools/check_release_evidence.py` will remain
 blocked until digest-bound evidence for all target-environment gates and two distinct human
-signatories is supplied.
+signatories is supplied. In particular,
+`docs/evidence/batch-24/production-closure-input.json` is deliberately absent, so the
+release check continues to fail closed with `RELEASE_BLOCKED` rather than manufacturing a
+production pass, signature, certification, or external-acceptance record.
+
+GitHub can discover six entrypoint workflows at the repository root: `ci.yml`,
+`release.yml`, `production-acceptance.yml`, `production-closure.yml`,
+`production-deploy.yml`, and `scheduled-closure-revalidation.yml`. They are
+deterministically rendered from the six package templates and retain package-relative
+working directories, exact workflow paths, immutable artifact names, and run-ID/run-attempt
+bindings. `tools/check_root_workflow_sync.py` rejects missing, extra, symlinked, or drifted
+root entrypoints; this activation is code and static-contract readiness, not evidence that
+remote CI or a production workflow has run.
 
 Every remaining target-environment gate has an executable harness in
 `tools/production_gate.py`. The environment-protected
@@ -111,6 +129,21 @@ gates are bound to one acceptance run, five exact release/environment coordinate
 purpose-scoped assessor/approver trust-store digest. These controls improve code readiness;
 they do not turn any unexecuted target gate into `PASSED`.
 
+The live OIDC browser journey is produced only after preflight into a pristine,
+runner-private output whose filename and payload bind the exact GitHub run attempt. Its v2
+record binds the acceptance run, release, both image digests, build, simulator, target
+environment, and sealed deployment plan, and the gate independently enforces freshness,
+PKCE/JWS, logout, persona, and server-side RBAC results. The managed PostgreSQL restore gate
+uses streaming, duplicate-sensitive row fingerprints and compares source and restore
+catalog/ownership/ACL/default-ACL/RLS state before reporting equivalence, then reapplies and
+checks the exact runtime and backup role privilege matrices.
+The S3 gate performs its workload-identity checks inside distinct target Kubernetes backup
+and snapshot Pods: exact RBAC and annotated service accounts, projected
+`sts.amazonaws.com` tokens, `AssumeRoleWithWebIdentity`, purpose-specific KMS encryption
+contexts, exact-version and listing denial across workload prefixes, and required
+version/Object Lock disposition are all evidence inputs. These are fail-closed executable contracts only; live-provider OIDC,
+managed PostgreSQL, and real S3/KMS target execution remain `NOT_RUN`.
+
 After closure, `.github/workflows/production-deploy.yml` downloads that exact closure run,
 re-verifies it, matches the sealed phased deployment plan and backend image, performs
 server-side dry runs, runs the candidate-image migration Job, rolls out all seven workloads,
@@ -119,6 +152,12 @@ manifest if rollout fails. Plan loading rejects cluster-scoped/RBAC/Secret resou
 out-of-namespace objects, undeclared workloads, mutable or unbound runtime images, and
 non-restricted Pod security; rollback also verifies the exact prior image digests and
 readiness. The prior-state manifest must exactly cover every object changed by bootstrap
-and runtime, and compensation begins on the first mutating apply, including partial
-bootstrap or migration failure. The workflow requires a separately protected deployment
-environment and exact `<namespace>:<plan-id>:deploy` confirmation.
+and runtime. Before the first candidate mutation, the publisher persists a run-attempt-bound
+recovery envelope and records `candidate_mutation_started`; the workflow schedules a
+separately confirmed same-run recovery step for failure or cancellation. Recovery validates
+the binding, envelope, and ordered journal, safely no-ops when no mutation began, and restores
+the exact prior manifest after an interrupted mutation. A separate break-glass path accepts
+only a closure-bound failed or cancelled prior deployment artifact and requires the rollback
+confirmation. The workflow requires a separately protected deployment environment and exact
+`<namespace>:<plan-id>:deploy` confirmation. No target deployment, interruption drill, or
+rollback has yet been executed by this repository.

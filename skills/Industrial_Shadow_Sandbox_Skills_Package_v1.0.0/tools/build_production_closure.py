@@ -15,7 +15,10 @@ from typing import Any
 from jsonschema import Draft202012Validator, FormatChecker
 
 from shadow_sandbox.common.models import DomainError, canonical_digest, canonical_json
-from shadow_sandbox.evaluation.formal_benchmark import FormalBenchmarkImporter
+from shadow_sandbox.evaluation.formal_benchmark import (
+    FormalBenchmarkImporter,
+    validate_s3_closure_evidence,
+)
 from shadow_sandbox.operations.container_scan import DockerScoutImageProbe
 from shadow_sandbox.operations.evidence import GateEvidence, read_evidence
 from shadow_sandbox.operations.external_assurance import ExternalAssuranceImporter
@@ -544,6 +547,23 @@ def main() -> int:
             "CLOSURE_RELEASE_COORDINATES_MISMATCH",
             "formal benchmark and requested release coordinates differ",
         )
+    formal_evidence, signed_target_profile = FormalBenchmarkImporter(
+        ROOT,
+        candidate_image=args.candidate_image,
+        build_digest=args.build_digest,
+        simulator_build_digest=args.simulator_build_digest,
+        trust_store=trust_store,
+        environment_digest=args.environment_digest,
+        deployment_plan_digest=args.deployment_plan_digest,
+    ).import_report_with_target_profile(formal)
+    if formal_evidence.digest != evidence["benchmark_150"][1].digest:
+        raise DomainError(
+            "CLOSURE_ATTESTATION_MISMATCH",
+            "formal benchmark does not reproduce its source gate evidence",
+        )
+    validate_s3_closure_evidence(
+        evidence["s3"][1], signed_target_profile, deployment_plan
+    )
     approval = approval_payload(
         evidence, attestations, release_coordinates, trust_store
     )

@@ -34,6 +34,8 @@ PLACEHOLDER = re.compile(
     re.IGNORECASE,
 )
 OBJECT_STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
+CONFIG_MAP_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+FORBIDDEN_RUNTIME_CONFIG_KEYS = frozenset({"SHADOW_OBJECT_STORAGE_PREFIX"})
 PLAN_KEYS = frozenset(
     {
         "schema_version",
@@ -100,9 +102,7 @@ STORAGE_SERVICE_ACCOUNTS = {
     "backup": "shadow-backup-storage",
 }
 WORKLOAD_IDENTITY_ANNOTATION = "eks.amazonaws.com/role-arn"
-IAM_ROLE_ARN = re.compile(
-    r"^arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$"
-)
+IAM_ROLE_ARN = re.compile(r"^arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
 EXPECTED_ARGS: dict[str, tuple[str, ...]] = {
     "control-api": (
         "uvicorn",
@@ -166,13 +166,11 @@ EXPECTED_ENV_FROM: dict[str, frozenset[tuple[str, str]]] = {
     ),
     "real-ot-collector": frozenset(
         {
-            ("configMapRef", "shadow-runtime"),
             ("configMapRef", "shadow-real-ot-collector-binding"),
         }
     ),
     "simulator-collector": frozenset(
         {
-            ("configMapRef", "shadow-runtime"),
             ("configMapRef", "shadow-simulator-collector-binding"),
         }
     ),
@@ -281,6 +279,7 @@ EXPECTED_NETWORK_POLICIES = frozenset(
         "real-ot-collector-read-only-egress",
         "simulator-collector-read-only-egress",
         "data-jobs-egress",
+        "storage-identity-probe-egress",
     }
 )
 PUBLISH_RBAC = frozenset(
@@ -504,6 +503,97 @@ def _references(value: Any) -> frozenset[tuple[str, str]]:
             "DEPLOYMENT_ARTIFACT_UNSAFE", "duplicate environment references are forbidden"
         )
     return frozenset(references)
+
+
+def _config_map_key_sets(
+    objects: Sequence[Mapping[str, Any]], *, phase: str
+) -> dict[str, frozenset[str]]:
+    result: dict[str, frozenset[str]] = {}
+    for value in objects:
+        if value.get("kind") != "ConfigMap":
+            continue
+        name = _pod_name(value)
+        data = value.get("data")
+        if "binaryData" in value or not isinstance(data, Mapping) or not data:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                f"{phase} ConfigMap environment data must be a non-empty text mapping",
+            )
+        keys = frozenset(str(key) for key in data)
+        if len(keys) != len(data) or any(
+            not isinstance(key, str)
+            or not CONFIG_MAP_ENVIRONMENT_NAME.fullmatch(key)
+            or not isinstance(item, str)
+            for key, item in data.items()
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                f"{phase} ConfigMap environment keys and values must be exact strings",
+            )
+        if name == "shadow-runtime" and keys & FORBIDDEN_RUNTIME_CONFIG_KEYS:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "the acceptance-only object-storage prefix is forbidden in shadow-runtime",
+            )
+        result[name] = keys
+    return result
+
+
+def _validate_config_map_consumers(
+    objects: Sequence[Mapping[str, Any]],
+    *,
+    config_map_keys: Mapping[str, frozenset[str]],
+    phase: str,
+) -> None:
+    for value in objects:
+        if value.get("kind") not in POD_KINDS:
+            continue
+        pod_spec = _pod_spec(value)
+        containers = pod_spec.get("containers") if isinstance(pod_spec, Mapping) else None
+        if not isinstance(containers, list) or len(containers) != 1:
+            raise DomainError(
+                "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                f"{phase} ConfigMap consumer must contain exactly one container",
+            )
+        container = containers[0]
+        if not isinstance(container, Mapping):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_INVALID",
+                f"{phase} ConfigMap consumer container is invalid",
+            )
+        imported: dict[str, str] = {}
+        for kind, config_name in _references(container.get("envFrom")):
+            if kind != "configMapRef":
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    f"{phase} Secret envFrom references are forbidden",
+                )
+            keys = config_map_keys.get(config_name)
+            if keys is None:
+                raise DomainError(
+                    "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                    f"{phase} referenced ConfigMap {config_name!r} is not sealed",
+                )
+            for key in keys:
+                previous = imported.get(key)
+                if previous is not None:
+                    raise DomainError(
+                        "DEPLOYMENT_ARTIFACT_UNSAFE",
+                        f"{phase} ConfigMaps {previous!r} and {config_name!r} both define {key!r}",
+                    )
+                imported[key] = config_name
+        explicit_names = {
+            str(item.get("name", ""))
+            for item in container.get("env", [])
+            if isinstance(item, Mapping)
+        }
+        overlap = set(imported) & explicit_names
+        if overlap:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                f"{phase} explicit environment variables override sealed ConfigMap keys: "
+                + ", ".join(sorted(overlap)),
+            )
 
 
 def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[str] | None) -> None:
@@ -744,6 +834,53 @@ def _validate_network_policies(values: Sequence[Mapping[str, Any]]) -> None:
                             raise DomainError(
                                 "DEPLOYMENT_ARTIFACT_UNSAFE", "world CIDRs are forbidden"
                             )
+        if _pod_name(policy) == "storage-identity-probe-egress" and not (
+            storage_probe_network_policy_exact(spec)
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "storage identity probes require exact host-only S3/STS HTTPS egress",
+            )
+
+
+def storage_probe_network_policy_exact(spec: object) -> bool:
+    """Validate the sealed, dedicated S3/STS egress shape for identity probe Jobs."""
+    if not isinstance(spec, Mapping) or set(spec) != {
+        "podSelector",
+        "policyTypes",
+        "egress",
+    }:
+        return False
+    if spec.get("podSelector") != {
+        "matchLabels": {"app.kubernetes.io/name": "industrial-shadow-storage-probe"}
+    } or spec.get("policyTypes") != ["Egress"]:
+        return False
+    egress = spec.get("egress")
+    if not isinstance(egress, list) or len(egress) != 1:
+        return False
+    rule = egress[0]
+    if not isinstance(rule, Mapping) or set(rule) != {"to", "ports"}:
+        return False
+    if rule.get("ports") != [{"protocol": "TCP", "port": 443}]:
+        return False
+    peers = rule.get("to")
+    if not isinstance(peers, list) or len(peers) < 2:
+        return False
+    networks: set[str] = set()
+    for peer in peers:
+        if not isinstance(peer, Mapping) or set(peer) != {"ipBlock"}:
+            return False
+        block = peer.get("ipBlock")
+        if not isinstance(block, Mapping) or set(block) != {"cidr"}:
+            return False
+        try:
+            network = ipaddress.ip_network(str(block.get("cidr", "")), strict=True)
+        except ValueError:
+            return False
+        if network.prefixlen != network.max_prefixlen:
+            return False
+        networks.add(str(network))
+    return len(networks) == len(peers)
 
 
 def _run(command: Sequence[str], timeout: int) -> str:
@@ -963,6 +1100,57 @@ class ProductionDeploymentPlan:
                             "DEPLOYMENT_ARTIFACT_UNSAFE", "ServiceAccount token policy is not exact"
                         )
             manifest_objects[phase] = objects
+        candidate_config_map_keys = _config_map_key_sets(
+            manifest_objects["bootstrap_manifest"], phase="candidate"
+        )
+        rollback_config_map_keys = _config_map_key_sets(
+            manifest_objects["rollback_manifest"], phase="rollback"
+        )
+        referenced_config_maps = {
+            target
+            for references in EXPECTED_ENV_FROM.values()
+            for kind, target in references
+            if kind == "configMapRef"
+        }
+        if (
+            not referenced_config_maps.issubset(candidate_config_map_keys)
+            or not referenced_config_maps.issubset(rollback_config_map_keys)
+            or any(
+                candidate_config_map_keys[name] != rollback_config_map_keys[name]
+                for name in referenced_config_maps
+            )
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "candidate and rollback referenced ConfigMap key sets must be exact",
+            )
+        for phase, objects, key_sets in (
+            (
+                "candidate bootstrap",
+                manifest_objects["bootstrap_manifest"],
+                candidate_config_map_keys,
+            ),
+            (
+                "candidate migration",
+                manifest_objects["migration_manifest"],
+                candidate_config_map_keys,
+            ),
+            (
+                "candidate runtime",
+                manifest_objects["runtime_manifest"],
+                candidate_config_map_keys,
+            ),
+            (
+                "rollback",
+                manifest_objects["rollback_manifest"],
+                rollback_config_map_keys,
+            ),
+        ):
+            _validate_config_map_consumers(
+                objects,
+                config_map_keys=key_sets,
+                phase=phase,
+            )
         bootstrap_accounts = {
             _pod_name(value)
             for value in manifest_objects["bootstrap_manifest"]
@@ -983,16 +1171,14 @@ class ProductionDeploymentPlan:
                 if value.get("kind") == "ServiceAccount"
             }
             result: dict[str, str] = {}
+            role_arns: set[str] = set()
             for identity, account_name in STORAGE_SERVICE_ACCOUNTS.items():
                 account = accounts.get(account_name)
                 metadata = account.get("metadata") if isinstance(account, Mapping) else None
-                annotations = (
-                    metadata.get("annotations") if isinstance(metadata, Mapping) else None
-                )
-                if (
-                    not isinstance(annotations, Mapping)
-                    or set(annotations) != {WORKLOAD_IDENTITY_ANNOTATION}
-                ):
+                annotations = metadata.get("annotations") if isinstance(metadata, Mapping) else None
+                if not isinstance(annotations, Mapping) or set(annotations) != {
+                    WORKLOAD_IDENTITY_ANNOTATION
+                }:
                     raise DomainError(
                         "DEPLOYMENT_ARTIFACT_UNSAFE",
                         f"{phase} {identity} ServiceAccount identity annotation is not exact",
@@ -1003,9 +1189,13 @@ class ProductionDeploymentPlan:
                         "DEPLOYMENT_ARTIFACT_UNSAFE",
                         f"{phase} {identity} ServiceAccount role ARN is invalid",
                     )
-                result[identity] = canonical_digest(
-                    {"workload_identity_arn": role_arn}
-                )
+                if role_arn in role_arns:
+                    raise DomainError(
+                        "DEPLOYMENT_ARTIFACT_UNSAFE",
+                        f"{phase} snapshot and backup ServiceAccounts must use distinct roles",
+                    )
+                role_arns.add(role_arn)
+                result[identity] = canonical_digest({"workload_identity_arn": role_arn})
             return result
 
         workload_identity_bindings = workload_identity_digests(
@@ -1028,8 +1218,7 @@ class ProductionDeploymentPlan:
             configs = [
                 value
                 for value in objects
-                if value.get("kind") == "ConfigMap"
-                and _pod_name(value) == "shadow-runtime"
+                if value.get("kind") == "ConfigMap" and _pod_name(value) == "shadow-runtime"
             ]
             if len(configs) != 1:
                 raise DomainError(
@@ -1045,6 +1234,7 @@ class ProductionDeploymentPlan:
                 str(runtime_data.get("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX", "")),
                 str(runtime_data.get("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX", "")),
             )
+            segments = tuple(tuple(value.split("/")) for value in values)
             if (
                 any(
                     not OBJECT_STORAGE_PREFIX.fullmatch(value)
@@ -1054,17 +1244,17 @@ class ProductionDeploymentPlan:
                     for value in values
                 )
                 or len(set(values)) != len(values)
+                or segments[0] == segments[1][: len(segments[0])]
+                or segments[1] == segments[0][: len(segments[1])]
             ):
                 raise DomainError(
                     "DEPLOYMENT_ARTIFACT_INVALID",
-                    "snapshot and backup object-storage prefixes must be canonical and distinct",
+                    "snapshot and backup object-storage prefixes must be canonical and non-nested",
                 )
             return values
 
-        snapshot_object_storage_prefix, backup_object_storage_prefix = (
-            runtime_storage_prefixes(
-                manifest_objects["bootstrap_manifest"], phase="candidate"
-            )
+        snapshot_object_storage_prefix, backup_object_storage_prefix = runtime_storage_prefixes(
+            manifest_objects["bootstrap_manifest"], phase="candidate"
         )
         rollback_storage_prefixes = runtime_storage_prefixes(
             manifest_objects["rollback_manifest"], phase="rollback"
@@ -1077,6 +1267,7 @@ class ProductionDeploymentPlan:
                 "DEPLOYMENT_ARTIFACT_UNSAFE",
                 "rollback runtime object-storage prefixes differ from the candidate bundle",
             )
+
         def real_ot_runtime_binding(
             objects: Sequence[Mapping[str, Any]], *, phase: str
         ) -> tuple[str, str]:
@@ -1110,19 +1301,13 @@ class ProductionDeploymentPlan:
                     f"{phase} real-OT NodeId allowlist is invalid",
                 ) from error
             node_ids = tuple(str(item["node_id"]) for item in mappings)
-            node_digest = opcua_node_allowlist_digest(
-                node_ids, code="DEPLOYMENT_ARTIFACT_INVALID"
-            )
+            node_digest = opcua_node_allowlist_digest(node_ids, code="DEPLOYMENT_ARTIFACT_INVALID")
             digest = opcua_runtime_binding_digest(
                 endpoint_uri=str(data.get("SHADOW_ENDPOINT_URI", "")),
                 application_uri=str(data.get("SHADOW_APPLICATION_URI", "")),
-                client_application_uri=str(
-                    data.get("SHADOW_CLIENT_APPLICATION_URI", "")
-                ),
+                client_application_uri=str(data.get("SHADOW_CLIENT_APPLICATION_URI", "")),
                 namespace_uri=str(data.get("SHADOW_NAMESPACE_URI", "")),
-                server_certificate_fingerprint=str(
-                    data.get("SHADOW_CERTIFICATE_FINGERPRINT", "")
-                ),
+                server_certificate_fingerprint=str(data.get("SHADOW_CERTIFICATE_FINGERPRINT", "")),
                 client_certificate_fingerprint=str(
                     data.get("SHADOW_CLIENT_CERTIFICATE_FINGERPRINT", "")
                 ),
@@ -1135,10 +1320,8 @@ class ProductionDeploymentPlan:
             )
             return digest, node_digest
 
-        real_ot_runtime_binding_digest, real_ot_node_allowlist_digest = (
-            real_ot_runtime_binding(
-                manifest_objects["bootstrap_manifest"], phase="candidate"
-            )
+        real_ot_runtime_binding_digest, real_ot_node_allowlist_digest = real_ot_runtime_binding(
+            manifest_objects["bootstrap_manifest"], phase="candidate"
         )
         rollback_real_ot_binding = real_ot_runtime_binding(
             manifest_objects["rollback_manifest"], phase="rollback"
@@ -1346,6 +1529,7 @@ class KubernetesProductionPublisher:
         plan: ProductionDeploymentPlan,
         *,
         confirmation: str,
+        operation: str = "deploy",
         context: str,
         expected_cluster_uid_digest: str,
         expected_kubernetes_api_ca_digest: str,
@@ -1353,10 +1537,23 @@ class KubernetesProductionPublisher:
         runner: CommandRunner = _run,
         readiness_probe: ReadinessProbe = _ready,
     ) -> None:
-        if confirmation != f"{plan.namespace}:{plan.plan_id}:deploy":
+        confirmation_suffix = {
+            "deploy": "deploy",
+            "restore-prior-bundle": "rollback",
+        }.get(operation)
+        if confirmation_suffix is None:
             raise DomainError(
-                "PRODUCTION_DEPLOY_CONFIRMATION_REQUIRED",
-                "exact production deployment confirmation is required",
+                "PRODUCTION_DEPLOY_OPERATION_INVALID",
+                "production publisher operation is invalid",
+            )
+        if confirmation != f"{plan.namespace}:{plan.plan_id}:{confirmation_suffix}":
+            raise DomainError(
+                (
+                    "PRODUCTION_ROLLBACK_CONFIRMATION_REQUIRED"
+                    if operation == "restore-prior-bundle"
+                    else "PRODUCTION_DEPLOY_CONFIRMATION_REQUIRED"
+                ),
+                f"exact {operation} production confirmation is required",
             )
         if not DIGEST.fullmatch(expected_cluster_uid_digest) or not DIGEST.fullmatch(
             expected_kubernetes_api_ca_digest
@@ -1366,6 +1563,7 @@ class KubernetesProductionPublisher:
                 "signed target cluster identity digest is required",
             )
         self.plan = plan
+        self.operation = operation
         self.context = _safe_context(context)
         self.expected_cluster_uid_digest = expected_cluster_uid_digest
         self.expected_kubernetes_api_ca_digest = expected_kubernetes_api_ca_digest
@@ -1653,6 +1851,11 @@ class KubernetesProductionPublisher:
         )
 
     def resume_rollback(self) -> GateEvidence:
+        if self.operation != "restore-prior-bundle":
+            raise DomainError(
+                "PRODUCTION_ROLLBACK_CONFIRMATION_REQUIRED",
+                "rollback-specific break-glass authorization is required",
+            )
         started = utc_now()
         self._verify_cluster()
         self._verify_rbac()
@@ -1670,7 +1873,72 @@ class KubernetesProductionPublisher:
             metrics={"workloads": len(self.plan.workloads)},
         )
 
+    def verify_no_mutation(self) -> GateEvidence:
+        """Verify the recovery target without applying anything to the cluster."""
+        if self.operation != "restore-prior-bundle":
+            raise DomainError(
+                "PRODUCTION_ROLLBACK_CONFIRMATION_REQUIRED",
+                "rollback-specific break-glass authorization is required",
+            )
+        started = utc_now()
+        self._verify_cluster()
+        self._verify_rbac()
+        return complete(
+            "production_rollback_noop",
+            started_at=started,
+            coordinates={
+                "plan_digest": self.plan.digest,
+                "namespace": self.plan.namespace,
+                "cluster_uid_digest": self.cluster_uid_digest,
+                "kubernetes_api_ca_digest": self.kubernetes_api_ca_digest,
+            },
+            checks=(GateCheck("no_candidate_mutation_recorded", True),),
+            metrics={"workloads": len(self.plan.workloads)},
+        )
+
+    def verify_restored_bundle(self) -> GateEvidence:
+        """Read back the sealed prior bundle without performing another rollback."""
+        if self.operation != "restore-prior-bundle":
+            raise DomainError(
+                "PRODUCTION_ROLLBACK_CONFIRMATION_REQUIRED",
+                "rollback-specific break-glass authorization is required",
+            )
+        started = utc_now()
+        self._verify_cluster()
+        self._verify_rbac()
+        self._rollouts()
+        expected = {
+            workload.name: image
+            for workload, image in zip(self.plan.workloads, self.plan.rollback_images, strict=True)
+        }
+        observed_images, readiness, revisions = self._observed_workloads(expected)
+        checks = (
+            GateCheck("sealed_prior_images", observed_images == expected),
+            GateCheck("sealed_prior_rollouts_ready", all(readiness.values())),
+        )
+        return complete(
+            "production_rollback_verification",
+            started_at=started,
+            coordinates={
+                "plan_digest": self.plan.digest,
+                "namespace": self.plan.namespace,
+                "cluster_uid_digest": self.cluster_uid_digest,
+                "kubernetes_api_ca_digest": self.kubernetes_api_ca_digest,
+                "revisions": revisions,
+            },
+            checks=checks,
+            metrics={
+                "workloads": len(self.plan.workloads),
+                "ready_workloads": sum(readiness.values()),
+            },
+        )
+
     def run(self) -> GateEvidence:
+        if self.operation != "deploy":
+            raise DomainError(
+                "PRODUCTION_DEPLOY_CONFIRMATION_REQUIRED",
+                "deploy authorization is required for candidate publication",
+            )
         started = utc_now()
         self._verify_cluster()
         self._verify_rbac()
@@ -1695,6 +1963,10 @@ class KubernetesProductionPublisher:
         mutation_attempted = False
         rollback_completed = False
         try:
+            # This durable marker is written before the first mutating kubectl call.
+            # A terminated process can therefore never confuse a partial apply with
+            # the read-only preflight/no-op state.
+            self._journal("candidate_mutation_started")
             mutation_attempted = True
             self._apply(self.plan.bootstrap_manifest)
             self._apply(self.plan.migration_manifest)

@@ -127,3 +127,19 @@ spec:
       ports: [{protocol: TCP, port: 5432}]
     - to: [{ipBlock: {cidr: 198.51.100.30/32}}]
       ports: [{protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: storage-identity-probe-egress}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: industrial-shadow-storage-probe
+  policyTypes: [Egress]
+  egress:
+    # Fail-closed TEST-NET placeholder. The signed target overlay must replace
+    # this with the exact S3 and regional STS HTTPS endpoint addresses.
+    - to:
+        - {ipBlock: {cidr: 198.51.100.30/32}}
+        - {ipBlock: {cidr: 198.51.100.31/32}}
+      ports: [{protocol: TCP, port: 443}]

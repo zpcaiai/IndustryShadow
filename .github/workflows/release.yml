@@ -1,3 +1,5 @@
+# Generated root entrypoint; edit the package template and sync deliberately.
+# Template: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.github/workflows/release.yml
 name: release-candidate
 
 on:
@@ -11,6 +13,10 @@ permissions:
   id-token: write
   attestations: write
   artifact-metadata: write
+
+defaults:
+  run:
+    working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
 
 jobs:
   verify-executable-gates:
@@ -49,8 +55,8 @@ jobs:
         with:
           name: release-verification-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            artifacts/python-sbom.cdx.json
-            docs/evidence/batch-24
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/python-sbom.cdx.json
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24
           if-no-files-found: error
 
   build-images:
@@ -75,8 +81,8 @@ jobs:
         id: backend
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          context: .
-          file: deploy/compose/Dockerfile.backend
+          context: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
+          file: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/deploy/compose/Dockerfile.backend
           push: true
           tags: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
           provenance: mode=max
@@ -85,8 +91,8 @@ jobs:
         id: web
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
-          context: .
-          file: deploy/compose/Dockerfile.web
+          context: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
+          file: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/deploy/compose/Dockerfile.web
           push: true
           tags: ${{ env.WEB_IMAGE }}:${{ github.sha }}
           provenance: mode=max
@@ -97,7 +103,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
           image: ${{ env.BACKEND_IMAGE }}@${{ steps.backend.outputs.digest }}
-          output-file: artifacts/release/sbom/backend.spdx.json
+          output-file: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release/sbom/backend.spdx.json
           format: spdx-json
           upload-artifact: false
           upload-release-assets: false
@@ -105,7 +111,7 @@ jobs:
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
           image: ${{ env.WEB_IMAGE }}@${{ steps.web.outputs.digest }}
-          output-file: artifacts/release/sbom/web.spdx.json
+          output-file: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release/sbom/web.spdx.json
           format: spdx-json
           upload-artifact: false
           upload-release-assets: false
@@ -122,7 +128,7 @@ jobs:
         with:
           subject-name: ${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.backend.outputs.digest }}
-          sbom-path: artifacts/release/sbom/backend.spdx.json
+          sbom-path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release/sbom/backend.spdx.json
           push-to-registry: true
       - name: Attest web provenance
         id: web-provenance
@@ -137,7 +143,7 @@ jobs:
         with:
           subject-name: ${{ env.WEB_IMAGE }}
           subject-digest: ${{ steps.web.outputs.digest }}
-          sbom-path: artifacts/release/sbom/web.spdx.json
+          sbom-path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release/sbom/web.spdx.json
           push-to-registry: true
       - name: Write immutable candidate, migration contract, and attestation bundle
         env:
@@ -239,7 +245,7 @@ jobs:
         id: candidate-manifest
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
         with:
-          subject-path: artifacts/release/release-candidate.json
+          subject-path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release/release-candidate.json
       - name: Seal and self-validate the complete release bundle
         env:
           CANDIDATE_BUNDLE: ${{ steps.candidate-manifest.outputs.bundle-path }}
@@ -253,7 +259,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: immutable-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/release
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/artifacts/release
           if-no-files-found: error
           retention-days: 90
       - name: Remove candidate registry login

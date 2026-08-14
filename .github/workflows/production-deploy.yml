@@ -1,3 +1,5 @@
+# Generated root entrypoint; edit the package template and sync deliberately.
+# Template: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.github/workflows/production-deploy.yml
 name: production-deploy
 
 on:
@@ -27,6 +29,10 @@ concurrency:
   group: industrial-shadow-production-deploy
   cancel-in-progress: false
 
+defaults:
+  run:
+    working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
+
 jobs:
   deploy-closure-bound-release:
     environment: production-deployment
@@ -42,6 +48,7 @@ jobs:
         env:
           OPERATION: ${{ inputs.operation }}
           PRIOR_DEPLOYMENT_RUN_ID: ${{ inputs.prior_deployment_run_id }}
+        working-directory: ${{ github.workspace }}
         run: |
           case "$OPERATION" in
             deploy)
@@ -59,6 +66,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CLOSURE_RUN_ID: ${{ inputs.closure_run_id }}
+        working-directory: ${{ github.workspace }}
         run: |
           [[ "$CLOSURE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_record="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/runs/$CLOSURE_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt,.run_started_at,.updated_at] | @tsv')"
@@ -111,6 +119,7 @@ jobs:
         env:
           CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-closure-${{ github.run_id }}-${{ github.run_attempt }}/production/supply-chain/release-candidate.json
           EXPECTED_SOURCE_REVISION: ${{ steps.closure-run.outputs.source_revision }}
+        working-directory: ${{ github.workspace }}
         run: |
           source_revision="$(python3 - "$CANDIDATE_MANIFEST" "$EXPECTED_SOURCE_REVISION" <<'PY'
           import hashlib
@@ -151,7 +160,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: ${{ steps.closure-run.outputs.artifact_name }}
-          path: docs/evidence/batch-24
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24
           github-token: ${{ github.token }}
           run-id: ${{ steps.closure-run.outputs.run_id }}
       - name: Verify the failed deployment selected for break-glass restore
@@ -297,6 +306,6 @@ jobs:
         if: always()
         with:
           name: production-deployment-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: docs/evidence/batch-24/production-deployment
+          path: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production-deployment
           if-no-files-found: error
           retention-days: 90

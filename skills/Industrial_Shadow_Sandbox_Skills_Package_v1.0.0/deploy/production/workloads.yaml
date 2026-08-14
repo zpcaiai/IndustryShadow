@@ -198,7 +198,6 @@ spec:
           image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["python", "-m", "shadow_collector.runner"]
           envFrom:
-            - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-real-ot-collector-binding}
           env:
             - name: SHADOW_DATABASE_URL
@@ -247,7 +246,6 @@ spec:
           image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["python", "-m", "shadow_collector.runner"]
           envFrom:
-            - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-simulator-collector-binding}
           env:
             - name: SHADOW_DATABASE_URL

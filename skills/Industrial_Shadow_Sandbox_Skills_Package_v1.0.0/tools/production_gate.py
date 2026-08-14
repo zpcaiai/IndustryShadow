@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -18,12 +17,17 @@ from shadow_sandbox.common.models import (
     canonical_json,
     utc_now,
 )
-from shadow_sandbox.common.object_storage import S3ObjectStorage
+from shadow_sandbox.common.object_storage import S3ObjectStorage, validate_object_key
 from shadow_sandbox.common.opcua_readonly import (
+    normalize_opcua_fingerprint,
     normalize_opcua_security_string,
     opcua_runtime_binding_digest,
 )
-from shadow_sandbox.evaluation.formal_benchmark import FormalBenchmarkImporter
+from shadow_sandbox.common.secure_files import read_private_json_object
+from shadow_sandbox.evaluation.formal_benchmark import (
+    FormalBenchmarkImporter,
+    production_storage_binding_digest,
+)
 from shadow_sandbox.evaluation.measured_benchmark import MeasuredBenchmark
 from shadow_sandbox.operations.backup_job import database_coordinate_digest
 from shadow_sandbox.operations.certificate_probe import CertificateAuthorityProbe
@@ -41,6 +45,9 @@ from shadow_sandbox.operations.kubernetes_drills import (
     KubernetesChaosSuite,
     KubernetesDrill,
 )
+from shadow_sandbox.operations.kubernetes_storage_probe import (
+    run_kubernetes_storage_identity_probe,
+)
 from shadow_sandbox.operations.load_probe import run_http_load_suite
 from shadow_sandbox.operations.managed_postgresql_probe import AwsRdsControlPlaneProbe
 from shadow_sandbox.operations.network_probe import (
@@ -54,12 +61,11 @@ from shadow_sandbox.operations.postgresql_migration import (
 )
 from shadow_sandbox.operations.production_deployment import ProductionDeploymentPlan
 from shadow_sandbox.operations.production_preflight import ProductionPreflight
-from shadow_sandbox.operations.restore_drill import BackupRestoreReceipt, PostgreSqlRestoreDrill
-from shadow_sandbox.operations.storage_probe import (
-    S3KmsProbe,
-    S3WorkloadIdentityProbe,
-    workload_session,
+from shadow_sandbox.operations.restore_drill import (
+    BackupRestoreReceipt,
+    PostgreSqlRestoreDrill,
 )
+from shadow_sandbox.operations.storage_probe import S3KmsProbe
 from shadow_sandbox.operations.supply_chain import (
     ReleaseCandidate,
     SupplyChainAttestationProbe,
@@ -77,19 +83,10 @@ def _required(name: str) -> str:
 
 
 def _secret_json(path_value: str) -> Mapping[str, Any]:
-    path = Path(path_value)
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        raise DomainError(
-            "PRODUCTION_GATE_SECRET_PERMISSIONS",
-            "secret input must not be readable by group or other users",
-        )
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, Mapping):
-        raise DomainError(
-            "PRODUCTION_GATE_CONFIG_INVALID", "secret input must be an object"
-        )
-    return value
+    return read_private_json_object(
+        path_value,
+        code="PRODUCTION_GATE_SECRET_INVALID",
+    )
 
 
 def _config(path_value: str) -> Mapping[str, Any]:
@@ -160,7 +157,9 @@ def _signed_target_profile() -> Mapping[str, Any]:
     return target
 
 
-def _deployment_binding() -> tuple[ProductionDeploymentPlan, str, str, str]:
+def _deployment_binding(
+    context_environment_variable: str | None = None,
+) -> tuple[ProductionDeploymentPlan, str, str, str]:
     plan = ProductionDeploymentPlan.load(
         ROOT,
         _required("SHADOW_PRODUCTION_DEPLOYMENT_PLAN"),
@@ -186,7 +185,9 @@ def _deployment_binding() -> tuple[ProductionDeploymentPlan, str, str, str]:
         )
     return (
         plan,
-        _required("SHADOW_KUBERNETES_CONTEXT"),
+        _required(context_environment_variable)
+        if context_environment_variable is not None
+        else "",
         str(target["cluster_uid_digest"]),
         str(target["kubernetes_api_ca_digest"]),
     )
@@ -201,24 +202,49 @@ def _real_ot_probe_binding_digest() -> str:
         or any(not isinstance(item, str) or not item.strip() for item in node_ids)
         or len(node_ids) != len(set(node_ids))
     ):
-        raise DomainError("REAL_OT_BINDING_INVALID", "real-OT NodeId allowlist is invalid")
+        raise DomainError(
+            "REAL_OT_BINDING_INVALID", "real-OT NodeId allowlist is invalid"
+        )
     security_profile, _certificate_path, _key_path, _server_path = (
         normalize_opcua_security_string(
             _required("SHADOW_OPCUA_SECURITY_STRING"),
             code="REAL_OT_BINDING_INVALID",
         )
     )
+    server_fingerprint = normalize_opcua_fingerprint(
+        str(binding.get("certificate_fingerprint", "")),
+        code="REAL_OT_BINDING_INVALID",
+    )
+    client_fingerprint = normalize_opcua_fingerprint(
+        str(binding.get("client_certificate_fingerprint", "")),
+        code="REAL_OT_BINDING_INVALID",
+    )
+    if (
+        server_fingerprint
+        != normalize_opcua_fingerprint(
+            _required("SHADOW_CERTIFICATE_FINGERPRINT"),
+            code="REAL_OT_BINDING_INVALID",
+        )
+        or client_fingerprint
+        != normalize_opcua_fingerprint(
+            _required("SHADOW_CLIENT_CERTIFICATE_FINGERPRINT"),
+            code="REAL_OT_BINDING_INVALID",
+        )
+        or binding.get("application_uri") != _required("SHADOW_OPCUA_APPLICATION_URI")
+        or binding.get("client_application_uri")
+        != _required("SHADOW_OPCUA_CLIENT_APPLICATION_URI")
+    ):
+        raise DomainError(
+            "REAL_OT_BINDING_INVALID",
+            "real-OT probe and external-CA coordinates must be identical",
+        )
     return opcua_runtime_binding_digest(
         endpoint_uri=str(binding.get("endpoint_uri", "")),
         application_uri=str(binding.get("application_uri", "")),
         client_application_uri=str(binding.get("client_application_uri", "")),
         namespace_uri=str(binding.get("namespace_uri", "")),
-        server_certificate_fingerprint=str(
-            binding.get("certificate_fingerprint", "")
-        ),
-        client_certificate_fingerprint=_required(
-            "SHADOW_CLIENT_CERTIFICATE_FINGERPRINT"
-        ),
+        server_certificate_fingerprint=server_fingerprint,
+        client_certificate_fingerprint=client_fingerprint,
         next_client_certificate_fingerprint=_required(
             "SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT"
         ),
@@ -249,15 +275,29 @@ def _validate_signed_identity_and_storage(target: Mapping[str, Any]) -> None:
             _required("SHADOW_RESTORE_SOURCE_DATABASE_URL")
         ),
     )
-    prefixes = {
-        _required("SHADOW_OBJECT_STORAGE_PREFIX").rstrip("/"),
-        _required("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX").rstrip("/"),
-        _required("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX").rstrip("/"),
-    }
-    if len(prefixes) != 3:
+    prefixes = tuple(
+        _required(name)
+        for name in (
+            "SHADOW_OBJECT_STORAGE_PREFIX",
+            "SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX",
+            "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX",
+        )
+    )
+    segments = tuple(tuple(value.split("/")) for value in prefixes)
+    if (
+        len(set(prefixes)) != 3
+        or any(validate_object_key(value) != value for value in prefixes)
+        or any(
+            left == right[: len(left)] or right == left[: len(right)]
+            for index, left in enumerate(segments)
+            for right in segments[index + 1 :]
+        )
+        or _required("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN")
+        == _required("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN")
+    ):
         raise DomainError(
             "PRODUCTION_TARGET_PROFILE_INVALID",
-            "probe, snapshot, and backup object prefixes must be distinct",
+            "storage prefixes must be canonical/non-nested and workload roles distinct",
         )
     expected = {
         "oidc_issuer": _required("SHADOW_OIDC_ISSUER").rstrip("/"),
@@ -283,11 +323,7 @@ def _validate_signed_identity_and_storage(target: Mapping[str, Any]) -> None:
         ),
         "backup_restore_receipt_digest": receipt.receipt_digest,
         "backup_workload_identity_arn_digest": canonical_digest(
-            {
-                "workload_identity_arn": _required(
-                    "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"
-                )
-            }
+            {"workload_identity_arn": _required("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN")}
         ),
         "snapshot_workload_identity_arn_digest": canonical_digest(
             {
@@ -319,6 +355,32 @@ def _release_digest(*, strict: bool) -> str:
     return canonical_digest(
         values if all(values.values()) else {"configuration": "incomplete"}
     )
+
+
+def _immutable_image_digest(name: str) -> str:
+    value = _required(name)
+    match = re.fullmatch(r"[^@\s]+@sha256:([a-f0-9]{64})", value)
+    if match is None or match.group(1) == "0" * 64:
+        raise DomainError(
+            "PRODUCTION_GATE_IMAGE_INVALID",
+            f"{name} must be an immutable non-zero image digest",
+        )
+    return match.group(1)
+
+
+def _oidc_browser_binding() -> Mapping[str, str]:
+    return {
+        "acceptance_run_id": _required("SHADOW_ACCEPTANCE_RUN_ID"),
+        "release_digest": _release_digest(strict=True),
+        "candidate_image_digest": _immutable_image_digest("SHADOW_CANDIDATE_IMAGE"),
+        "web_candidate_image_digest": _immutable_image_digest(
+            "SHADOW_WEB_CANDIDATE_IMAGE"
+        ),
+        "build_digest": _required("SHADOW_BUILD_DIGEST"),
+        "simulator_build_digest": _required("SHADOW_SIMULATOR_BUILD_DIGEST"),
+        "environment_digest": _required("SHADOW_PRODUCTION_ENVIRONMENT_DIGEST"),
+        "deployment_plan_digest": _required("SHADOW_DEPLOYMENT_PLAN_DIGEST"),
+    }
 
 
 def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
@@ -456,6 +518,7 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                 )
                 if item.strip()
             ),
+            browser_binding=_oidc_browser_binding(),
         )
         values = secrets.get("persona_bearer_values", {})
         if not isinstance(values, Mapping):
@@ -465,13 +528,18 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
         return (
             probe.run(
                 {str(key): str(value) for key, value in values.items()},
-                browser_journey=_config(_required("SHADOW_OIDC_BROWSER_JOURNEY")),
+                browser_journey=read_private_json_object(
+                    _required("SHADOW_OIDC_BROWSER_JOURNEY"),
+                    code="OIDC_BROWSER_JOURNEY_FILE_INVALID",
+                ),
             ),
             None,
         )
     if name == "s3":
+        plan, context, cluster_uid_digest, kubernetes_api_ca_digest = (
+            _deployment_binding("SHADOW_KUBERNETES_STORAGE_CONTEXT")
+        )
         target_profile = _signed_target_profile()
-        _validate_signed_identity_and_storage(target_profile)
         try:
             import boto3
         except ImportError as error:
@@ -480,123 +548,131 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
             ) from error
         region = _required("SHADOW_OBJECT_STORAGE_REGION")
         endpoint = os.environ.get("SHADOW_OBJECT_STORAGE_ENDPOINT")
+        account_id = _required("SHADOW_AWS_ACCOUNT_ID")
+        probe_prefix = _required("SHADOW_OBJECT_STORAGE_PREFIX")
+        snapshot_prefix = _required("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX")
+        backup_prefix = _required("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX")
+        bucket = _required("SHADOW_OBJECT_STORAGE_BUCKET")
+        kms_key_id = _required("SHADOW_OBJECT_STORAGE_KMS_KEY_ID")
+        require_object_lock = _required("SHADOW_REQUIRE_OBJECT_LOCK") == "true"
+        if not require_object_lock:
+            raise DomainError(
+                "S3_OBJECT_LOCK_REQUIRED",
+                "production S3 probes require Object Lock retention",
+            )
         storage = S3ObjectStorage(
-            _required("SHADOW_OBJECT_STORAGE_BUCKET"),
+            bucket,
             region=region,
             endpoint_url=endpoint,
-            prefix=os.environ.get(
-                "SHADOW_OBJECT_STORAGE_PREFIX", "industrial-shadow/production"
-            ),
-            kms_key_id=_required("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
+            prefix=probe_prefix,
+            kms_key_id=kms_key_id,
             kms_encryption_context={
                 "application": "industrial-shadow",
                 "purpose": "probe",
             },
+            expected_bucket_owner=account_id,
+            production=True,
         )
-        control_plane = S3KmsProbe(
+        control_probe = S3KmsProbe(
             storage,
-            require_object_lock=os.environ.get(
-                "SHADOW_REQUIRE_OBJECT_LOCK", "true"
-            ).lower()
-            == "true",
+            require_object_lock=require_object_lock,
             kms_client=boto3.client("kms", region_name=region),
             sts_client=boto3.client("sts", region_name=region),
-            expected_account_id=_required("SHADOW_AWS_ACCOUNT_ID"),
+            expected_account_id=account_id,
             require_cloud_control_plane=True,
-        ).run()
-        sentinel_checks: list[GateCheck] = []
-        for identity, variable in (
-            ("backup", "SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY"),
-            ("snapshot", "SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"),
-        ):
-            sentinel = storage.client.head_object(
-                Bucket=storage.bucket,
-                Key=_required(variable),
-            )
-            sentinel_checks.append(
-                GateCheck(
-                    f"{identity}_cross_prefix_sentinel_exists",
-                    bool(sentinel.get("VersionId"))
-                    and sentinel.get("ServerSideEncryption") == "aws:kms"
-                    and sentinel.get("SSEKMSKeyId") == storage.kms_key_id,
-                )
-            )
-        session_contracts = _secret_json(
-            _required("SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE")
+            lifecycle_prefixes={
+                "acceptance": storage._key("production-probes").rstrip("/") + "/",
+                "snapshot": snapshot_prefix,
+                "backup": backup_prefix,
+            },
+            immutable_sentinel_keys={
+                "backup": _required("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY"),
+                "snapshot": _required("SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"),
+            },
+            acceptance_run_id=_required("SHADOW_ACCEPTANCE_RUN_ID"),
+            signed_target_profile_digest=_required(
+                "SHADOW_PRODUCTION_ENVIRONMENT_DIGEST"
+            ),
+            mutation_confirmation=_required(
+                "SHADOW_PRODUCTION_S3_CONTROL_PLANE_CONFIRMATION"
+            ),
         )
-        if set(session_contracts) != {"backup", "snapshot"} or any(
-            not isinstance(session_contracts[name], Mapping)
-            for name in ("backup", "snapshot")
-        ):
+        control_plane = control_probe.run()
+        control_plane.verify()
+        if control_plane.status != "PASSED" or control_plane.limitations:
             raise DomainError(
-                "WORKLOAD_IDENTITY_CONFIG_INVALID",
-                "exact backup and snapshot workload sessions are required",
+                "S3_CONTROL_PLANE_INVALID",
+                "target-Pod probes require an unqualified S3/KMS control-plane PASS",
             )
-        workload_evidence: dict[str, GateEvidence] = {}
-        workload_coordinates = {
-            "backup": (
-                _required("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX"),
-                _required("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"),
-                _required("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY"),
-            ),
-            "snapshot": (
-                _required("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX"),
-                _required("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
-                _required("SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"),
-            ),
-        }
-        for identity, (prefix, expected_role, forbidden_key) in workload_coordinates.items():
-            contract = session_contracts[identity]
-            assert isinstance(contract, Mapping)
-            session = workload_session(contract, boto3_module=boto3)
-            identity_storage = S3ObjectStorage(
-                _required("SHADOW_OBJECT_STORAGE_BUCKET"),
-                region=region,
-                endpoint_url=endpoint,
-                prefix=prefix,
-                kms_key_id=_required("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
-                kms_encryption_context={
-                    "application": "industrial-shadow",
-                    "purpose": identity,
-                },
-                client=session.client("s3", region_name=region, endpoint_url=endpoint),
-                require_https_endpoint=True,
+        if set(control_probe.sentinel_bindings) != {"backup", "snapshot"}:
+            raise DomainError(
+                "S3_SENTINEL_BINDING_INVALID",
+                "control plane did not bind both immutable cross-prefix sentinels",
             )
-            workload_evidence[identity] = S3WorkloadIdentityProbe(
-                identity_storage,
-                identity=identity,
-                sts_client=session.client("sts", region_name=region),
-                expected_role_arn=expected_role,
-                forbidden_key=forbidden_key,
-                require_object_lock=True,
-            ).run()
+        workload_identity = run_kubernetes_storage_identity_probe(
+            namespace=plan.namespace,
+            context=context,
+            candidate_image=plan.backend_image,
+            bucket=bucket,
+            region=region,
+            prefixes={
+                "acceptance": probe_prefix,
+                "backup": backup_prefix,
+                "snapshot": snapshot_prefix,
+            },
+            kms_key_arn=kms_key_id,
+            account_id=account_id,
+            expected_role_arns={
+                "backup": _required("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"),
+                "snapshot": _required("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
+            },
+            immutable_sentinel_bindings=control_probe.sentinel_bindings,
+            expected_cluster_uid_digest=cluster_uid_digest,
+            expected_kubernetes_api_ca_digest=kubernetes_api_ca_digest,
+            confirmation=_required(
+                "SHADOW_PRODUCTION_S3_WORKLOAD_IDENTITY_CONFIRMATION"
+            ),
+            require_object_lock=require_object_lock,
+        )
+        workload_identity.verify()
+        if workload_identity.status != "PASSED" or workload_identity.limitations:
+            raise DomainError(
+                "KUBERNETES_STORAGE_PROBE_EVIDENCE_INVALID",
+                "both target-Pod workload identity probes must pass without limitations",
+            )
         checks = [
             GateCheck("control_plane", control_plane.status == "PASSED"),
             *(
                 GateCheck(f"control_{check.name}", check.passed, check.details)
                 for check in control_plane.checks
             ),
-            *sentinel_checks,
         ]
-        for identity in ("backup", "snapshot"):
-            evidence = workload_evidence[identity]
-            checks.append(GateCheck(f"{identity}_identity", evidence.status == "PASSED"))
-            checks.extend(
-                GateCheck(f"{identity}_{check.name}", check.passed, check.details)
-                for check in evidence.checks
+        checks.append(
+            GateCheck(
+                "target_pod_workload_identities", workload_identity.status == "PASSED"
             )
+        )
+        checks.extend(
+            (
+                GateCheck("backup_identity", workload_identity.status == "PASSED"),
+                GateCheck("snapshot_identity", workload_identity.status == "PASSED"),
+            )
+        )
+        checks.extend(
+            GateCheck(check.name, check.passed, check.details)
+            for check in workload_identity.checks
+        )
+        sentinel_digests = {
+            identity: binding.binding_digest
+            for identity, binding in sorted(control_probe.sentinel_bindings.items())
+        }
         return (
             complete(
                 "s3",
                 started_at=control_plane.started_at,
                 coordinates={
                     "control_plane_target_digest": control_plane.target_digest,
-                    "backup_identity_target_digest": workload_evidence[
-                        "backup"
-                    ].target_digest,
-                    "snapshot_identity_target_digest": workload_evidence[
-                        "snapshot"
-                    ].target_digest,
+                    "target_pod_identity_target_digest": workload_identity.target_digest,
                     "signed_target_profile_digest": _required(
                         "SHADOW_PRODUCTION_ENVIRONMENT_DIGEST"
                     ),
@@ -606,14 +682,24 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                     "snapshot_workload_identity_arn_digest": target_profile[
                         "snapshot_workload_identity_arn_digest"
                     ],
+                    "sentinel_binding_digest": canonical_digest(sentinel_digests),
                 },
                 checks=checks,
                 metrics={
                     **control_plane.metrics,
-                    "workload_identities_verified": sum(
-                        evidence.status == "PASSED"
-                        for evidence in workload_evidence.values()
+                    "workload_identities_verified": 2
+                    if workload_identity.status == "PASSED"
+                    else 0,
+                    "target_pod_identities_verified": workload_identity.metrics.get(
+                        "pods", 0
                     ),
+                    "sentinel_bindings_verified": len(control_probe.sentinel_bindings),
+                    "storage_binding_digest": production_storage_binding_digest(
+                        target_profile, plan
+                    ),
+                    "backup_sentinel_binding_digest": sentinel_digests["backup"],
+                    "snapshot_sentinel_binding_digest": sentinel_digests["snapshot"],
+                    "sentinel_binding_digest": canonical_digest(sentinel_digests),
                 },
             ),
             None,
@@ -723,8 +809,7 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
             "restore_ca_identifier_digest": "managed_postgresql_restore_ca_identifier_digest",
         }
         control_plane_bound = control_plane.status == "PASSED" and all(
-            control_plane.metrics.get(coordinate)
-            == target_profile.get(profile_field)
+            control_plane.metrics.get(coordinate) == target_profile.get(profile_field)
             for coordinate, profile_field in signed_control_coordinates.items()
         )
         if not control_plane_bound:
@@ -822,7 +907,9 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
         )
     if name == "network_policy":
         config = _config(_required("SHADOW_NETWORK_PROBE_CONFIG"))
-        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding()
+        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding(
+            "SHADOW_KUBERNETES_NETWORK_CONTEXT"
+        )
         return run_kubernetes_policy_suite(
             namespace=str(config["namespace"]),
             probes=tuple(config["probes"]),
@@ -845,7 +932,9 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
         ), None
     if name == "resilience":
         config = _config(_required("SHADOW_CHAOS_DRILL_CONFIG"))
-        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding()
+        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding(
+            "SHADOW_KUBERNETES_CHAOS_CONTEXT"
+        )
         suite = KubernetesChaosSuite(
             str(config["namespace"]),
             _required("SHADOW_DRILL_DATABASE_URL"),
@@ -858,7 +947,9 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
         return suite.run(tuple(config["scenarios"])), None
     if name == "upgrade_rollback":
         config = _config(_required("SHADOW_KUBERNETES_DRILL_CONFIG"))
-        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding()
+        plan, context, cluster_uid_digest, api_ca_digest = _deployment_binding(
+            "SHADOW_KUBERNETES_ROLLBACK_CONTEXT"
+        )
         drill = KubernetesDrill(
             str(config["namespace"]),
             str(config["deployment"]),

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -22,7 +23,11 @@ from shadow_sandbox.common.sqlalchemy_store import SqlAlchemyStore
 from shadow_sandbox.common.tenant_scope import workspace_scope
 
 from .backup_job import postgres_environment
-from .database_roles import DatabaseRoleConfigurator
+from .database_roles import (
+    DatabaseRoleConfigurator,
+    role_access_matrix,
+    role_matrix_is_exact,
+)
 from .evidence import GateCheck, GateEvidence, complete
 
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -252,38 +257,480 @@ def _verify_full(url: str) -> bool:
     )
 
 
+def _ordered_rows_digest(
+    rows: Iterable[Mapping[str, object]], *, domain: str
+) -> dict[str, int | str]:
+    """Digest an already canonically ordered row stream without retaining it."""
+
+    digest = hashlib.sha256()
+    digest.update(b"industrial-shadow-ordered-multiset-v2\x00")
+    encoded_domain = domain.encode("utf-8")
+    digest.update(len(encoded_domain).to_bytes(8, "big"))
+    digest.update(encoded_domain)
+    count = 0
+    for row in rows:
+        encoded = canonical_json(row).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    digest.update(count.to_bytes(16, "big"))
+    return {"count": count, "sha256": digest.hexdigest()}
+
+
 def _table_inventory(store: SqlAlchemyStore) -> dict[str, dict[str, int | str]]:
     tables = [
         str(row["tablename"])
         for row in store.query(
-            "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+            """SELECT relation.relname AS tablename
+                 FROM pg_class relation
+                 JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                WHERE namespace.nspname='public'
+                  AND relation.relkind IN ('r', 'p', 'm')
+                  AND NOT relation.relispartition
+             ORDER BY relation.relname COLLATE \"C\""""
         )
     ]
     inventory: dict[str, dict[str, int | str]] = {}
     for table in tables:
         quoted = '"' + table.replace('"', '""') + '"'
-        row = store.query(
-            f"""SELECT COUNT(*) AS count,
-                       COALESCE(SUM((('x' || SUBSTR(MD5(TO_JSONB(item)::text), 1, 16))::bit(64)::bigint)::numeric), 0)::text AS digest_a,
-                       COALESCE(SUM((('x' || SUBSTR(MD5(TO_JSONB(item)::text), 17, 16))::bit(64)::bigint)::numeric), 0)::text AS digest_b
-                  FROM {quoted} AS item"""
-        )[0]
-        inventory[table] = {
-            "count": int(row["count"]),
-            "digest_a": str(row["digest_a"]),
-            "digest_b": str(row["digest_b"]),
-        }
+        rows = store.iterate(
+            f"""SELECT TO_JSONB(item)::text AS row_json
+                  FROM public.{quoted} AS item
+              ORDER BY (TO_JSONB(item)::text) COLLATE \"C\"""",
+            batch_size=32,
+        )
+        inventory[table] = _ordered_rows_digest(rows, domain=f"table:public.{table}")
     return inventory
 
 
 def _rls_inventory(store: SqlAlchemyStore) -> dict[str, int | str]:
-    row = store.query(
-        """SELECT COUNT(*) AS count,
-                  MD5(COALESCE(STRING_AGG(MD5(TO_JSONB(policy)::text), ''
-                                          ORDER BY MD5(TO_JSONB(policy)::text)), '')) AS digest
-             FROM pg_policies AS policy WHERE schemaname='public'"""
-    )[0]
-    return {"count": int(row["count"]), "digest": str(row["digest"])}
+    return _ordered_rows_digest(
+        store.iterate(
+            """SELECT policyname, tablename, permissive, roles::text AS roles,
+                      cmd, COALESCE(qual, '') AS using_expression,
+                      COALESCE(with_check, '') AS check_expression
+                 FROM pg_policies
+                WHERE schemaname='public'
+             ORDER BY tablename COLLATE \"C\", policyname COLLATE \"C\""""
+        ),
+        domain="catalog:public.rls-policies",
+    )
+
+
+CATALOG_QUERIES: tuple[tuple[str, str], ...] = (
+    (
+        "server",
+        """SELECT current_setting('server_version_num') AS server_version_num,
+                  current_setting('integer_datetimes') AS integer_datetimes""",
+    ),
+    (
+        "relations",
+        """SELECT relation.relname AS object_name,
+                  relation.relkind::text AS relation_kind,
+                  relation.relpersistence::text AS persistence,
+                  relation.relreplident::text AS replica_identity,
+                  relation.relrowsecurity AS row_security,
+                  relation.relforcerowsecurity AS force_row_security,
+                  relation.relispartition AS is_partition,
+                  COALESCE(pg_get_expr(relation.relpartbound, relation.oid, true), '')
+                    AS partition_bound,
+                  COALESCE(pg_get_partkeydef(relation.oid), '') AS partition_key,
+                  owner.rolname AS owner,
+                  COALESCE(tablespace.spcname, '') AS tablespace
+             FROM pg_class relation
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+             JOIN pg_roles owner ON owner.oid=relation.relowner
+        LEFT JOIN pg_tablespace tablespace ON tablespace.oid=relation.reltablespace
+            WHERE namespace.nspname='public'
+              AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+         ORDER BY relation.relkind::text COLLATE \"C\", relation.relname COLLATE \"C\"""",
+    ),
+    (
+        "columns",
+        """SELECT relation.relname AS relation_name,
+                  attribute.attnum AS ordinal,
+                  attribute.attname AS column_name,
+                  format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+                  attribute.attnotnull AS not_null,
+                  attribute.attidentity::text AS identity_kind,
+                  attribute.attgenerated::text AS generated_kind,
+                  attribute.attstorage::text AS storage_kind,
+                  attribute.attstattarget AS statistics_target,
+                  COALESCE(collation.collname, '') AS collation,
+                  COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid, true), '')
+                    AS default_expression
+             FROM pg_attribute attribute
+             JOIN pg_class relation ON relation.oid=attribute.attrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+        LEFT JOIN pg_attrdef default_value
+               ON default_value.adrelid=attribute.attrelid
+              AND default_value.adnum=attribute.attnum
+        LEFT JOIN pg_collation collation ON collation.oid=attribute.attcollation
+            WHERE namespace.nspname='public'
+              AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+         ORDER BY relation.relname COLLATE \"C\", attribute.attnum""",
+    ),
+    (
+        "constraints",
+        """SELECT relation.relname AS relation_name,
+                  constraint_object.conname AS constraint_name,
+                  constraint_object.contype::text AS constraint_kind,
+                  constraint_object.condeferrable AS deferrable,
+                  constraint_object.condeferred AS initially_deferred,
+                  constraint_object.convalidated AS validated,
+                  constraint_object.connoinherit AS no_inherit,
+                  pg_get_constraintdef(constraint_object.oid, true) AS definition
+             FROM pg_constraint constraint_object
+             JOIN pg_class relation ON relation.oid=constraint_object.conrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname='public'
+         ORDER BY relation.relname COLLATE \"C\",
+                  constraint_object.conname COLLATE \"C\"""",
+    ),
+    (
+        "indexes",
+        """SELECT table_relation.relname AS relation_name,
+                  index_relation.relname AS index_name,
+                  owner.rolname AS owner,
+                  access_method.amname AS access_method,
+                  index_state.indisunique AS is_unique,
+                  index_state.indisprimary AS is_primary,
+                  index_state.indisexclusion AS is_exclusion,
+                  index_state.indisclustered AS is_clustered,
+                  index_state.indisreplident AS is_replica_identity,
+                  index_state.indisvalid AS is_valid,
+                  index_state.indisready AS is_ready,
+                  index_state.indislive AS is_live,
+                  pg_get_indexdef(index_relation.oid) AS definition,
+                  COALESCE(pg_get_expr(index_state.indpred, index_state.indrelid, true), '')
+                    AS predicate
+             FROM pg_index index_state
+             JOIN pg_class index_relation ON index_relation.oid=index_state.indexrelid
+             JOIN pg_class table_relation ON table_relation.oid=index_state.indrelid
+             JOIN pg_namespace namespace ON namespace.oid=table_relation.relnamespace
+             JOIN pg_roles owner ON owner.oid=index_relation.relowner
+             JOIN pg_am access_method ON access_method.oid=index_relation.relam
+            WHERE namespace.nspname='public'
+         ORDER BY table_relation.relname COLLATE \"C\",
+                  index_relation.relname COLLATE \"C\"""",
+    ),
+    (
+        "sequences",
+        """SELECT sequence_relation.relname AS sequence_name,
+                  format_type(sequence_state.seqtypid, NULL) AS data_type,
+                  sequence_state.seqstart::text AS start_value,
+                  sequence_state.seqincrement::text AS increment_by,
+                  sequence_state.seqmax::text AS maximum_value,
+                  sequence_state.seqmin::text AS minimum_value,
+                  sequence_state.seqcache::text AS cache_size,
+                  sequence_state.seqcycle AS cycles,
+                  COALESCE(owner_relation.relname, '') AS owned_by_relation,
+                  COALESCE(owner_attribute.attname, '') AS owned_by_column
+             FROM pg_sequence sequence_state
+             JOIN pg_class sequence_relation ON sequence_relation.oid=sequence_state.seqrelid
+             JOIN pg_namespace namespace ON namespace.oid=sequence_relation.relnamespace
+        LEFT JOIN pg_depend dependency
+               ON dependency.classid='pg_class'::regclass
+              AND dependency.objid=sequence_relation.oid
+              AND dependency.objsubid=0
+              AND dependency.refclassid='pg_class'::regclass
+              AND dependency.deptype IN ('a', 'i')
+        LEFT JOIN pg_class owner_relation ON owner_relation.oid=dependency.refobjid
+        LEFT JOIN pg_attribute owner_attribute
+               ON owner_attribute.attrelid=dependency.refobjid
+              AND owner_attribute.attnum=dependency.refobjsubid
+            WHERE namespace.nspname='public'
+         ORDER BY sequence_relation.relname COLLATE \"C\"""",
+    ),
+    (
+        "sequence_state",
+        """SELECT sequencename AS sequence_name, last_value::text AS last_value
+             FROM pg_sequences
+            WHERE schemaname='public'
+         ORDER BY sequencename COLLATE \"C\"""",
+    ),
+    (
+        "views",
+        """SELECT relation.relname AS view_name,
+                  relation.relkind::text AS view_kind,
+                  relation.relispopulated AS populated,
+                  COALESCE(array_to_string(relation.reloptions, E'\\n'), '') AS options,
+                  pg_get_viewdef(relation.oid, false) AS definition
+             FROM pg_class relation
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname='public' AND relation.relkind IN ('v', 'm')
+         ORDER BY relation.relkind::text COLLATE \"C\", relation.relname COLLATE \"C\"""",
+    ),
+    (
+        "routines",
+        """SELECT routine.proname AS routine_name,
+                  pg_get_function_identity_arguments(routine.oid) AS identity_arguments,
+                  pg_get_function_result(routine.oid) AS result_type,
+                  routine.prokind::text AS routine_kind,
+                  language.lanname AS language,
+                  routine.provolatile::text AS volatility,
+                  routine.proparallel::text AS parallel_safety,
+                  routine.prosecdef AS security_definer,
+                  routine.proleakproof AS leakproof,
+                  routine.proisstrict AS strict,
+                  routine.proretset AS returns_set,
+                  routine.prosrc AS source,
+                  COALESCE(routine.probin, '') AS binary_path,
+                  COALESCE(pg_get_expr(routine.proargdefaults, 0, true), '')
+                    AS argument_defaults,
+                  COALESCE((SELECT string_agg(option, E'\\n' ORDER BY option COLLATE \"C\")
+                              FROM unnest(routine.proconfig) AS option), '') AS configuration,
+                  owner.rolname AS owner
+             FROM pg_proc routine
+             JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
+             JOIN pg_language language ON language.oid=routine.prolang
+             JOIN pg_roles owner ON owner.oid=routine.proowner
+            WHERE namespace.nspname='public'
+         ORDER BY routine.proname COLLATE \"C\",
+                  pg_get_function_identity_arguments(routine.oid) COLLATE \"C\"""",
+    ),
+)
+
+CATALOG_SECURITY_QUERIES: tuple[tuple[str, str], ...] = (
+    (
+        "triggers",
+        """SELECT relation.relname AS relation_name,
+                  trigger_object.tgname AS trigger_name,
+                  trigger_object.tgenabled::text AS enabled_mode,
+                  trigger_object.tgdeferrable AS deferrable,
+                  trigger_object.tginitdeferred AS initially_deferred,
+                  pg_get_triggerdef(trigger_object.oid, true) AS definition
+             FROM pg_trigger trigger_object
+             JOIN pg_class relation ON relation.oid=trigger_object.tgrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname='public' AND NOT trigger_object.tgisinternal
+         ORDER BY relation.relname COLLATE \"C\", trigger_object.tgname COLLATE \"C\"""",
+    ),
+    (
+        "rules",
+        """SELECT tablename, rulename, definition
+             FROM pg_rules
+            WHERE schemaname='public'
+         ORDER BY tablename COLLATE \"C\", rulename COLLATE \"C\"""",
+    ),
+    (
+        "types",
+        """SELECT type_object.typname AS type_name,
+                  type_object.typtype::text AS type_kind,
+                  type_object.typcategory::text AS category,
+                  type_object.typispreferred AS preferred,
+                  type_object.typnotnull AS not_null,
+                  format_type(type_object.typbasetype, type_object.typtypmod) AS base_type,
+                  COALESCE(format_type(type_object.typelem, NULL), '') AS element_type,
+                  COALESCE(collation.collname, '') AS collation,
+                  COALESCE(type_object.typdefault, '') AS default_value,
+                  owner.rolname AS owner
+             FROM pg_type type_object
+             JOIN pg_namespace namespace ON namespace.oid=type_object.typnamespace
+             JOIN pg_roles owner ON owner.oid=type_object.typowner
+        LEFT JOIN pg_collation collation ON collation.oid=type_object.typcollation
+            WHERE namespace.nspname='public'
+         ORDER BY type_object.typname COLLATE \"C\"""",
+    ),
+    (
+        "enum_labels",
+        """SELECT type_object.typname AS type_name,
+                  enum_value.enumsortorder::text AS sort_order,
+                  enum_value.enumlabel AS label
+             FROM pg_enum enum_value
+             JOIN pg_type type_object ON type_object.oid=enum_value.enumtypid
+             JOIN pg_namespace namespace ON namespace.oid=type_object.typnamespace
+            WHERE namespace.nspname='public'
+         ORDER BY type_object.typname COLLATE \"C\", enum_value.enumsortorder""",
+    ),
+    (
+        "extensions",
+        """SELECT extension.extname AS extension_name,
+                  extension.extversion AS version,
+                  extension.extrelocatable AS relocatable,
+                  namespace.nspname AS schema_name,
+                  owner.rolname AS owner
+             FROM pg_extension extension
+             JOIN pg_namespace namespace ON namespace.oid=extension.extnamespace
+             JOIN pg_roles owner ON owner.oid=extension.extowner
+         ORDER BY extension.extname COLLATE \"C\"""",
+    ),
+    (
+        "policies",
+        """SELECT policyname, tablename, permissive, roles::text AS roles,
+                  cmd, COALESCE(qual, '') AS using_expression,
+                  COALESCE(with_check, '') AS check_expression
+             FROM pg_policies
+            WHERE schemaname='public'
+         ORDER BY tablename COLLATE \"C\", policyname COLLATE \"C\"""",
+    ),
+    (
+        "ownership",
+        """SELECT object_kind, object_identity, owner
+             FROM (
+                   SELECT 'database' AS object_kind, '<database>' AS object_identity,
+                          owner.rolname AS owner
+                     FROM pg_database database_object
+                     JOIN pg_roles owner ON owner.oid=database_object.datdba
+                    WHERE database_object.datname=current_database()
+                   UNION ALL
+                   SELECT 'schema', namespace.nspname, owner.rolname
+                     FROM pg_namespace namespace
+                     JOIN pg_roles owner ON owner.oid=namespace.nspowner
+                    WHERE namespace.nspname='public'
+                   UNION ALL
+                   SELECT 'relation:' || relation.relkind::text, relation.relname, owner.rolname
+                     FROM pg_class relation
+                     JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                     JOIN pg_roles owner ON owner.oid=relation.relowner
+                    WHERE namespace.nspname='public'
+                   UNION ALL
+                   SELECT 'routine', routine.proname || '(' ||
+                          pg_get_function_identity_arguments(routine.oid) || ')', owner.rolname
+                     FROM pg_proc routine
+                     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
+                     JOIN pg_roles owner ON owner.oid=routine.proowner
+                    WHERE namespace.nspname='public'
+                   UNION ALL
+                   SELECT 'type', type_object.typname, owner.rolname
+                     FROM pg_type type_object
+                     JOIN pg_namespace namespace ON namespace.oid=type_object.typnamespace
+                     JOIN pg_roles owner ON owner.oid=type_object.typowner
+                    WHERE namespace.nspname='public'
+                   UNION ALL
+                   SELECT 'extension', extension.extname, owner.rolname
+                     FROM pg_extension extension
+                     JOIN pg_roles owner ON owner.oid=extension.extowner
+                  ) AS owned_objects
+         ORDER BY object_kind COLLATE \"C\", object_identity COLLATE \"C\"""",
+    ),
+    (
+        "object_privileges",
+        """WITH secured_objects AS (
+                  SELECT 'database' AS object_kind, '<database>' AS object_identity,
+                         database_object.datdba AS owner_oid,
+                         database_object.datacl AS acl, CAST('d' AS \"char\") AS default_kind
+                    FROM pg_database database_object
+                   WHERE database_object.datname=current_database()
+                  UNION ALL
+                  SELECT 'schema', namespace.nspname, namespace.nspowner,
+                         namespace.nspacl, CAST('n' AS \"char\")
+                    FROM pg_namespace namespace WHERE namespace.nspname='public'
+                  UNION ALL
+                  SELECT 'relation:' || relation.relkind::text, relation.relname,
+                         relation.relowner, relation.relacl,
+                         CASE WHEN relation.relkind='S' THEN CAST('S' AS \"char\")
+                              ELSE CAST('r' AS \"char\") END
+                    FROM pg_class relation
+                    JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                   WHERE namespace.nspname='public'
+                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                  UNION ALL
+                  SELECT 'routine', routine.proname || '(' ||
+                         pg_get_function_identity_arguments(routine.oid) || ')',
+                         routine.proowner, routine.proacl, CAST('f' AS \"char\")
+                    FROM pg_proc routine
+                    JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
+                   WHERE namespace.nspname='public'
+             )
+           SELECT secured_objects.object_kind, secured_objects.object_identity,
+                  grantor.rolname AS grantor,
+                  CASE WHEN privilege.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END AS grantee,
+                  privilege.privilege_type, privilege.is_grantable
+             FROM secured_objects
+       CROSS JOIN LATERAL aclexplode(
+                  COALESCE(secured_objects.acl,
+                           acldefault(secured_objects.default_kind, secured_objects.owner_oid))
+             ) AS privilege
+        LEFT JOIN pg_roles grantor ON grantor.oid=privilege.grantor
+        LEFT JOIN pg_roles grantee ON grantee.oid=privilege.grantee
+         ORDER BY secured_objects.object_kind COLLATE \"C\",
+                  secured_objects.object_identity COLLATE \"C\",
+                  grantee COLLATE \"C\", privilege.privilege_type COLLATE \"C\",
+                  grantor COLLATE \"C\"""",
+    ),
+    (
+        "default_privileges",
+        """SELECT owner, schema_name, object_kind, grantor, grantee,
+                  privilege_type, is_grantable
+             FROM (
+                   SELECT owner.rolname AS owner,
+                          COALESCE(namespace.nspname, '') AS schema_name,
+                          defaults.defaclobjtype::text AS object_kind,
+                          '<entry>' AS grantor, '<entry>' AS grantee,
+                          '<entry>' AS privilege_type, false AS is_grantable
+                     FROM pg_default_acl defaults
+                     JOIN pg_roles owner ON owner.oid=defaults.defaclrole
+                LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+                   UNION ALL
+                   SELECT owner.rolname, COALESCE(namespace.nspname, ''),
+                          defaults.defaclobjtype::text,
+                          grantor.rolname,
+                          CASE WHEN privilege.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END,
+                          privilege.privilege_type, privilege.is_grantable
+                     FROM pg_default_acl defaults
+                     JOIN pg_roles owner ON owner.oid=defaults.defaclrole
+                LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+               CROSS JOIN LATERAL aclexplode(
+                          COALESCE(defaults.defaclacl, '{}'::aclitem[])
+                     ) AS privilege
+                LEFT JOIN pg_roles grantor ON grantor.oid=privilege.grantor
+                LEFT JOIN pg_roles grantee ON grantee.oid=privilege.grantee
+                  ) AS normalized_defaults
+         ORDER BY owner COLLATE \"C\", schema_name COLLATE \"C\",
+                  object_kind COLLATE \"C\", grantor COLLATE \"C\",
+                  grantee COLLATE \"C\", privilege_type COLLATE \"C\",
+                  is_grantable""",
+    ),
+)
+
+
+def _sequence_runtime_state_inventory(store: SqlAlchemyStore) -> dict[str, int | str]:
+    names = [
+        str(row["sequence_name"])
+        for row in store.query(
+            """SELECT sequence.relname AS sequence_name
+                 FROM pg_class sequence
+                 JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace
+                WHERE namespace.nspname='public' AND sequence.relkind='S'
+             ORDER BY sequence.relname COLLATE \"C\""""
+        )
+    ]
+
+    def rows() -> Iterable[Mapping[str, object]]:
+        for name in names:
+            quoted = '"' + name.replace('"', '""') + '"'
+            state = tuple(
+                store.iterate(
+                    f"SELECT last_value::text AS last_value, is_called FROM public.{quoted}",
+                    batch_size=1,
+                )
+            )
+            if len(state) != 1:
+                raise DomainError(
+                    "RESTORE_SEQUENCE_STATE_INVALID",
+                    "a public sequence did not expose exactly one runtime state row",
+                    {"sequence": name},
+                )
+            yield {"sequence_name": name, **state[0]}
+
+    return _ordered_rows_digest(rows(), domain="catalog:sequence-runtime-state")
+
+
+def _catalog_inventory(store: SqlAlchemyStore) -> dict[str, object]:
+    sections: dict[str, dict[str, int | str]] = {}
+    for name, sql in (*CATALOG_QUERIES, *CATALOG_SECURITY_QUERIES):
+        sections[name] = _ordered_rows_digest(
+            store.iterate(sql, batch_size=128), domain=f"catalog:{name}"
+        )
+    sections["sequence_runtime_state"] = _sequence_runtime_state_inventory(store)
+    return {
+        "sha256": canonical_digest(sections),
+        "objects": sum(int(section["count"]) for section in sections.values()),
+        "sections": sections,
+    }
 
 
 class PostgreSqlRestoreDrill:
@@ -334,6 +781,8 @@ class PostgreSqlRestoreDrill:
         self.target_coordinate = target_coordinate
         self.application_target_url = application_target_url
         self.backup_target_url = backup_target_url
+        self.application_role: str | None = None
+        self.restore_role = target_user
         self.tenant_roles = tuple(tenant_roles)
         self.maintenance_role = maintenance_role
         self.backup_role = backup_role
@@ -418,6 +867,7 @@ class PostgreSqlRestoreDrill:
                     "RESTORE_ROLE_BINDING_INVALID",
                     "database URL users must match the migration, tenant, and backup role contract",
                 )
+            self.application_role = application_user
         if require_managed_coordinates and not all(
             _verify_full(value)
             for value in (
@@ -519,35 +969,63 @@ class PostgreSqlRestoreDrill:
         target = SqlAlchemyStore(self.target_url)
         try:
             existing = target.query(
-                "SELECT COUNT(*) AS count FROM pg_tables WHERE schemaname='public'"
+                """SELECT COUNT(*) AS count
+                     FROM (
+                           SELECT relation.oid
+                             FROM pg_class relation
+                             JOIN pg_namespace namespace
+                               ON namespace.oid=relation.relnamespace
+                            WHERE namespace.nspname='public'
+                              AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                           UNION ALL
+                           SELECT routine.oid
+                             FROM pg_proc routine
+                             JOIN pg_namespace namespace
+                               ON namespace.oid=routine.pronamespace
+                            WHERE namespace.nspname='public'
+                           UNION ALL
+                           SELECT type_object.oid
+                             FROM pg_type type_object
+                             JOIN pg_namespace namespace
+                               ON namespace.oid=type_object.typnamespace
+                            WHERE namespace.nspname='public'
+                         ) AS existing_objects"""
             )[0]
             if int(existing["count"]):
                 raise DomainError(
                     "RESTORE_TARGET_NOT_EMPTY",
-                    "restore target must be an empty disposable database",
+                    "restore target public schema must contain no pre-existing objects",
                 )
             source_inventory = _table_inventory(source)
             source_policies = _rls_inventory(source)
+            source_catalog = _catalog_inventory(source)
             source_role_valid = True
             if self.backup_role:
                 source_role = source.query(
                     """SELECT current_user AS role, roles.rolbypassrls AS bypass,
                               EXISTS (
-                                SELECT 1 FROM pg_tables
-                                WHERE schemaname='public' AND tableowner=current_user
+                                SELECT 1 FROM pg_class relation
+                                JOIN pg_namespace namespace
+                                  ON namespace.oid=relation.relnamespace
+                                WHERE namespace.nspname='public'
+                                  AND relation.relowner=roles.oid
                               ) AS owns_tables,
-                              (SELECT COUNT(*) FROM pg_tables
-                                WHERE schemaname='public'
-                                  AND has_table_privilege(current_user,
-                                      format('%I.%I', schemaname, tablename), 'INSERT'))
-                                AS writable_tables
+                              EXISTS (
+                                SELECT 1 FROM pg_proc routine
+                                JOIN pg_namespace namespace
+                                  ON namespace.oid=routine.pronamespace
+                                WHERE namespace.nspname='public'
+                                  AND routine.proowner=roles.oid
+                              ) AS owns_routines
                          FROM pg_roles roles WHERE roles.rolname=current_user"""
                 )[0]
+                source_matrix = role_access_matrix(source, self.backup_role)
                 source_role_valid = (
                     source_role["role"] == self.backup_role
                     and bool(source_role["bypass"])
                     and not bool(source_role["owns_tables"])
-                    and int(source_role["writable_tables"]) == 0
+                    and not bool(source_role["owns_routines"])
+                    and role_matrix_is_exact(source_matrix, read_write=False)
                 )
             with tempfile.TemporaryDirectory(prefix="shadow-restore-drill-") as directory:
                 directory_path = Path(directory)
@@ -596,6 +1074,7 @@ class PostgreSqlRestoreDrill:
 
             target_inventory = _table_inventory(target)
             target_policies = _rls_inventory(target)
+            target_catalog = _catalog_inventory(target)
             source_versions = tuple(
                 int(item["version"])
                 for item in source.query("SELECT version FROM schema_migrations ORDER BY version")
@@ -606,7 +1085,9 @@ class PostgreSqlRestoreDrill:
             )
             source_head = source_versions[-1] if source_versions else 0
             target_integrity = target.query(
-                "SELECT NOT pg_is_in_recovery() AS writable, current_database() AS database"
+                """SELECT NOT pg_is_in_recovery() AS writable,
+                          current_database() AS database,
+                          current_user AS role"""
             )[0]
             integrity = target.query(
                 """SELECT
@@ -635,9 +1116,19 @@ class PostgreSqlRestoreDrill:
                     source_policies == target_policies and int(target_policies["count"]) > 0,
                 ),
                 GateCheck(
+                    "catalog_equivalence",
+                    source_catalog == target_catalog,
+                    {
+                        "catalog_sections": len(CATALOG_QUERIES)
+                        + len(CATALOG_SECURITY_QUERIES)
+                        + 1
+                    },
+                ),
+                GateCheck(
                     "restored_database_online",
                     bool(target_integrity["writable"])
-                    and target_integrity["database"] == self.target_name,
+                    and target_integrity["database"] == self.target_name
+                    and target_integrity["role"] == self.restore_role,
                 ),
                 GateCheck(
                     "archive_size_bound",
@@ -654,13 +1145,27 @@ class PostgreSqlRestoreDrill:
                 application = SqlAlchemyStore(self.application_target_url)
                 try:
                     role = application.query(
-                        """SELECT roles.rolbypassrls AS bypass,
+                        """SELECT current_user AS role,
+                                  roles.rolbypassrls AS bypass,
                                   EXISTS (
-                                    SELECT 1 FROM pg_tables
-                                    WHERE schemaname='public' AND tableowner=current_user
-                                  ) AS owns_tables
+                                    SELECT 1 FROM pg_class relation
+                                    JOIN pg_namespace namespace
+                                      ON namespace.oid=relation.relnamespace
+                                    WHERE namespace.nspname='public'
+                                      AND relation.relowner=roles.oid
+                                  ) AS owns_tables,
+                                  EXISTS (
+                                    SELECT 1 FROM pg_proc routine
+                                    JOIN pg_namespace namespace
+                                      ON namespace.oid=routine.pronamespace
+                                    WHERE namespace.nspname='public'
+                                      AND routine.proowner=roles.oid
+                                  ) AS owns_routines
                              FROM pg_roles roles WHERE roles.rolname=current_user"""
                     )[0]
+                    application_matrix = role_access_matrix(
+                        application, str(self.application_role)
+                    )
                     workspaces = target.query(
                         """SELECT workspace_id, COUNT(*) AS count FROM domain_resources
                              GROUP BY workspace_id ORDER BY workspace_id LIMIT 1"""
@@ -678,7 +1183,13 @@ class PostgreSqlRestoreDrill:
                         (
                             GateCheck(
                                 "runtime_role_least_privilege",
-                                not bool(role["bypass"]) and not bool(role["owns_tables"]),
+                                role["role"] == self.application_role
+                                and not bool(role["bypass"])
+                                and not bool(role["owns_tables"])
+                                and not bool(role["owns_routines"])
+                                and role_matrix_is_exact(
+                                    application_matrix, read_write=True
+                                ),
                             ),
                             GateCheck(
                                 "restored_rls_unscoped_denial",
@@ -695,16 +1206,22 @@ class PostgreSqlRestoreDrill:
                     backup_state = backup.query(
                         """SELECT current_user AS role, roles.rolbypassrls AS bypass,
                                   EXISTS (
-                                    SELECT 1 FROM pg_tables
-                                    WHERE schemaname='public' AND tableowner=current_user
+                                    SELECT 1 FROM pg_class relation
+                                    JOIN pg_namespace namespace
+                                      ON namespace.oid=relation.relnamespace
+                                    WHERE namespace.nspname='public'
+                                      AND relation.relowner=roles.oid
                                   ) AS owns_tables,
-                                  (SELECT COUNT(*) FROM pg_tables
-                                    WHERE schemaname='public'
-                                      AND has_table_privilege(current_user,
-                                          format('%I.%I', schemaname, tablename), 'INSERT'))
-                                    AS writable_tables
+                                  EXISTS (
+                                    SELECT 1 FROM pg_proc routine
+                                    JOIN pg_namespace namespace
+                                      ON namespace.oid=routine.pronamespace
+                                    WHERE namespace.nspname='public'
+                                      AND routine.proowner=roles.oid
+                                  ) AS owns_routines
                              FROM pg_roles roles WHERE roles.rolname=current_user"""
                     )[0]
+                    backup_matrix = role_access_matrix(backup, str(self.backup_role))
                     backup_rows = int(
                         backup.query("SELECT COUNT(*) AS count FROM domain_resources")[0]["count"]
                     )
@@ -717,11 +1234,12 @@ class PostgreSqlRestoreDrill:
                                 "backup_role_identity",
                                 backup_state["role"] == self.backup_role
                                 and bool(backup_state["bypass"])
-                                and not bool(backup_state["owns_tables"]),
+                                and not bool(backup_state["owns_tables"])
+                                and not bool(backup_state["owns_routines"]),
                             ),
                             GateCheck(
                                 "backup_role_read_only",
-                                int(backup_state["writable_tables"]) == 0,
+                                role_matrix_is_exact(backup_matrix, read_write=False),
                             ),
                             GateCheck(
                                 "backup_role_complete_visibility",
@@ -752,6 +1270,7 @@ class PostgreSqlRestoreDrill:
                     ),
                     "backup_manifest_digest": receipt.manifest_digest,
                     "backup_receipt_digest": receipt.receipt_digest,
+                    "restored_catalog_digest": str(target_catalog["sha256"]),
                     "kms_key_id_digest": kms_key_digest,
                     "managed_provider": self.managed_provider or "not-required",
                     "managed_instance_digest": self.managed_instance_digest or "not-required",
@@ -762,6 +1281,7 @@ class PostgreSqlRestoreDrill:
                     "rows": sum(int(item["count"]) for item in target_inventory.values()),
                     "migration_head": source_head,
                     "rls_policies": int(target_policies["count"]),
+                    "catalog_objects": int(str(target_catalog["objects"])),
                     "archive_bytes": archive_bytes,
                     "backup_age_seconds": round(max(0.0, backup_age_seconds), 3),
                     "object_fetch_seconds": round(object_fetch_seconds, 3),

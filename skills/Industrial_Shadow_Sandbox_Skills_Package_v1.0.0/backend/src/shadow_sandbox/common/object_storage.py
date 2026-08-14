@@ -227,16 +227,36 @@ class S3ObjectStorage:
         kms_encryption_context: dict[str, str] | None = None,
         client: Any | None = None,
         require_https_endpoint: bool | None = None,
+        expected_bucket_owner: str | None = None,
+        production: bool | None = None,
+        allow_custom_endpoint: bool = False,
     ) -> None:
         if not bucket or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise DomainError("OBJECT_BUCKET_INVALID", "S3 bucket name is invalid", status=503)
         self.bucket = bucket
         self.region = region
-        production_endpoint = (
+        self.production = (
             os.environ.get("SHADOW_ENVIRONMENT", "").lower() == "production"
+            if production is None
+            else production
+        )
+        if type(self.production) is not bool or type(allow_custom_endpoint) is not bool:
+            raise DomainError(
+                "OBJECT_STORAGE_CONFIG_INVALID",
+                "object storage production controls must be booleans",
+                status=503,
+            )
+        production_endpoint = (
+            self.production
             if require_https_endpoint is None
             else require_https_endpoint
         )
+        if type(production_endpoint) is not bool:
+            raise DomainError(
+                "OBJECT_STORAGE_CONFIG_INVALID",
+                "object storage endpoint policy must be a boolean",
+                status=503,
+            )
         if endpoint_url:
             endpoint = urlsplit(endpoint_url)
             if (
@@ -245,6 +265,7 @@ class S3ObjectStorage:
                 or endpoint.password
                 or endpoint.query
                 or endpoint.fragment
+                or endpoint.path not in {"", "/"}
                 or (production_endpoint and endpoint.scheme != "https")
                 or endpoint.scheme not in {"http", "https"}
             ):
@@ -253,7 +274,57 @@ class S3ObjectStorage:
                     "object storage endpoint must be an approved HTTPS origin",
                     status=503,
                 )
+            if self.production and not allow_custom_endpoint:
+                raise DomainError(
+                    "OBJECT_STORAGE_CUSTOM_ENDPOINT_FORBIDDEN",
+                    "AWS production storage does not accept a custom S3 endpoint",
+                    status=503,
+                )
         self.endpoint_url = endpoint_url
+        if region is not None and not re.fullmatch(
+            r"[a-z]{2}(?:-[a-z0-9]+)+-\d", region
+        ):
+            raise DomainError(
+                "OBJECT_STORAGE_REGION_INVALID", "S3 region is invalid", status=503
+            )
+        if self.production and not region:
+            raise DomainError(
+                "OBJECT_STORAGE_REGION_INVALID",
+                "AWS production storage requires an exact region",
+                status=503,
+            )
+        resolved_owner = expected_bucket_owner
+        if resolved_owner is None and self.production:
+            resolved_owner = os.environ.get("SHADOW_AWS_ACCOUNT_ID")
+        kms_account_match = re.fullmatch(
+            r"arn:(?:aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:(\d{12}):key/[A-Za-z0-9-]+",
+            str(kms_key_id or ""),
+        )
+        if resolved_owner is None and self.production and kms_account_match:
+            resolved_owner = kms_account_match.group(1)
+        if resolved_owner is not None and not re.fullmatch(r"\d{12}", resolved_owner):
+            raise DomainError(
+                "OBJECT_STORAGE_BUCKET_OWNER_INVALID",
+                "S3 expected bucket owner must be an exact AWS account ID",
+                status=503,
+            )
+        if self.production and resolved_owner is None:
+            raise DomainError(
+                "OBJECT_STORAGE_BUCKET_OWNER_REQUIRED",
+                "AWS production storage requires an expected bucket owner",
+                status=503,
+            )
+        if (
+            self.production
+            and kms_account_match
+            and resolved_owner != kms_account_match.group(1)
+        ):
+            raise DomainError(
+                "OBJECT_STORAGE_ACCOUNT_BINDING_INVALID",
+                "S3 bucket owner and KMS key account must match",
+                status=503,
+            )
+        self.expected_bucket_owner = resolved_owner
         self.prefix = validate_object_key(prefix).rstrip("/")
         self.kms_key_id = kms_key_id
         self.kms_encryption_context = dict(kms_encryption_context or {})
@@ -270,6 +341,19 @@ class S3ObjectStorage:
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{validate_object_key(key)}"
+
+    def bucket_request(self, **arguments: Any) -> dict[str, Any]:
+        """Bind every S3 request to the configured bucket owner when available."""
+        if "Bucket" in arguments or "ExpectedBucketOwner" in arguments:
+            raise DomainError(
+                "OBJECT_STORAGE_REQUEST_INVALID",
+                "bucket request arguments cannot replace sealed coordinates",
+                status=503,
+            )
+        request: dict[str, Any] = {"Bucket": self.bucket, **arguments}
+        if self.expected_bucket_owner:
+            request["ExpectedBucketOwner"] = self.expected_bucket_owner
+        return request
 
     def _encryption(self) -> dict[str, Any]:
         if not self.kms_key_id:
@@ -304,15 +388,16 @@ class S3ObjectStorage:
         digest = hashlib.sha256(data).hexdigest()
         encryption = self._encryption()
         response = self.client.put_object(
-            Bucket=self.bucket,
-            Key=self._key(key),
-            Body=data,
-            ContentType=content_type,
-            Metadata={"sha256": digest},
+            **self.bucket_request(
+                Key=self._key(key),
+                Body=data,
+                ContentType=content_type,
+                Metadata={"sha256": digest},
+            ),
             **encryption,
         )
         version_id = response.get("VersionId")
-        head_arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": self._key(key)}
+        head_arguments = self.bucket_request(Key=self._key(key))
         if version_id:
             head_arguments["VersionId"] = version_id
         try:
@@ -354,16 +439,16 @@ class S3ObjectStorage:
             if size <= SINGLE_PUT_MAX_BYTES:
                 with source_path.open("rb") as handle:
                     response = self.client.put_object(
-                        Bucket=self.bucket,
-                        Key=full_key,
-                        Body=handle,
-                        ContentLength=size,
+                        **self.bucket_request(
+                            Key=full_key,
+                            Body=handle,
+                            ContentLength=size,
+                        ),
                         **extra,
                     )
             else:
                 initiated = self.client.create_multipart_upload(
-                    Bucket=self.bucket,
-                    Key=full_key,
+                    **self.bucket_request(Key=full_key),
                     **extra,
                 )
                 upload_id = str(initiated["UploadId"])
@@ -372,23 +457,25 @@ class S3ObjectStorage:
                     part_number = 1
                     while chunk := handle.read(MULTIPART_PART_BYTES):
                         uploaded = self.client.upload_part(
-                            Bucket=self.bucket,
-                            Key=full_key,
-                            UploadId=upload_id,
-                            PartNumber=part_number,
-                            Body=chunk,
+                            **self.bucket_request(
+                                Key=full_key,
+                                UploadId=upload_id,
+                                PartNumber=part_number,
+                                Body=chunk,
+                            ),
                         )
                         parts.append({"ETag": str(uploaded["ETag"]), "PartNumber": part_number})
                         part_number += 1
                 response = self.client.complete_multipart_upload(
-                    Bucket=self.bucket,
-                    Key=full_key,
-                    UploadId=upload_id,
-                    MultipartUpload={"Parts": parts},
+                    **self.bucket_request(
+                        Key=full_key,
+                        UploadId=upload_id,
+                        MultipartUpload={"Parts": parts},
+                    ),
                 )
                 upload_id = None
             version_id = response.get("VersionId")
-            head_arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": full_key}
+            head_arguments = self.bucket_request(Key=full_key)
             if version_id:
                 head_arguments["VersionId"] = version_id
             head = self.client.head_object(**head_arguments)
@@ -396,9 +483,7 @@ class S3ObjectStorage:
             if upload_id:
                 try:
                     self.client.abort_multipart_upload(
-                        Bucket=self.bucket,
-                        Key=full_key,
-                        UploadId=upload_id,
+                        **self.bucket_request(Key=full_key, UploadId=upload_id),
                     )
                 except Exception:  # noqa: BLE001,S110 - preserve the original upload failure
                     pass
@@ -452,7 +537,7 @@ class S3ObjectStorage:
         version_id: str | None = None,
         expected_sha256: str | None = None,
     ) -> bytes:
-        arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": self._key(key)}
+        arguments = self.bucket_request(Key=self._key(key))
         if version_id:
             arguments["VersionId"] = version_id
         try:
@@ -477,7 +562,9 @@ class S3ObjectStorage:
             raise DomainError("OBJECT_TOO_LARGE", "object exceeds the read limit", status=413)
         if version_id and response.get("VersionId") != version_id:
             raise DomainError(
-                "OBJECT_VERSION_INVALID", "object storage returned an unexpected version", status=503
+                "OBJECT_VERSION_INVALID",
+                "object storage returned an unexpected version",
+                status=503,
             )
         expected = response.get("Metadata", {}).get("sha256")
         actual = hashlib.sha256(data).hexdigest()
@@ -497,7 +584,7 @@ class S3ObjectStorage:
     ) -> ObjectRef:
         if maximum_bytes < 1:
             raise DomainError("OBJECT_TOO_LARGE", "object read limit must be positive", status=413)
-        arguments: dict[str, Any] = {"Bucket": self.bucket, "Key": self._key(key)}
+        arguments = self.bucket_request(Key=self._key(key))
         if version_id:
             arguments["VersionId"] = version_id
         try:
@@ -574,7 +661,7 @@ class S3ObjectStorage:
         )
 
     def delete(self, key: str) -> None:
-        self.client.delete_object(Bucket=self.bucket, Key=self._key(key))
+        self.client.delete_object(**self.bucket_request(Key=self._key(key)))
 
 
 def create_object_storage(
@@ -588,6 +675,9 @@ def create_object_storage(
     kms_key_id: str | None = None,
     kms_encryption_context: dict[str, str] | None = None,
     require_https_endpoint: bool | None = None,
+    expected_bucket_owner: str | None = None,
+    production: bool | None = None,
+    allow_custom_endpoint: bool = False,
 ) -> ObjectStorage:
     if backend == "local":
         return LocalObjectStorage(local_root)
@@ -600,6 +690,9 @@ def create_object_storage(
             kms_key_id=kms_key_id,
             kms_encryption_context=kms_encryption_context,
             require_https_endpoint=require_https_endpoint,
+            expected_bucket_owner=expected_bucket_owner,
+            production=production,
+            allow_custom_endpoint=allow_custom_endpoint,
         )
     raise DomainError(
         "OBJECT_STORAGE_CONFIG_INVALID", "object storage backend is invalid", status=503

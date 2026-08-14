@@ -48,6 +48,7 @@ metadata:
 data:
   SHADOW_COLLECTOR_IDENTITY: real_ot
   SHADOW_ENVIRONMENT_TYPE: real_readonly
+  SHADOW_AUTO_MIGRATE: "false"
   SHADOW_ENDPOINT_URI: opc.tcp://replace-with-approved-readonly-endpoint:4840
   SHADOW_APPLICATION_URI: urn:replace-with-approved-application
   SHADOW_CLIENT_APPLICATION_URI: urn:replace-with-approved-real-ot-collector
@@ -73,6 +74,7 @@ metadata:
 data:
   SHADOW_COLLECTOR_IDENTITY: simulator
   SHADOW_ENVIRONMENT_TYPE: simulator
+  SHADOW_AUTO_MIGRATE: "false"
   SHADOW_ENDPOINT_URI: opc.tcp://simulator:4840/shadow
   SHADOW_APPLICATION_URI: urn:industrial-shadow:simulator
   SHADOW_CLIENT_APPLICATION_URI: urn:replace-with-approved-simulator-collector

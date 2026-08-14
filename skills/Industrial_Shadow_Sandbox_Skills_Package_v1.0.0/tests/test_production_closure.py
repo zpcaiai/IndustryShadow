@@ -46,7 +46,10 @@ from shadow_sandbox.operations.production_deployment import (
     KubernetesProductionPublisher,
     ProductionDeploymentPlan,
 )
-from shadow_sandbox.operations.production_preflight import ProductionPreflight
+from shadow_sandbox.operations.production_preflight import (
+    ProductionPreflight,
+    validate_oidc_browser_journey_output_target,
+)
 from shadow_sandbox.operations.restore_drill import PostgreSqlRestoreDrill
 from shadow_sandbox.operations.storage_probe import S3KmsProbe
 from shadow_sandbox.operations.trust_store import SignerTrustStore
@@ -328,6 +331,30 @@ class FakeRoleStore:
             ]
         if "FROM pg_auth_members" in sql:
             return []
+        if ") AS owned" in sql:
+            return [{"count": 0}]
+        if "WITH requested(role_name)" in sql:
+            role = str(tuple(_parameters)[0])  # type: ignore[arg-type]
+            read_write = role != "shadow_backup"
+            return [
+                {
+                    "database_connect": True,
+                    "database_temp": False,
+                    "schema_usage": True,
+                    "schema_create": False,
+                    "table_count": 2,
+                    "table_select": 2,
+                    "table_insert": 2 if read_write else 0,
+                    "table_update": 2 if read_write else 0,
+                    "table_delete": 2 if read_write else 0,
+                    "table_elevated": 0,
+                    "sequence_count": 1,
+                    "sequence_usage": 1 if read_write else 0,
+                    "sequence_select": 1,
+                    "sequence_update": 0,
+                    "routine_execute": 0,
+                }
+            ]
         if "current_user" in sql:
             return [{"role": "shadow_migration"}]
         return [{"database": "shadow_production"}]
@@ -485,6 +512,43 @@ class ProductionClosureTests(unittest.TestCase):
         evidence = ProductionPreflight({}).run()
         self.assertEqual("FAILED", evidence.status)
         self.assertGreater(len(evidence.checks), 10)
+        self.assertFalse(
+            next(
+                check.passed
+                for check in evidence.checks
+                if check.name == "s3_control_plane_mutation_authorization"
+            )
+        )
+
+    def test_preflight_accepts_only_pristine_run_bound_oidc_journey_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_directory = root / "web" / "test-results"
+            target_directory.mkdir(parents=True, mode=0o700)
+            target_directory.chmod(0o700)
+            run_id = "unit-test-run-0001"
+            target = f"web/test-results/production-oidc-journey-{run_id}.json"
+            self.assertTrue(
+                validate_oidc_browser_journey_output_target(root, target, run_id)
+            )
+            target_directory.chmod(0o755)
+            self.assertFalse(
+                validate_oidc_browser_journey_output_target(root, target, run_id)
+            )
+            target_directory.chmod(0o700)
+            self.assertFalse(
+                validate_oidc_browser_journey_output_target(
+                    root,
+                    "web/test-results/production-oidc-journey.json",
+                    run_id,
+                )
+            )
+            (root / target).write_text("{}\n", encoding="utf-8")
+            self.assertFalse(
+                validate_oidc_browser_journey_output_target(root, target, run_id)
+            )
 
     def test_s3_kms_probe_validates_controls_round_trip_and_locked_retention(
         self,
@@ -568,6 +632,16 @@ class ProductionClosureTests(unittest.TestCase):
                 )
             return 404, {}
 
+        browser_binding = {
+            "acceptance_run_id": "unit-test-run-0001",
+            "release_digest": "a" * 64,
+            "candidate_image_digest": "b" * 64,
+            "web_candidate_image_digest": "c" * 64,
+            "build_digest": "d" * 64,
+            "simulator_build_digest": "e" * 64,
+            "environment_digest": "f" * 64,
+            "deployment_plan_digest": "1" * 64,
+        }
         probe = OidcLiveProbe(
             issuer,
             "industrial-shadow",
@@ -578,9 +652,36 @@ class ProductionClosureTests(unittest.TestCase):
             token_url=issuer + "/token",
             end_session_url=issuer + "/logout",
             service_client_ids=("test-evaluator-client",),
+            browser_binding=browser_binding,
             http_get=http_get,
             validator=FakeOidcValidator(),  # type: ignore[arg-type]
         )
+        journey = {
+            "schema_version": 2,
+            **browser_binding,
+            "started_at": utc_now(),
+            "completed_at": utc_now(),
+            "web_origin": "https://shadow.example.invalid",
+            "issuer": issuer,
+            "client_id_digest": hashlib.sha256(b"test-client").hexdigest(),
+            "personas": [
+                "viewer",
+                "engineer",
+                "approver",
+                "pack_author",
+                "admin",
+                "auditor",
+            ],
+            "checks": {
+                "authorization_code": True,
+                "pkce_s256": True,
+                "token_exchange": True,
+                "id_token_verified": True,
+                "access_token_api": True,
+                "logout": True,
+                "no_cross_origin_redirect": True,
+            },
+        }
         result = probe.run(
             {
                 "viewer": "viewer-value",
@@ -591,33 +692,54 @@ class ProductionClosureTests(unittest.TestCase):
                 "auditor": "auditor-value",
                 "evaluator_service": "evaluator-value",
             },
-            browser_journey={
-                "schema_version": 1,
-                "started_at": utc_now(),
-                "completed_at": utc_now(),
-                "web_origin": "https://shadow.example.invalid",
-                "issuer": issuer,
-                "client_id_digest": hashlib.sha256(b"test-client").hexdigest(),
-                "personas": [
-                    "viewer",
-                    "engineer",
-                    "approver",
-                    "pack_author",
-                    "admin",
-                    "auditor",
-                ],
-                "checks": {
-                    "authorization_code": True,
-                    "pkce_s256": True,
-                    "token_exchange": True,
-                    "id_token_verified": True,
-                    "access_token_api": True,
-                    "logout": True,
-                    "no_cross_origin_redirect": True,
-                },
-            },
+            browser_journey=journey,
         )
         self.assertEqual("PASSED", result.status)
+        result_checks = {check.name: check.passed for check in result.checks}
+        self.assertTrue(result_checks["browser_journey_run_binding"])
+        self.assertTrue(result_checks["browser_journey_freshness"])
+
+        wrong_run = {**journey, "acceptance_run_id": "unit-test-run-9999"}
+        wrong_run_checks = probe._browser_checks(  # noqa: SLF001
+            wrong_run,
+            gate_started_at=utc_now(),
+        )
+        self.assertFalse(
+            {check.name: check.passed for check in wrong_run_checks}[
+                "browser_journey_run_binding"
+            ]
+        )
+
+        now = dt.datetime.now(dt.UTC)
+        stale = {
+            **journey,
+            "started_at": (now - dt.timedelta(minutes=12)).isoformat(),
+            "completed_at": (now - dt.timedelta(minutes=11)).isoformat(),
+        }
+        stale_checks = probe._browser_checks(  # noqa: SLF001
+            stale,
+            gate_started_at=now.isoformat(),
+        )
+        self.assertFalse(
+            {check.name: check.passed for check in stale_checks}[
+                "browser_journey_freshness"
+            ]
+        )
+
+        future = {
+            **journey,
+            "started_at": now.isoformat(),
+            "completed_at": (now + dt.timedelta(seconds=1)).isoformat(),
+        }
+        future_checks = probe._browser_checks(  # noqa: SLF001
+            future,
+            gate_started_at=now.isoformat(),
+        )
+        self.assertFalse(
+            {check.name: check.passed for check in future_checks}[
+                "browser_journey_freshness"
+            ]
+        )
 
     def test_external_ca_probe_requires_valid_rotation_overlap_and_crl(self) -> None:
         now = dt.datetime.now(dt.UTC)
@@ -781,7 +903,45 @@ class ProductionClosureTests(unittest.TestCase):
         self.assertTrue(
             any("ALTER DEFAULT PRIVILEGES" in sql for sql in store.statements)
         )
+        self.assertTrue(result["existing_privileges_reset"])
+        self.assertTrue(result["role_matrix_verified"])
+        self.assertTrue(
+            any(
+                'REVOKE ALL PRIVILEGES ON DATABASE "shadow_production" FROM "shadow_api"'
+                in sql
+                for sql in store.statements
+            )
+        )
+        self.assertTrue(
+            any(
+                "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC" in sql
+                for sql in store.statements
+            )
+        )
+        self.assertTrue(
+            any(
+                'GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "shadow_backup"'
+                in sql
+                for sql in store.statements
+            )
+        )
         self.assertFalse(any("CREATE ROLE" in sql for sql in store.statements))
+
+        class OwnedRoleStore(FakeRoleStore):
+            def query(
+                self, sql: str, parameters: object = ()
+            ) -> list[dict[str, object]]:
+                if ") AS owned" in sql:
+                    return [{"count": 1}]
+                return super().query(sql, parameters)
+
+        with self.assertRaises(DomainError):
+            DatabaseRoleConfigurator(
+                OwnedRoleStore(),  # type: ignore[arg-type]
+                tenant_roles=("shadow_api", "shadow_action", "shadow_collector"),
+                maintenance_role="shadow_worker",
+                backup_role="shadow_backup",
+            ).configure()
         with self.assertRaises(DomainError):
             KubernetesDrill(
                 "industrial-shadow",
@@ -1282,11 +1442,9 @@ class ProductionClosureTests(unittest.TestCase):
                         ("configMapRef", "shadow-release-coordinates"),
                     ],
                     "real-ot-collector": [
-                        ("configMapRef", "shadow-runtime"),
                         ("configMapRef", "shadow-real-ot-collector-binding"),
                     ],
                     "simulator-collector": [
-                        ("configMapRef", "shadow-runtime"),
                         ("configMapRef", "shadow-simulator-collector-binding"),
                     ],
                     "web": [],
@@ -1479,13 +1637,33 @@ class ProductionClosureTests(unittest.TestCase):
                 "real-ot-collector-read-only-egress",
                 "simulator-collector-read-only-egress",
                 "data-jobs-egress",
+                "storage-identity-probe-egress",
             )
-            policies = "---\n".join(
-                "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
-                f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
-                "spec: {podSelector: {}, policyTypes: [Ingress, Egress]}\n"
-                for name in policy_names
-            )
+
+            def policy_manifest(name: str) -> str:
+                if name == "storage-identity-probe-egress":
+                    return (
+                        "apiVersion: networking.k8s.io/v1\n"
+                        "kind: NetworkPolicy\n"
+                        "metadata: {name: storage-identity-probe-egress, "
+                        "namespace: industrial-shadow}\n"
+                        "spec:\n"
+                        "  podSelector: {matchLabels: {app.kubernetes.io/name: "
+                        "industrial-shadow-storage-probe}}\n"
+                        "  policyTypes: [Egress]\n"
+                        "  egress:\n"
+                        "    - to:\n"
+                        "        - {ipBlock: {cidr: 10.0.0.30/32}}\n"
+                        "        - {ipBlock: {cidr: 10.0.0.31/32}}\n"
+                        "      ports: [{protocol: TCP, port: 443}]\n"
+                    )
+                return (
+                    "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
+                    f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
+                    "spec: {podSelector: {}, policyTypes: [Ingress, Egress]}\n"
+                )
+
+            policies = "---\n".join(policy_manifest(name) for name in policy_names)
 
             runtime_workloads = "---\n".join(
                 workload_manifest(
@@ -1503,10 +1681,14 @@ class ProductionClosureTests(unittest.TestCase):
                 "data: {phase: bootstrap}\n---\n"
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: shadow-runtime, namespace: industrial-shadow}\n"
-                "data: {SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots, SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups}\n---\n"
+                "data: {SHADOW_AUTO_MIGRATE: 'false', SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots, SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups}\n---\n"
+                "apiVersion: v1\nkind: ConfigMap\n"
+                "metadata: {name: shadow-release-coordinates, namespace: industrial-shadow}\n"
+                f"data: {{SHADOW_BUILD_DIGEST: {'a' * 64}, SHADOW_SIMULATOR_BUILD_DIGEST: {'b' * 64}, SHADOW_SIMULATOR_DIGEST: {'c' * 64}}}\n---\n"
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: shadow-real-ot-collector-binding, namespace: industrial-shadow}\n"
                 "data:\n"
+                "  SHADOW_AUTO_MIGRATE: 'false'\n"
                 "  SHADOW_ENDPOINT_URI: opc.tcp://ot.test.internal:4840\n"
                 "  SHADOW_APPLICATION_URI: urn:industrial-shadow:test-server\n"
                 "  SHADOW_CLIENT_APPLICATION_URI: urn:industrial-shadow:test-client\n"
@@ -1514,9 +1696,15 @@ class ProductionClosureTests(unittest.TestCase):
                 f"  SHADOW_CERTIFICATE_FINGERPRINT: {'f' * 64}\n"
                 f"  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: {'1' * 64}\n"
                 f"  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: {'3' * 64}\n"
-                "  SHADOW_NODE_ALLOWLIST: '[{\"node_id\":\"ns=2;s=temperature\",\"signal_key\":\"temperature\",\"sample_period_ms\":500}]'\n"
+                '  SHADOW_NODE_ALLOWLIST: \'[{"node_id":"ns=2;s=temperature","signal_key":"temperature","sample_period_ms":500}]\'\n'
                 "  SHADOW_MAXIMUM_NODES: '500'\n"
                 "  SHADOW_OPCUA_SECURITY_PROFILE: Basic256Sha256,SignAndEncrypt\n---\n"
+                "apiVersion: v1\nkind: ConfigMap\n"
+                "metadata: {name: shadow-simulator-collector-binding, namespace: industrial-shadow}\n"
+                "data: {SHADOW_AUTO_MIGRATE: 'false'}\n---\n"
+                "apiVersion: v1\nkind: ConfigMap\n"
+                "metadata: {name: shadow-database-roles, namespace: industrial-shadow}\n"
+                "data: {SHADOW_DATABASE_TENANT_ROLES: 'shadow_api,shadow_action,shadow_collector', SHADOW_DATABASE_MAINTENANCE_ROLE: shadow_worker, SHADOW_DATABASE_BACKUP_ROLE: shadow_backup}\n---\n"
                 + service_accounts
                 + "---\n"
                 + policies
@@ -1620,24 +1808,21 @@ class ProductionClosureTests(unittest.TestCase):
                 plan.backup_object_storage_prefix,
             )
 
-            def assert_invalid_runtime_secret_binding(
-                label: str, manifest: str
-            ) -> None:
-                invalid_manifest = root / f"{label}-runtime.yaml"
-                invalid_manifest.write_text(manifest, encoding="utf-8")
+            def assert_invalid_manifest_bindings(label: str, **manifests: str) -> None:
                 invalid_plan = json.loads(json.dumps(plan_value))
-                invalid_plan["runtime_manifest"] = {
-                    "path": str(invalid_manifest.relative_to(ROOT)),
-                    "sha256": hashlib.sha256(
-                        invalid_manifest.read_bytes()
-                    ).hexdigest(),
-                }
+                for artifact_name, manifest in manifests.items():
+                    invalid_manifest = root / f"{label}-{artifact_name}.yaml"
+                    invalid_manifest.write_text(manifest, encoding="utf-8")
+                    invalid_plan[f"{artifact_name}_manifest"] = {
+                        "path": str(invalid_manifest.relative_to(ROOT)),
+                        "sha256": hashlib.sha256(
+                            invalid_manifest.read_bytes()
+                        ).hexdigest(),
+                    }
                 invalid_plan["digest"] = ""
                 invalid_plan["digest"] = canonical_digest(invalid_plan)
                 invalid_plan_path = root / f"{label}-deployment-plan.json"
-                invalid_plan_path.write_text(
-                    json.dumps(invalid_plan), encoding="utf-8"
-                )
+                invalid_plan_path.write_text(json.dumps(invalid_plan), encoding="utf-8")
                 with self.assertRaises(DomainError):
                     ProductionDeploymentPlan.load(
                         ROOT,
@@ -1646,17 +1831,17 @@ class ProductionClosureTests(unittest.TestCase):
                         expected_digest=str(invalid_plan["digest"]),
                     )
 
-            assert_invalid_runtime_secret_binding(
+            assert_invalid_manifest_bindings(
                 "wrong-secret-reference",
-                runtime.replace(
+                runtime=runtime.replace(
                     "name: shadow-api-secrets",
                     "name: shadow-worker-secrets",
                     1,
                 ),
             )
-            assert_invalid_runtime_secret_binding(
+            assert_invalid_manifest_bindings(
                 "extra-secret-reference",
-                runtime.replace(
+                runtime=runtime.replace(
                     "          securityContext:\n",
                     "            - name: SHADOW_UNSEALED_OVERRIDE\n"
                     "              valueFrom:\n"
@@ -1666,6 +1851,104 @@ class ProductionClosureTests(unittest.TestCase):
                     "          securityContext:\n",
                     1,
                 ),
+            )
+            assert_invalid_manifest_bindings(
+                "rollback-storage-prefix-drift",
+                rollback=rollback.replace(
+                    "industrial-shadow/production/snapshots",
+                    "industrial-shadow/production/snapshots-drift",
+                    1,
+                ),
+            )
+            nested_bootstrap = bootstrap.replace(
+                "industrial-shadow/production/backups",
+                "industrial-shadow/production/snapshots/archive",
+                1,
+            )
+            nested_rollback = rollback.replace(
+                "industrial-shadow/production/backups",
+                "industrial-shadow/production/snapshots/archive",
+                1,
+            )
+            assert_invalid_manifest_bindings(
+                "nested-storage-prefixes",
+                bootstrap=nested_bootstrap,
+                rollback=nested_rollback,
+            )
+            duplicate_role_bootstrap = bootstrap.replace(
+                "role/shadow-backup", "role/shadow-snapshot", 1
+            )
+            duplicate_role_rollback = rollback.replace(
+                "role/shadow-backup", "role/shadow-snapshot", 1
+            )
+            assert_invalid_manifest_bindings(
+                "shared-storage-role",
+                bootstrap=duplicate_role_bootstrap,
+                rollback=duplicate_role_rollback,
+            )
+            assert_invalid_manifest_bindings(
+                "rollback-ot-endpoint-drift",
+                rollback=rollback.replace(
+                    "opc.tcp://ot.test.internal:4840",
+                    "opc.tcp://ot-drift.test.internal:4840",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "rollback-ot-allowlist-drift",
+                rollback=rollback.replace("ns=2;s=temperature", "ns=2;s=pressure", 1),
+            )
+            assert_invalid_manifest_bindings(
+                "rollback-ot-fingerprint-drift",
+                rollback=rollback.replace("1" * 64, "4" * 64, 1),
+            )
+            assert_invalid_manifest_bindings(
+                "invalid-four-segment-ot-profile",
+                bootstrap=bootstrap.replace(
+                    "Basic256Sha256,SignAndEncrypt",
+                    "Basic256Sha256,SignAndEncrypt,/pki/client.crt,/pki/client.key",
+                    1,
+                ),
+            )
+            overlapping_bootstrap = bootstrap.replace(
+                "data: {SHADOW_BUILD_DIGEST:",
+                "data: {SHADOW_AUTO_MIGRATE: 'false', SHADOW_BUILD_DIGEST:",
+                1,
+            )
+            overlapping_rollback = rollback.replace(
+                "data: {SHADOW_BUILD_DIGEST:",
+                "data: {SHADOW_AUTO_MIGRATE: 'false', SHADOW_BUILD_DIGEST:",
+                1,
+            )
+            assert_invalid_manifest_bindings(
+                "overlapping-config-map-keys",
+                bootstrap=overlapping_bootstrap,
+                rollback=overlapping_rollback,
+            )
+            assert_invalid_manifest_bindings(
+                "rollback-config-map-key-set-drift",
+                rollback=rollback.replace(
+                    "data: {SHADOW_BUILD_DIGEST:",
+                    "data: {SHADOW_UNSEALED_COORDINATE: forbidden, SHADOW_BUILD_DIGEST:",
+                    1,
+                ),
+            )
+            acceptance_prefix_bootstrap = bootstrap.replace(
+                "data: {SHADOW_AUTO_MIGRATE: 'false',",
+                "data: {SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/acceptance, "
+                "SHADOW_AUTO_MIGRATE: 'false',",
+                1,
+            )
+            acceptance_prefix_rollback = rollback.replace(
+                "data: {SHADOW_AUTO_MIGRATE: 'false',",
+                "data: {SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/acceptance, "
+                "SHADOW_AUTO_MIGRATE: 'false',",
+                1,
+            )
+            assert_invalid_manifest_bindings(
+                "acceptance-prefix-in-runtime-config",
+                bootstrap=acceptance_prefix_bootstrap,
+                rollback=acceptance_prefix_rollback,
             )
             unsafe_manifest = root / "unsafe-bootstrap.yaml"
             unsafe_manifest.write_text(

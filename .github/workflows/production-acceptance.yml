@@ -1,3 +1,5 @@
+# Generated root entrypoint; edit the package template and sync deliberately.
+# Template: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.github/workflows/production-acceptance.yml
 name: production-acceptance
 
 on:
@@ -18,6 +20,10 @@ permissions:
 concurrency:
   group: industrial-shadow-production-acceptance
   cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0
 
 jobs:
   target-gates:
@@ -135,6 +141,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+        working-directory: ${{ github.workspace }}
         run: |
           [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_record="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt] | @tsv')"
@@ -161,6 +168,7 @@ jobs:
           RELEASE_RUN_ATTEMPT: ${{ steps.release-run.outputs.run_attempt }}
           SOURCE_REVISION: ${{ steps.release-run.outputs.source_revision }}
           CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-release-candidate/release-candidate.json
+        working-directory: ${{ github.workspace }}
         run: |
           run_attempt="$RELEASE_RUN_ATTEMPT"
           source_revision="$SOURCE_REVISION"
@@ -217,7 +225,7 @@ jobs:
           test ! -L "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE"
           install -m 0444 "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE" "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY"
       - name: Install locked browser-journey dependencies
-        working-directory: web
+        working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/web
         run: npm ci --ignore-scripts
       - name: Prepare pristine run-bound OIDC browser journey target
         run: |
@@ -290,7 +298,7 @@ jobs:
       - name: Execute bundled local diagnostic benchmark
         run: python tools/production_gate.py benchmark_local --output docs/evidence/batch-24/production/benchmark_local.json --summary docs/evidence/batch-24/production/benchmark-local-summary.json
       - name: Execute six-persona production OIDC PKCE and logout journey
-        working-directory: web
+        working-directory: skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/web
         env:
           SHADOW_E2E_PRODUCTION_URL: ${{ vars.SHADOW_PRODUCTION_WEB_URL }}
           SHADOW_E2E_EXECUTABLE: ${{ vars.SHADOW_E2E_EXECUTABLE }}
@@ -355,7 +363,7 @@ jobs:
         with:
           name: production-acceptance-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            docs/evidence/batch-24/production
-            docs/evidence/batch-24/production-deployment
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production
+            skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/docs/evidence/batch-24/production-deployment
           if-no-files-found: error
           retention-days: 30
