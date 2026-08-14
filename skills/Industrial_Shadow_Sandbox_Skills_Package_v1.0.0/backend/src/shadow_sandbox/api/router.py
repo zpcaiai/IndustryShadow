@@ -7,6 +7,7 @@ from typing import Any
 
 from shadow_sandbox.application import ApplicationService
 from shadow_sandbox.common import ActorContext, DomainError
+from shadow_sandbox.security import authorize
 
 API_ROUTE_CONTRACT: tuple[tuple[str, str], ...] = (
     ("GET", "/api/v1/health/live"),
@@ -15,6 +16,7 @@ API_ROUTE_CONTRACT: tuple[tuple[str, str], ...] = (
     ("GET", "/api/v1/auth/config"),
     ("GET", "/api/v1/me"),
     ("GET", "/api/v1/permissions"),
+    ("GET", "/api/v1/authorization-probe/{capability}"),
     ("POST", "/api/v1/asset-models"),
     ("GET", "/api/v1/asset-models/{model_id}"),
     ("PATCH", "/api/v1/asset-models/{model_id}"),
@@ -196,6 +198,48 @@ def create_api_router(
 
     register("GET", "/me", me, tags=["identity"])
     register("GET", "/permissions", me, tags=["identity"])
+
+    authorization_probe_permissions = {
+        "viewer": "run:view",
+        "engineer": "run:create",
+        "approver": "approval:decide",
+        "pack-author": "pack:edit",
+        "admin": "admin:manage",
+        "auditor": "audit:view",
+        "evaluator-service": "evaluation:execute",
+    }
+
+    def authorization_probe(
+        capability: str,
+        x_actor_id: str = Header(default="dev-viewer"),
+        x_tenant_id: str = Header(default="dev-tenant"),
+        x_workspace_id: str = Header(default="dev-workspace"),
+        x_roles: str = Header(default="Viewer"),
+        x_service_identity: str = Header(default="false"),
+    ) -> dict[str, object]:
+        permission = authorization_probe_permissions.get(capability)
+        if permission is None:
+            raise DomainError("AUTHORIZATION_PROBE_UNKNOWN", "unknown capability", status=404)
+        actor = context(
+            x_actor_id,
+            x_tenant_id,
+            x_workspace_id,
+            x_roles,
+            x_service_identity,
+        )
+        authorize(actor, permission)
+        return {
+            "authorized": True,
+            "capability": capability,
+            "service_identity": actor.service,
+        }
+
+    register(
+        "GET",
+        "/authorization-probe/{capability}",
+        authorization_probe,
+        tags=["identity"],
+    )
 
     # Asset models
     def create_asset(

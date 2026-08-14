@@ -22,10 +22,13 @@ spec:
               args: ["python", "-m", "shadow_sandbox.operations.backup_job"]
               envFrom:
                 - configMapRef: {name: shadow-runtime}
-                - secretRef: {name: shadow-backup-secrets}
+              env:
+                - name: SHADOW_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: {name: shadow-backup-secrets, key: SHADOW_DATABASE_URL}
               securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
               volumeMounts: [{name: tmp, mountPath: /tmp}]
               resources:
-                requests: {cpu: 100m, memory: 256Mi}
-                limits: {cpu: "1", memory: 1Gi}
-          volumes: [{name: tmp, emptyDir: {sizeLimit: 20Gi}}]
+                requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 110Gi}
+                limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 120Gi}
+          volumes: [{name: tmp, emptyDir: {sizeLimit: 120Gi}}]

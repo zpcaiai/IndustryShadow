@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import math
-import os
 import platform
 import time
 from collections.abc import Mapping, Sequence
@@ -11,11 +9,29 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from shadow_sandbox.common.models import DomainError, utc_now
 
 from .evidence import GateCheck, GateEvidence, complete
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Never replay production probe credentials to a redirected origin."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+
+
+_NO_REDIRECT_OPENER = build_opener(_RejectRedirects())
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,11 +87,14 @@ class HttpLoadProbe:
         ):
             raise DomainError("LOAD_PROFILE_INVALID", "load warmup or abort policy is invalid")
         target_url = urlsplit(target.path)
+        method = target.method.upper()
         if (
             not target.path.startswith("/")
             or target_url.scheme
             or target_url.netloc
-            or target.method.upper() not in {"GET", "POST"}
+            or target_url.fragment
+            or method not in {"GET", "HEAD"}
+            or target.body is not None
             or not 100 <= target.expected_status <= 599
             or p95_limit_ms <= 0
             or not 0 <= maximum_error_rate <= 1
@@ -92,23 +111,28 @@ class HttpLoadProbe:
         self.warmup_requests = warmup_requests
         self.maximum_consecutive_errors = maximum_consecutive_errors
         self.minimum_achieved_rate_ratio = minimum_achieved_rate_ratio
-        self.run_nonce = os.urandom(12).hex()
 
     def _request(self, sequence: int) -> tuple[float, bool]:
+        del sequence
         url = urljoin(self.base_url + "/", self.target.path.lstrip("/"))
         headers = {"Accept": "application/json", "X-Load-Probe": "industrial-shadow"}
         if self.bearer_value:
             headers["Authorization"] = "Bearer " + self.bearer_value
-        data = None
-        if self.target.body is not None:
-            data = json.dumps(self.target.body, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-            headers["Idempotency-Key"] = f"load-probe-{self.run_nonce}-{sequence}"
-        request = Request(url, data=data, headers=headers, method=self.target.method.upper())
+        request = Request(url, data=None, headers=headers, method=self.target.method.upper())
         started = time.perf_counter()
         status = 0
         try:
-            with urlopen(request, timeout=30) as response:
+            with _NO_REDIRECT_OPENER.open(request, timeout=30) as response:
+                final_url = urlsplit(response.geturl())
+                expected_origin = urlsplit(self.base_url)
+                if (
+                    final_url.scheme != expected_origin.scheme
+                    or final_url.netloc != expected_origin.netloc
+                ):
+                    raise DomainError(
+                        "LOAD_TARGET_REDIRECTED",
+                        "production load requests must not leave the approved origin",
+                    )
                 status = int(response.status)
                 response.read(65_537)
         except HTTPError as error:
@@ -157,8 +181,7 @@ class HttpLoadProbe:
                 completed = len(latencies)
                 observed_error_rate = (completed - successes) / max(completed, 1)
                 if consecutive_errors >= self.maximum_consecutive_errors or (
-                    completed >= 50
-                    and observed_error_rate > max(0.10, self.maximum_error_rate * 5)
+                    completed >= 50 and observed_error_rate > max(0.10, self.maximum_error_rate * 5)
                 ):
                     aborted = True
             for future in pending:
@@ -230,7 +253,7 @@ def run_http_load_suite(
 
     def healthy() -> bool:
         try:
-            with urlopen(
+            with _NO_REDIRECT_OPENER.open(
                 Request(urljoin(base_url.rstrip("/") + "/", health_path.lstrip("/"))),
                 timeout=15,
             ) as response:
@@ -259,9 +282,7 @@ def run_http_load_suite(
                     p95_limit_ms=float(profile["p95_limit_ms"]),
                     maximum_error_rate=float(profile["maximum_error_rate"]),
                     warmup_requests=int(profile.get("warmup_requests", 5)),
-                    maximum_consecutive_errors=int(
-                        profile.get("maximum_consecutive_errors", 20)
-                    ),
+                    maximum_consecutive_errors=int(profile.get("maximum_consecutive_errors", 20)),
                     minimum_achieved_rate_ratio=float(
                         profile.get("minimum_achieved_rate_ratio", 0.95)
                     ),

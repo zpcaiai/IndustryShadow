@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:industrial-shadow:external-assurance:v1",
-  "$comment": "Deprecated local contract. Production acceptance accepts external-assurance-report-v2 only.",
+  "$comment": "Deprecated local contract. Production acceptance accepts external-assurance-report-v3 only.",
   "type": "object",
   "additionalProperties": false,
   "required": ["gate", "assessment_id", "assessor", "started_at", "completed_at", "checks", "artifacts", "limitations", "public_key_b64", "report_digest", "signature_b64"],

@@ -17,6 +17,7 @@ from .evidence import GateCheck, GateEvidence, complete
 
 IMAGE_DIGEST = re.compile(r"^[^@\s]+@sha256:[a-f0-9]{64}$")
 SCOUT_VERSION = re.compile(r"(?m)^version:\s*(v?\d+\.\d+\.\d+(?:[-+][^\s]+)?)\s*$")
+REGISTRY_NAME = re.compile(r"^(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[0-9]{1,5})?$")
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -31,6 +32,7 @@ class DockerScoutImageProbe:
         candidate_image: str,
         report_path: str | Path,
         credentials_file: str | Path,
+        registry_credentials_file: str | Path,
         run_command: CommandRunner = subprocess.run,
     ) -> None:
         self.root = Path(repository_root).resolve(strict=True)
@@ -50,7 +52,28 @@ class DockerScoutImageProbe:
                 "container scan report must not be a symlink",
             )
         self.report_path = candidate_report
-        self.credentials_file = Path(credentials_file).resolve(strict=True)
+        credentials_path = Path(credentials_file)
+        registry_path = Path(registry_credentials_file)
+        if credentials_path.is_symlink() or registry_path.is_symlink():
+            raise DomainError(
+                "CONTAINER_SCAN_CREDENTIAL_INVALID",
+                "credential files must not be symlinks",
+            )
+        self.credentials_file = credentials_path.resolve(strict=True)
+        self.registry_credentials_file = registry_path.resolve(strict=True)
+        if (
+            self.credentials_file == self.registry_credentials_file
+            or not self.credentials_file.is_file()
+            or not self.registry_credentials_file.is_file()
+            or self.credentials_file.stat().st_nlink != 1
+            or self.registry_credentials_file.stat().st_nlink != 1
+            or not 1 <= self.credentials_file.stat().st_size <= 1024 * 1024
+            or not 1 <= self.registry_credentials_file.stat().st_size <= 1024 * 1024
+        ):
+            raise DomainError(
+                "CONTAINER_SCAN_CREDENTIAL_INVALID",
+                "Docker ID and image registry credentials must be separate safe files",
+            )
         self.run_command = run_command
 
     def _credentials(self) -> tuple[str, str]:
@@ -77,12 +100,61 @@ class DockerScoutImageProbe:
             )
         username = str(value.get("username", "")).strip()
         access_value = str(value.get("personal_access_token", ""))
-        if not username or not access_value or "\n" in username or "\n" in access_value:
+        if (
+            not username
+            or not access_value
+            or any("\n" in item or "\r" in item for item in (username, access_value))
+        ):
             raise DomainError(
                 "CONTAINER_SCAN_CREDENTIAL_INVALID",
                 "Docker Scout credential values are invalid",
             )
         return username, access_value
+
+    def _registry_credentials(self) -> tuple[str, str, str]:
+        mode = stat.S_IMODE(self.registry_credentials_file.stat().st_mode)
+        if mode & 0o077:
+            raise DomainError(
+                "CONTAINER_REGISTRY_CREDENTIAL_PERMISSIONS",
+                "image registry credentials must not be readable by group or other users",
+            )
+        try:
+            value = json.loads(self.registry_credentials_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "CONTAINER_REGISTRY_CREDENTIAL_INVALID",
+                "image registry credentials are invalid",
+            ) from error
+        if not isinstance(value, Mapping) or set(value) != {
+            "registry",
+            "username",
+            "access_token",
+        }:
+            raise DomainError(
+                "CONTAINER_REGISTRY_CREDENTIAL_INVALID",
+                "image registry credentials require registry, username, and access_token",
+            )
+        registry = str(value.get("registry", "")).strip().lower()
+        username = str(value.get("username", "")).strip()
+        access_token = str(value.get("access_token", ""))
+        if (
+            not REGISTRY_NAME.fullmatch(registry)
+            or not username
+            or not access_token
+            or any("\n" in item or "\r" in item for item in (registry, username, access_token))
+        ):
+            raise DomainError(
+                "CONTAINER_REGISTRY_CREDENTIAL_INVALID",
+                "image registry credential values are invalid",
+            )
+        return registry, username, access_token
+
+    def _image_registry(self) -> str:
+        repository = self.candidate_image.split("@", 1)[0]
+        first = repository.split("/", 1)[0].lower()
+        if "." not in first and ":" not in first and first != "localhost":
+            return "docker.io"
+        return first
 
     @staticmethod
     def _sarif_results(payload: Any) -> list[Mapping[str, Any]]:
@@ -103,9 +175,12 @@ class DockerScoutImageProbe:
                 )
             tool = run.get("tool")
             driver = tool.get("driver") if isinstance(tool, Mapping) else None
-            if not isinstance(driver, Mapping) or not str(driver.get("name", "")).strip():
+            if (
+                not isinstance(driver, Mapping)
+                or str(driver.get("name", "")).strip().lower() != "docker scout"
+            ):
                 raise DomainError(
-                    "CONTAINER_SCAN_REPORT_INVALID", "Docker Scout SARIF tool is missing"
+                    "CONTAINER_SCAN_REPORT_INVALID", "SARIF was not produced by Docker Scout"
                 )
             run_results = run.get("results", [])
             if not isinstance(run_results, list) or any(
@@ -125,6 +200,13 @@ class DockerScoutImageProbe:
                 "container scan requires an immutable image digest reference",
             )
         username, access_value = self._credentials()
+        registry, registry_username, registry_token = self._registry_credentials()
+        image_registry = self._image_registry()
+        if registry != image_registry:
+            raise DomainError(
+                "CONTAINER_REGISTRY_MISMATCH",
+                "image registry credentials do not match the candidate image registry",
+            )
         self.report_path.unlink(missing_ok=True)
         with tempfile.TemporaryDirectory(prefix="industrial-shadow-docker-config-") as directory:
             os.chmod(directory, 0o700)
@@ -148,6 +230,77 @@ class DockerScoutImageProbe:
             if login.returncode != 0:
                 raise DomainError(
                     "CONTAINER_SCAN_AUTH_FAILED", "Docker Scout authentication failed"
+                )
+            if registry == "docker.io":
+                if registry_username != username or registry_token != access_value:
+                    raise DomainError(
+                        "CONTAINER_REGISTRY_AUTH_FAILED",
+                        "conflicting Docker Hub credentials were supplied",
+                    )
+            else:
+                registry_login = self.run_command(
+                    [
+                        "docker",
+                        "login",
+                        registry,
+                        "--username",
+                        registry_username,
+                        "--password-stdin",
+                    ],
+                    input=registry_token + "\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env=environment,
+                    check=False,
+                )
+                if registry_login.returncode != 0:
+                    raise DomainError(
+                        "CONTAINER_REGISTRY_AUTH_FAILED",
+                        "candidate image registry authentication failed",
+                    )
+            pull = self.run_command(
+                ["docker", "pull", self.candidate_image],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=environment,
+                check=False,
+            )
+            if pull.returncode != 0:
+                raise DomainError(
+                    "CONTAINER_IMAGE_PULL_FAILED", "candidate image could not be pulled"
+                )
+            inspected = self.run_command(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{json .RepoDigests}}",
+                    self.candidate_image,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=environment,
+                check=False,
+            )
+            try:
+                repo_digests = json.loads(inspected.stdout)
+            except json.JSONDecodeError as error:
+                raise DomainError(
+                    "CONTAINER_IMAGE_DIGEST_UNVERIFIED",
+                    "pulled image digest could not be verified",
+                ) from error
+            if (
+                inspected.returncode != 0
+                or not isinstance(repo_digests, list)
+                or self.candidate_image not in repo_digests
+            ):
+                raise DomainError(
+                    "CONTAINER_IMAGE_DIGEST_UNVERIFIED",
+                    "pulled image is not the closure-bound digest",
                 )
             version_result = self.run_command(
                 ["docker", "scout", "version"],
@@ -182,7 +335,12 @@ class DockerScoutImageProbe:
             )
         if scan.returncode not in {0, 2}:
             raise DomainError("CONTAINER_SCAN_EXECUTION_FAILED", "Docker Scout image scan failed")
-        if not self.report_path.is_file() or self.report_path.is_symlink():
+        if (
+            not self.report_path.is_file()
+            or self.report_path.is_symlink()
+            or self.report_path.stat().st_nlink != 1
+            or not 1 <= self.report_path.stat().st_size <= 64 * 1024 * 1024
+        ):
             raise DomainError(
                 "CONTAINER_SCAN_REPORT_INVALID", "Docker Scout SARIF report is missing"
             )
@@ -207,6 +365,8 @@ class DockerScoutImageProbe:
             },
             checks=(
                 GateCheck("docker_scout_authenticated", True),
+                GateCheck("candidate_registry_authenticated", True),
+                GateCheck("pulled_image_digest_exact", True),
                 GateCheck("immutable_image_reference", True),
                 GateCheck("sarif_contract", True),
                 GateCheck(
@@ -220,6 +380,7 @@ class DockerScoutImageProbe:
                 "report_bytes": len(report_bytes),
                 "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
                 "scanner_version": version_match.group(1),
+                "image_registry": image_registry,
             },
         )
 
@@ -235,6 +396,7 @@ class DockerScoutReleaseProbe:
         web_image: str,
         backend_report_path: str | Path,
         credentials_file: str | Path,
+        registry_credentials_file: str | Path,
         run_command: CommandRunner = subprocess.run,
     ) -> None:
         self.root = Path(repository_root)
@@ -242,6 +404,7 @@ class DockerScoutReleaseProbe:
         self.web_image = web_image
         self.backend_report_path = Path(backend_report_path)
         self.credentials_file = credentials_file
+        self.registry_credentials_file = registry_credentials_file
         self.run_command = run_command
 
     def run(self) -> GateEvidence:
@@ -258,6 +421,7 @@ class DockerScoutReleaseProbe:
                 candidate_image=image,
                 report_path=report,
                 credentials_file=self.credentials_file,
+                registry_credentials_file=self.registry_credentials_file,
                 run_command=self.run_command,
             ).run()
         return complete(

@@ -4,9 +4,16 @@ import asyncio
 import hashlib
 import re
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
 from shadow_sandbox.common.models import DomainError, utc_now
+from shadow_sandbox.common.opcua_readonly import (
+    ReadonlyAsyncUaAdapter,
+    normalize_opcua_security_string,
+    opcua_node_allowlist_digest,
+    opcua_runtime_binding_digest,
+    server_certificate_fingerprint,
+)
 
 from .evidence import GateCheck, GateEvidence, complete
 
@@ -31,15 +38,16 @@ class _SubscriptionHandler:
 class ReadonlyOpcUaProbe:
     """Browse/read/subscribe acceptance for a real endpoint; no write/call API exists."""
 
-    OPERATIONS = frozenset({"Browse", "Read", "CreateSubscription", "MonitoredItem", "Publish"})
-
     def __init__(
         self,
         *,
         endpoint_uri: str,
         application_uri: str,
+        client_application_uri: str,
         namespace_uri: str,
         certificate_fingerprint: str,
+        client_certificate_fingerprint: str,
+        next_client_certificate_fingerprint: str,
         node_ids: Sequence[str],
         security_string: str,
         sampling_interval_ms: int = 500,
@@ -51,14 +59,20 @@ class ReadonlyOpcUaProbe:
     ) -> None:
         if not endpoint_uri.startswith("opc.tcp://"):
             raise DomainError("OPCUA_ENDPOINT_INVALID", "OPC UA endpoint must use opc.tcp")
-        if not node_ids or len(node_ids) > 500:
+        if (
+            not node_ids
+            or len(node_ids) > 500
+            or len(set(node_ids)) != len(node_ids)
+            or any(not node_id.strip() for node_id in node_ids)
+        ):
             raise DomainError("OPCUA_NODE_POLICY_INVALID", "1..500 approved nodes are required")
-        security_parts = [item.strip() for item in security_string.split(",")]
-        if len(security_parts) < 2 or security_parts[1] != "SignAndEncrypt":
-            raise DomainError(
-                "OPCUA_SECURITY_REQUIRED", "real OT probe requires SignAndEncrypt security"
+        security_profile, _certificate_path, _key_path, _server_path = (
+            normalize_opcua_security_string(
+                security_string, code="OPCUA_SECURITY_REQUIRED"
             )
-        if security_parts[0] not in set(allowed_security_policies):
+        )
+        security_policy = security_profile.split(",", 1)[0]
+        if security_policy not in set(allowed_security_policies):
             raise DomainError(
                 "OPCUA_SECURITY_POLICY_INVALID", "OPC UA security policy is not approved"
             )
@@ -73,14 +87,57 @@ class ReadonlyOpcUaProbe:
                 "real OT certificate fingerprint must be SHA-256",
             )
         self.endpoint_uri = endpoint_uri
+        if not client_application_uri or any(
+            character.isspace() for character in client_application_uri
+        ):
+            raise DomainError(
+                "OPCUA_CLIENT_APPLICATION_URI_INVALID",
+                "real OT client ApplicationUri must be explicitly bound",
+            )
+        normalized_client_fingerprint = (
+            client_certificate_fingerprint.replace(":", "").strip().lower()
+        )
+        if not re.fullmatch(r"[a-f0-9]{64}", normalized_client_fingerprint):
+            raise DomainError(
+                "OPCUA_CLIENT_CERTIFICATE_FINGERPRINT_INVALID",
+                "real OT client certificate fingerprint must be SHA-256",
+            )
         self.application_uri = application_uri
+        self.client_application_uri = client_application_uri
         self.namespace_uri = namespace_uri
         self.certificate_fingerprint = normalized_fingerprint
+        self.client_certificate_fingerprint = normalized_client_fingerprint
+        self.next_client_certificate_fingerprint = (
+            next_client_certificate_fingerprint.replace(":", "").strip().lower()
+        )
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", self.next_client_certificate_fingerprint)
+            or self.next_client_certificate_fingerprint
+            == self.client_certificate_fingerprint
+        ):
+            raise DomainError(
+                "OPCUA_NEXT_CLIENT_CERTIFICATE_FINGERPRINT_INVALID",
+                "next client certificate must be a distinct SHA-256 fingerprint",
+            )
         self.node_ids = tuple(dict.fromkeys(node_ids))
         self.security_string = security_string
         self.sampling_interval_ms = sampling_interval_ms
         self.observation_seconds = observation_seconds
-        self.security_policy = security_parts[0]
+        self.security_policy = security_policy
+        self.security_profile = security_profile
+        self.node_allowlist_digest = opcua_node_allowlist_digest(self.node_ids)
+        self.runtime_binding_digest = opcua_runtime_binding_digest(
+            endpoint_uri=self.endpoint_uri,
+            application_uri=self.application_uri,
+            client_application_uri=self.client_application_uri,
+            namespace_uri=self.namespace_uri,
+            server_certificate_fingerprint=self.certificate_fingerprint,
+            client_certificate_fingerprint=self.client_certificate_fingerprint,
+            next_client_certificate_fingerprint=self.next_client_certificate_fingerprint,
+            security_profile=self.security_profile,
+            node_ids=self.node_ids,
+            code="OPCUA_RUNTIME_BINDING_INVALID",
+        )
 
     async def run(self) -> GateEvidence:
         try:
@@ -94,14 +151,18 @@ class ReadonlyOpcUaProbe:
     async def _run_bounded(self) -> GateEvidence:
         started = utc_now()
         try:
-            from asyncua import Client
+            from asyncua import Client, ua
         except ImportError as error:
             raise DomainError(
                 "ASYNCUA_DEPENDENCY_UNAVAILABLE", "asyncua is required", status=503
             ) from error
-        client = Client(url=self.endpoint_uri)
-        await client.set_security_string(self.security_string)
-        endpoints = await client.connect_and_get_server_endpoints()
+        adapter = ReadonlyAsyncUaAdapter(Client(url=self.endpoint_uri))
+        adapter.bind_application_uri(self.client_application_uri)
+        await adapter.configure_security(self.security_string)
+        client_certificate_bound = adapter.client_certificate_bound(
+            self.client_certificate_fingerprint
+        )
+        endpoints = await adapter.endpoint_descriptions()
         matches = [
             item
             for item in endpoints
@@ -110,7 +171,8 @@ class ReadonlyOpcUaProbe:
             and str(item.SecurityPolicyUri).endswith("#" + self.security_policy)
         ]
         fingerprints = {
-            hashlib.sha256(bytes(item.ServerCertificate)).hexdigest() for item in matches
+            server_certificate_fingerprint(bytes(item.ServerCertificate))
+            for item in matches
         }
         endpoint_identity = bool(matches)
         handler = _SubscriptionHandler()
@@ -119,42 +181,45 @@ class ReadonlyOpcUaProbe:
         namespace_match = False
         good_values = 0
         timestamped_values = 0
-        subscription = None
-        handles: list[int] = []
-        async with client:
-            namespace_match = self.namespace_uri in await client.get_namespace_array()
-            browse_count = len(await client.nodes.objects.get_children())
-            nodes = [client.get_node(node_id) for node_id in self.node_ids]
-            for node in nodes:
-                data_value = await node.read_data_value()
+        readonly_nodes = 0
+        method_free_nodes = 0
+        access_profiles_checked = 0
+        async with adapter:
+            client_certificate_bound = client_certificate_bound and (
+                adapter.client_certificate_bound(self.client_certificate_fingerprint)
+                and adapter.application_uri == self.client_application_uri
+            )
+            namespace_match = self.namespace_uri in await adapter.namespace_array()
+            browse_count = await adapter.browse_object_count()
+            inspections = await adapter.inspect_and_read(self.node_ids, ua.AttributeIds)
+            for inspection in inspections:
+                data_value = inspection.data_value
                 good_values += int(data_value.StatusCode.is_good())
                 timestamped_values += int(
                     data_value.SourceTimestamp is not None
                     or data_value.ServerTimestamp is not None
                 )
                 read_count += 1
-            subscription = await client.create_subscription(self.sampling_interval_ms, handler)
-            try:
-                raw_handles = await subscription.subscribe_data_change(nodes)
-                values = [raw_handles] if isinstance(raw_handles, int) else list(raw_handles)
-                for item in values:
-                    if not isinstance(item, int):
-                        raise DomainError(
-                            "OPCUA_SUBSCRIPTION_REJECTED",
-                            "one or more approved nodes rejected subscription",
-                            status=503,
-                        )
-                    handles.append(cast(int, item))
-                await asyncio.sleep(self.observation_seconds)
-            finally:
-                if handles:
-                    await subscription.unsubscribe(handles)
-                await subscription.delete()
+                access_profiles_checked += 1
+                readonly_nodes += int(inspection.readonly)
+                method_free_nodes += int(inspection.variable_without_methods)
+            if readonly_nodes == len(self.node_ids):
+                await adapter.subscribe_for(
+                    self.node_ids,
+                    sampling_interval_ms=self.sampling_interval_ms,
+                    handler=handler,
+                    observation_seconds=self.observation_seconds,
+                    sleep=asyncio.sleep,
+                )
 
-        forbidden = self.OPERATIONS.intersection({"Write", "Call", "HistoryUpdate"})
         checks = (
             GateCheck("endpoint_application_uri", endpoint_identity),
             GateCheck("endpoint_certificate", self.certificate_fingerprint in fingerprints),
+            GateCheck(
+                "client_application_uri",
+                adapter.application_uri == self.client_application_uri,
+            ),
+            GateCheck("client_certificate_session_binding", client_certificate_bound),
             GateCheck("namespace", namespace_match),
             GateCheck("browse_service", browse_count > 0),
             GateCheck("allowlisted_reads", read_count == len(self.node_ids)),
@@ -169,7 +234,27 @@ class ReadonlyOpcUaProbe:
                 and set(self.node_ids).issubset(handler.node_ids),
                 {"notifications": handler.notifications, "observed_nodes": len(handler.node_ids)},
             ),
-            GateCheck("read_only_surface", not forbidden),
+            GateCheck(
+                "access_levels_read_only",
+                access_profiles_checked == len(self.node_ids)
+                and readonly_nodes == len(self.node_ids),
+                {
+                    "profiles_checked": access_profiles_checked,
+                    "readonly_nodes": readonly_nodes,
+                },
+            ),
+            GateCheck(
+                "method_execution_unavailable",
+                method_free_nodes == len(self.node_ids),
+                {"method_free_nodes": method_free_nodes},
+            ),
+            GateCheck(
+                "read_only_adapter_surface",
+                not any(
+                    hasattr(adapter, name)
+                    for name in ("write", "write_value", "call", "call_method", "get_node")
+                ),
+            ),
         )
         return complete(
             "real_ot",
@@ -177,7 +262,13 @@ class ReadonlyOpcUaProbe:
             coordinates={
                 "endpoint_digest": hashlib.sha256(self.endpoint_uri.encode()).hexdigest(),
                 "application_uri": self.application_uri,
+                "server_application_uri": self.application_uri,
+                "client_application_uri": self.client_application_uri,
                 "namespace_uri": self.namespace_uri,
+                "server_certificate_fingerprint": self.certificate_fingerprint,
+                "client_certificate_fingerprint": self.client_certificate_fingerprint,
+                "node_allowlist_digest": self.node_allowlist_digest,
+                "runtime_binding_digest": self.runtime_binding_digest,
                 "security_policy": self.security_policy,
             },
             checks=checks,
@@ -188,6 +279,18 @@ class ReadonlyOpcUaProbe:
                 "notifications": handler.notifications,
                 "good_values": good_values,
                 "timestamped_values": timestamped_values,
+                "access_profiles_checked": access_profiles_checked,
+                "readonly_nodes": readonly_nodes,
+                "method_free_nodes": method_free_nodes,
+                "server_certificate_fingerprint": self.certificate_fingerprint,
+                "client_certificate_fingerprint": self.client_certificate_fingerprint,
+                "next_client_certificate_fingerprint": (
+                    self.next_client_certificate_fingerprint
+                ),
+                "client_application_uri": self.client_application_uri,
+                "node_allowlist_digest": self.node_allowlist_digest,
+                "runtime_binding_digest": self.runtime_binding_digest,
+                "security_policy": self.security_policy,
                 "observation_seconds": self.observation_seconds,
             },
         )

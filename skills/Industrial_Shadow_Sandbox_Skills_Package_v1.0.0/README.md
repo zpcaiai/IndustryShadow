@@ -95,8 +95,9 @@ signatories is supplied.
 
 Every remaining target-environment gate has an executable harness in
 `tools/production_gate.py`. The environment-protected
-`.github/workflows/production-acceptance.yml` first runs a non-mutating, fail-closed input
-preflight, then runs live OIDC personas, an isolated managed
+`.github/workflows/production-acceptance.yml` first verifies release attestations and the
+signed formal target profile, then runs a non-mutating, fail-closed input preflight before
+authorizing any target mutation. It subsequently runs live OIDC personas, an isolated managed
 PostgreSQL restore, S3/KMS controls, external CA/CRL and real read-only OPC UA, plane-labelled
 NetworkPolicy probes, measured load, controlled pod loss, exact image rollback, signed
 security/privacy/human-accessibility assurance imports, authenticated Docker Scout scans
@@ -104,7 +105,7 @@ of both immutable backend and Web candidate images, a local diagnostic 174-Episo
 signed formal target result set whose metrics and exact-bundle Gate are recomputed. See
 `docs/runbooks/production-acceptance.md` before enabling the workflow. The separate
 `.github/workflows/production-closure.yml` downloads one exact acceptance run by ID and
-verifies the two-person signatures without rerunning or changing the evidence. All 15 source
+verifies the two-person signatures without rerunning or changing the evidence. All 17 source
 gates are bound to one acceptance run, five exact release/environment coordinates
 (including the sealed Kubernetes deployment-plan digest), and a
 purpose-scoped assessor/approver trust-store digest. These controls improve code readiness;
@@ -112,7 +113,7 @@ they do not turn any unexecuted target gate into `PASSED`.
 
 After closure, `.github/workflows/production-deploy.yml` downloads that exact closure run,
 re-verifies it, matches the sealed phased deployment plan and backend image, performs
-server-side dry runs, runs the candidate-image migration Job, rolls out all six workloads,
+server-side dry runs, runs the candidate-image migration Job, rolls out all seven workloads,
 verifies exact image digests and HTTPS readiness, and reapplies the digest-pinned prior
 manifest if rollout fails. Plan loading rejects cluster-scoped/RBAC/Secret resources,
 out-of-namespace objects, undeclared workloads, mutable or unbound runtime images, and

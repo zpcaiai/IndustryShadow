@@ -15,7 +15,8 @@
       "operation": "scale_outage",
       "kind": "deployment",
       "maximum_recovery_seconds": 600,
-      "workload": "worker"
+      "workload": "worker",
+      "readiness_url": "https://shadow.example.invalid/internal/v1/worker/heartbeat"
     },
     {
       "name": "collector-outage",
@@ -23,7 +24,8 @@
       "operation": "scale_outage",
       "kind": "deployment",
       "maximum_recovery_seconds": 600,
-      "workload": "collector"
+      "workload": "real-ot-collector",
+      "readiness_url": "https://shadow.example.invalid/internal/v1/collectors/real-ot/heartbeat"
     },
     {
       "name": "simulator-outage",
@@ -31,7 +33,8 @@
       "operation": "scale_outage",
       "kind": "statefulset",
       "maximum_recovery_seconds": 900,
-      "workload": "simulator"
+      "workload": "simulator",
+      "readiness_url": "https://shadow.example.invalid/internal/v1/simulator/heartbeat"
     }
   ]
 }

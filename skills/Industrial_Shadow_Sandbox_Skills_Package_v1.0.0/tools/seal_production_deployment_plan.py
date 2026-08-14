@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -16,6 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise DomainError(
+            "DEPLOYMENT_PLAN_OUTPUT_EXISTS",
+            "refusing to overwrite an existing sealed deployment plan",
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
         prefix=".deployment-plan-", dir=path.parent
@@ -25,7 +31,9 @@ def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(canonical_json(payload) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.chmod(temporary, 0o444)
+        os.link(temporary, path)
+        os.unlink(temporary)
     except Exception:
         try:
             os.unlink(temporary)
@@ -41,6 +49,16 @@ def main() -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if (
+        args.input.is_symlink()
+        or not args.input.is_file()
+        or not stat.S_ISREG(args.input.stat().st_mode)
+        or args.input.stat().st_nlink != 1
+        or not 1 <= args.input.stat().st_size <= 4 * 1024 * 1024
+    ):
+        raise DomainError(
+            "DEPLOYMENT_PLAN_INVALID", "deployment plan input must be a safe file"
+        )
     value = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
         raise DomainError(
@@ -63,11 +81,19 @@ def main() -> int:
             raise DomainError(
                 "DEPLOYMENT_PLAN_INVALID", "deployment artifact fields are invalid"
             )
-        path = (ROOT / str(item.get("path", ""))).resolve(strict=True)
+        source = ROOT / str(item.get("path", ""))
+        if source.is_symlink():
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_INVALID",
+                "deployment artifact must not be a symlink",
+            )
+        path = source.resolve(strict=True)
         if (
             ROOT.resolve() not in path.parents
-            or path.is_symlink()
             or not path.is_file()
+            or not stat.S_ISREG(path.stat().st_mode)
+            or path.stat().st_nlink != 1
+            or not 1 <= path.stat().st_size <= 64 * 1024 * 1024
         ):
             raise DomainError(
                 "DEPLOYMENT_ARTIFACT_INVALID",
@@ -82,11 +108,6 @@ def main() -> int:
             )
         payload[name] = {"path": str(item["path"]), "sha256": actual}
     payload["digest"] = canonical_digest(payload)
-    if args.output.exists():
-        raise DomainError(
-            "DEPLOYMENT_PLAN_OUTPUT_EXISTS",
-            "refusing to overwrite an existing sealed deployment plan",
-        )
     _atomic_write(args.output, payload)
     try:
         plan = ProductionDeploymentPlan.load(

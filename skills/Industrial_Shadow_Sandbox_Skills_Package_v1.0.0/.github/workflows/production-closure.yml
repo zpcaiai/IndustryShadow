@@ -24,13 +24,78 @@ jobs:
     env:
       PYTHONPATH: backend/src
       SHADOW_CLOSURE_SIGNATORIES_FILE: ${{ secrets.SHADOW_CLOSURE_SIGNATORIES_FILE }}
-      SHADOW_CANDIDATE_IMAGE: ${{ vars.SHADOW_CANDIDATE_IMAGE }}
-      SHADOW_BUILD_DIGEST: ${{ vars.SHADOW_BUILD_DIGEST }}
-      SHADOW_SIMULATOR_BUILD_DIGEST: ${{ vars.SHADOW_SIMULATOR_BUILD_DIGEST }}
-      SHADOW_PRODUCTION_ENVIRONMENT_DIGEST: ${{ vars.SHADOW_PRODUCTION_ENVIRONMENT_DIGEST }}
-      SHADOW_DEPLOYMENT_PLAN_DIGEST: ${{ vars.SHADOW_DEPLOYMENT_PLAN_DIGEST }}
+      SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256: ${{ vars.SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256 }}
     steps:
+      - name: Inspect the selected acceptance artifact before checkout
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: production-acceptance-evidence
+          path: ${{ runner.temp }}/industrial-shadow-acceptance
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.acceptance_run_id }}
+      - name: Bind verifier source to the accepted release candidate
+        id: accepted-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+          CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-acceptance/production/supply-chain/release-candidate.json
+        run: |
+          [[ "$ACCEPTANCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          run_record="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ACCEPTANCE_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt] | @tsv')"
+          IFS=$'\t' read -r conclusion acceptance_head_sha workflow_path source_repository event run_attempt <<< "$run_record"
+          test "$conclusion" = success
+          test "$workflow_path" = .github/workflows/production-acceptance.yml
+          test "$source_repository" = "$GITHUB_REPOSITORY"
+          test "$event" = workflow_dispatch
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
+          expected_acceptance_run_id="$ACCEPTANCE_RUN_ID-$run_attempt"
+          python3 - "$CANDIDATE_MANIFEST" "${{ runner.temp }}/industrial-shadow-acceptance/production" "$expected_acceptance_run_id" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          manifest, evidence_dir, expected_run_id = sys.argv[1:]
+          candidate = json.loads(Path(manifest).read_text(encoding="utf-8"))
+          candidate_payload = {**candidate, "manifest_digest": ""}
+          encoded = json.dumps(candidate_payload, sort_keys=True, separators=(",", ":"))
+          if (
+              candidate.get("manifest_digest") != hashlib.sha256(encoded.encode()).hexdigest()
+              or candidate.get("repository") != os.environ["GITHUB_REPOSITORY"]
+              or not re.fullmatch(r"[1-9][0-9]*", str(candidate.get("release_run_id", "")))
+              or isinstance(candidate.get("release_run_attempt"), bool)
+              or not isinstance(candidate.get("release_run_attempt"), int)
+              or candidate.get("release_run_attempt") < 1
+              or not re.fullmatch(r"[a-f0-9]{40}", str(candidate.get("source_revision", "")))
+          ):
+              raise SystemExit("candidate manifest digest is invalid")
+          release_digest = None
+          gates = [
+              "preflight", "supply_chain", "postgresql_migration", "oidc",
+              "backup_restore", "s3", "external_ca", "real_ot", "network_policy",
+              "container_scan", "security", "resilience", "performance", "privacy",
+              "accessibility", "upgrade_rollback", "benchmark_150",
+          ]
+          for gate in gates:
+              value = json.loads((Path(evidence_dir) / f"{gate}.json").read_text(encoding="utf-8"))
+              if value.get("acceptance_run_id") != expected_run_id:
+                  raise SystemExit(f"{gate} evidence is not bound to selected acceptance run")
+              if release_digest is None:
+                  release_digest = value.get("release_digest")
+              elif value.get("release_digest") != release_digest:
+                  raise SystemExit("acceptance evidence release digests differ")
+          PY
+          source_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_revision"])' "$CANDIDATE_MANIFEST")"
+          [[ "$source_revision" =~ ^[a-f0-9]{40}$ ]]
+          test "$acceptance_head_sha" = "$source_revision"
+          echo "source_revision=$source_revision" >> "$GITHUB_OUTPUT"
+          echo "acceptance_run_id=$expected_acceptance_run_id" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.accepted-source.outputs.source_revision }}
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: "3.12"}
       - name: Install closure verifier dependencies
@@ -42,7 +107,43 @@ jobs:
           path: docs/evidence/batch-24
           github-token: ${{ github.token }}
           run-id: ${{ inputs.acceptance_run_id }}
+      - name: Export candidate and approval-bound release coordinates
+        run: |
+          release_run_id="$(python -c 'import json; print(json.load(open("docs/evidence/batch-24/production/supply-chain/release-candidate.json"))["release_run_id"])')"
+          python tools/export_release_candidate.py \
+            --manifest docs/evidence/batch-24/production/supply-chain/release-candidate.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$release_run_id" \
+            --run-attempt "$(python -c 'import json; print(json.load(open("docs/evidence/batch-24/production/supply-chain/release-candidate.json"))["release_run_attempt"])')" \
+            --github-env "$GITHUB_ENV"
+          python - "$GITHUB_ENV" <<'PY'
+          import json
+          import re
+          import sys
+
+          approval = json.load(open("docs/evidence/batch-24/production/approval-request.json"))
+          plan = json.load(open("docs/evidence/batch-24/production-deployment/deployment-plan.json"))
+          candidate = json.load(open("docs/evidence/batch-24/production/supply-chain/release-candidate.json"))
+          coordinates = approval.get("release_coordinates", {})
+          values = {
+              "SHADOW_PRODUCTION_ENVIRONMENT_DIGEST": coordinates.get("environment_digest", ""),
+              "SHADOW_DEPLOYMENT_PLAN_DIGEST": coordinates.get("deployment_plan_digest", ""),
+          }
+          if (
+              any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in values.values())
+              or plan.get("digest") != values["SHADOW_DEPLOYMENT_PLAN_DIGEST"]
+              or coordinates.get("candidate_image") != candidate.get("backend_image")
+              or coordinates.get("build_digest") != candidate.get("source_digest")
+              or coordinates.get("simulator_build_digest") != candidate.get("source_digest")
+          ):
+              raise SystemExit("approval request release coordinates are inconsistent")
+          with open(sys.argv[1], "a", encoding="utf-8") as output:
+              for name, value in values.items():
+                  output.write(f"{name}={value}\n")
+          PY
       - name: Verify signatories against the downloaded approval digest
+        env:
+          SHADOW_EXPECTED_ACCEPTANCE_RUN_ID: ${{ steps.accepted-source.outputs.acceptance_run_id }}
         run: |
           test -f "$SHADOW_CLOSURE_SIGNATORIES_FILE"
           python tools/build_production_closure.py \
@@ -52,7 +153,10 @@ jobs:
             --build-digest "$SHADOW_BUILD_DIGEST" \
             --simulator-build-digest "$SHADOW_SIMULATOR_BUILD_DIGEST" \
             --environment-digest "$SHADOW_PRODUCTION_ENVIRONMENT_DIGEST" \
-            --deployment-plan-digest "$SHADOW_DEPLOYMENT_PLAN_DIGEST"
+            --deployment-plan-digest "$SHADOW_DEPLOYMENT_PLAN_DIGEST" \
+            --trust-root-attestation docs/evidence/batch-24/production/assessor-trust-root-attestation.json \
+            --trust-root-public-key docs/evidence/batch-24/production/assessor-trust-root-public-key.pem \
+            --trust-root-key-sha256 "$SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256"
           python tools/check_release_evidence.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

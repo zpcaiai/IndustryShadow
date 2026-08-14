@@ -4,8 +4,12 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker
 
 from shadow_sandbox.common.models import canonical_digest
 from shadow_sandbox.evaluation.formal_benchmark import FormalBenchmarkImporter
@@ -13,12 +17,15 @@ from shadow_sandbox.operations.container_scan import DockerScoutImageProbe
 from shadow_sandbox.operations.evidence import read_evidence
 from shadow_sandbox.operations.external_assurance import ExternalAssuranceImporter
 from shadow_sandbox.operations.production_deployment import ProductionDeploymentPlan
+from shadow_sandbox.operations.supply_chain import ReleaseCandidate
 from shadow_sandbox.operations.trust_store import SignerTrustStore
+from tools.source_integrity import source_digest
 
 ROOT = Path(__file__).resolve().parents[1]
 INPUT = ROOT / "docs/evidence/batch-24/production-closure-input.json"
 REQUIRED_GATES = {
     "production_preflight",
+    "supply_chain",
     "postgresql_migration",
     "backup_restore",
     "oidc",
@@ -36,6 +43,8 @@ REQUIRED_GATES = {
 }
 SOURCE_GATES = {
     "preflight",
+    "supply_chain",
+    "postgresql_migration",
     "oidc",
     "backup_restore",
     "s3",
@@ -54,15 +63,48 @@ SOURCE_GATES = {
 
 
 def main() -> int:
-    if not INPUT.is_file():
+    if INPUT.is_symlink() or not INPUT.is_file():
         print(f"RELEASE_BLOCKED: missing {INPUT.relative_to(ROOT)}")
         return 1
-    data: dict[str, Any] = json.loads(INPUT.read_text(encoding="utf-8"))
+    input_stat = INPUT.stat()
+    if (
+        input_stat.st_nlink != 1
+        or not 1 <= input_stat.st_size <= 16 * 1024 * 1024
+    ):
+        print("RELEASE_BLOCKED: closure input is not a safe regular file")
+        return 1
+    try:
+        decoded = json.loads(INPUT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print("RELEASE_BLOCKED: closure input is invalid JSON")
+        return 1
+    if not isinstance(decoded, dict):
+        print("RELEASE_BLOCKED: closure input must be an object")
+        return 1
+    data: dict[str, Any] = decoded
+    try:
+        schema = json.loads(
+            (ROOT / "schemas/production/production-closure-input-v2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema, format_checker=FormatChecker()).validate(data)
+    except Exception:  # noqa: BLE001 - malformed closure input must fail closed
+        print("RELEASE_BLOCKED: closure input does not satisfy the production schema")
+        return 1
     errors: list[str] = []
     trust_store: SignerTrustStore | None = None
     try:
-        trust_store = SignerTrustStore.load(
-            ROOT / "docs/evidence/batch-24/production/assessor-trust-store.json"
+        trust_store = SignerTrustStore.load_verified(
+            ROOT / "docs/evidence/batch-24/production/assessor-trust-store.json",
+            root_attestation_path=ROOT
+            / "docs/evidence/batch-24/production/assessor-trust-root-attestation.json",
+            root_public_key_path=ROOT
+            / "docs/evidence/batch-24/production/assessor-trust-root-public-key.pem",
+            expected_root_key_sha256=os.environ[
+                "SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256"
+            ],
         )
     except Exception:  # noqa: BLE001 - invalid trust material must block release
         errors.append("assessor and approver trust store is missing or invalid")
@@ -83,6 +125,7 @@ def main() -> int:
     if not artifacts:
         errors.append("no closure artifacts supplied")
     observed_gate_digests: dict[str, str] = {}
+    observed_evidence: dict[str, Any] = {}
     observed_run_ids: set[str] = set()
     observed_release_digests: set[str] = set()
     observed_times: list[tuple[dt.datetime, dt.datetime]] = []
@@ -93,7 +136,13 @@ def main() -> int:
         except FileNotFoundError:
             errors.append(f"missing artifact {artifact.get('path')}")
             continue
-        if ROOT.resolve() not in resolved.parents or resolved.is_symlink():
+        if (
+            ROOT.resolve() not in resolved.parents
+            or path.is_symlink()
+            or not resolved.is_file()
+            or resolved.stat().st_nlink != 1
+            or not 1 <= resolved.stat().st_size <= 64 * 1024 * 1024
+        ):
             errors.append(f"artifact outside repository {artifact.get('path')}")
             continue
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -141,7 +190,10 @@ def main() -> int:
                     scan_resolved = scan_path.resolve(strict=True)
                     if (
                         ROOT.resolve() not in scan_resolved.parents
-                        or scan_resolved.is_symlink()
+                        or scan_path.is_symlink()
+                        or not scan_resolved.is_file()
+                        or scan_resolved.stat().st_nlink != 1
+                        or not 1 <= scan_resolved.stat().st_size <= 64 * 1024 * 1024
                     ):
                         raise ValueError("scan report outside repository")
                     scan_bytes = scan_path.read_bytes()
@@ -154,10 +206,25 @@ def main() -> int:
             except Exception:  # noqa: BLE001 - malformed scan evidence blocks release
                 errors.append("invalid or mismatched Docker Scout SARIF reports")
         observed_gate_digests[gate] = evidence.digest
+        observed_evidence[gate] = evidence
     if set(observed_gate_digests) != SOURCE_GATES:
         errors.append("source gate evidence set is incomplete")
     if len(observed_run_ids) != 1 or len(observed_release_digests) != 1:
         errors.append("source gates do not belong to one acceptance run and release")
+    try:
+        ca_metrics = observed_evidence["external_ca"].metrics
+        ot_metrics = observed_evidence["real_ot"].metrics
+        for name in (
+            "server_certificate_fingerprint",
+            "client_certificate_fingerprint",
+            "next_client_certificate_fingerprint",
+            "client_application_uri",
+            "security_policy",
+        ):
+            if not ca_metrics.get(name) or ca_metrics.get(name) != ot_metrics.get(name):
+                raise ValueError(name)
+    except (KeyError, ValueError):
+        errors.append("external CA and real OT evidence coordinates do not match")
     now = dt.datetime.now(dt.UTC)
     if len(observed_times) != len(SOURCE_GATES) or any(
         started.tzinfo is None
@@ -185,18 +252,94 @@ def main() -> int:
         errors.append("release coordinates are incomplete")
         release_coordinates = {}
     expected_release_digest = canonical_digest(release_coordinates)
+    candidate: ReleaseCandidate | None = None
     try:
-        ProductionDeploymentPlan.load(
+        expected_repository = os.environ.get("GITHUB_REPOSITORY") or None
+        expected_source_revision = os.environ.get("GITHUB_SHA") or None
+        if expected_repository is not None and not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected_repository
+        ):
+            raise ValueError("invalid expected repository")
+        if expected_source_revision is not None and not re.fullmatch(
+            r"[a-f0-9]{40}", expected_source_revision
+        ):
+            raise ValueError("invalid expected source revision")
+        candidate = ReleaseCandidate.load(
+            ROOT / "docs/evidence/batch-24/production/supply-chain/release-candidate.json",
+            expected_repository=expected_repository,
+        )
+        if (
+            candidate.backend_image != release_coordinates.get("candidate_image")
+            or candidate.source_digest != source_digest()
+            or (
+                expected_source_revision is not None
+                and candidate.source_revision != expected_source_revision
+            )
+            or candidate.source_digest != release_coordinates.get("build_digest")
+            or candidate.source_digest
+            != release_coordinates.get("simulator_build_digest")
+            or observed_evidence["supply_chain"].metrics.get(
+                "candidate_manifest_digest"
+            )
+            != candidate.manifest_digest
+            or observed_evidence["supply_chain"].metrics.get("release_run_attempt")
+            != candidate.release_run_attempt
+            or observed_evidence["supply_chain"].target_digest
+            != canonical_digest(
+                {
+                    "repository": candidate.repository,
+                    "release_run_id": candidate.release_run_id,
+                    "release_run_attempt": candidate.release_run_attempt,
+                    "source_revision": candidate.source_revision,
+                    "source_digest": candidate.source_digest,
+                    "backend_image": candidate.backend_image,
+                    "web_image": candidate.web_image,
+                    "candidate_manifest_digest": candidate.manifest_digest,
+                    "signer_workflow": (
+                        f"{candidate.repository}/.github/workflows/release.yml"
+                    ),
+                }
+            )
+        ):
+            raise ValueError("candidate coordinates mismatch")
+    except Exception:  # noqa: BLE001 - invalid candidate bundle blocks release
+        errors.append("release candidate manifest is missing, invalid, or not closure-bound")
+    try:
+        deployment_plan = ProductionDeploymentPlan.load(
             ROOT,
             ROOT / "docs/evidence/batch-24/production-deployment/deployment-plan.json",
             candidate_image=str(release_coordinates.get("candidate_image", "")),
             expected_digest=str(release_coordinates.get("deployment_plan_digest", "")),
         )
+        if (
+            deployment_plan.real_ot_node_allowlist_digest
+            != observed_evidence["real_ot"].metrics.get("node_allowlist_digest")
+            or deployment_plan.real_ot_runtime_binding_digest
+            != observed_evidence["real_ot"].metrics.get("runtime_binding_digest")
+        ):
+            raise ValueError("real OT sealed runtime binding mismatch")
     except Exception:  # noqa: BLE001 - invalid deployment plan blocks release
         errors.append("deployment plan is missing, invalid, or not closure-bound")
+    try:
+        supply_metrics = observed_evidence["supply_chain"].metrics
+        migration_metrics = observed_evidence["postgresql_migration"].metrics
+        if (
+            candidate is None
+            or supply_metrics.get("postgresql_migration_manifest_sha256")
+            != candidate.postgresql_migration_manifest.sha256
+            or migration_metrics.get("compatibility_manifest_digest")
+            != candidate.postgresql_migration_manifest.sha256
+        ):
+            raise ValueError("migration contract mismatch")
+    except Exception:  # noqa: BLE001 - incomplete migration chain blocks release
+        errors.append("PostgreSQL migration evidence is not release-candidate-bound")
     if approval.get("schema_version") != 2:
         errors.append("approval schema version is not 2")
-    if approval.get("acceptance_run_id") not in observed_run_ids:
+    expected_acceptance_run_id = os.environ.get("SHADOW_EXPECTED_ACCEPTANCE_RUN_ID", "")
+    if approval.get("acceptance_run_id") not in observed_run_ids or (
+        expected_acceptance_run_id
+        and approval.get("acceptance_run_id") != expected_acceptance_run_id
+    ):
         errors.append("approval acceptance run does not match source gates")
     if approval.get(
         "release_digest"
@@ -222,7 +365,10 @@ def main() -> int:
             report_resolved = report_path.resolve(strict=True)
             if (
                 ROOT.resolve() not in report_resolved.parents
-                or report_resolved.is_symlink()
+                or report_path.is_symlink()
+                or not report_resolved.is_file()
+                or report_resolved.stat().st_nlink != 1
+                or not 1 <= report_resolved.stat().st_size <= 64 * 1024 * 1024
             ):
                 raise ValueError("outside repository")
             report_sha = hashlib.sha256(report_path.read_bytes()).hexdigest()
@@ -248,7 +394,13 @@ def main() -> int:
             for relative, expected_sha in declared_artifacts:
                 artifact_path = ROOT / relative
                 resolved = artifact_path.resolve(strict=True)
-                if ROOT.resolve() not in resolved.parents or resolved.is_symlink():
+                if (
+                    ROOT.resolve() not in resolved.parents
+                    or artifact_path.is_symlink()
+                    or not resolved.is_file()
+                    or resolved.stat().st_nlink != 1
+                    or not 1 <= resolved.stat().st_size <= 64 * 1024 * 1024
+                ):
                     raise ValueError("attestation artifact outside repository")
                 if (
                     hashlib.sha256(artifact_path.read_bytes()).hexdigest()
@@ -279,6 +431,9 @@ def main() -> int:
                     trust_store=trust_store,
                     environment_digest=str(
                         release_coordinates.get("environment_digest", "")
+                    ),
+                    deployment_plan_digest=str(
+                        release_coordinates.get("deployment_plan_digest", "")
                     ),
                 ).import_report(report)
             if reproduced.digest != observed_gate_digests.get(gate):
@@ -312,15 +467,22 @@ def main() -> int:
         Ed25519PublicKey = None  # type: ignore[assignment,misc]
     identities: set[str] = set()
     roles: set[str] = set()
+    key_fingerprints: set[str] = set()
+    signatory_keys = {
+        "identity", "role", "approved", "signed_at", "approval_digest",
+        "public_key_b64", "signature_b64",
+    }
     for item in data.get("signatories", []):
         identity = str(item.get("identity", ""))
         role = str(item.get("role", ""))
         if (
-            not identity
+            not isinstance(item, dict)
+            or set(item) != signatory_keys
+            or not identity
             or identity in identities
             or role not in {"release_owner", "security_owner"}
             or role in roles
-            or not item.get("approved")
+            or item.get("approved") is not True
         ):
             errors.append("signatories must be distinct approved identities")
             continue
@@ -330,12 +492,14 @@ def main() -> int:
         try:
             if trust_store is None:
                 raise ValueError("trust store unavailable")
-            trust_store.verify_signer(
+            fingerprint = trust_store.verify_signer(
                 identity=identity,
                 purpose=f"closure_{role}",
                 public_key_b64=str(item.get("public_key_b64", "")),
                 signed_at=str(item.get("signed_at", "")),
             )
+            if fingerprint in key_fingerprints:
+                raise ValueError("closure signatories reuse one public key")
             if Ed25519PublicKey is None:
                 raise ValueError("cryptography unavailable")
             Ed25519PublicKey.from_public_bytes(
@@ -349,6 +513,7 @@ def main() -> int:
             continue
         identities.add(identity)
         roles.add(role)
+        key_fingerprints.add(fingerprint)
     if len(identities) < 2 or not {"release_owner", "security_owner"}.issubset(roles):
         errors.append("release_owner and security_owner signatures are required")
     if errors:

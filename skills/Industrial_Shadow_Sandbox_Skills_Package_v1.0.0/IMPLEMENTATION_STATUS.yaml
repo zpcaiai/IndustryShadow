@@ -4,10 +4,10 @@ scope: S0 simulation, S1 historical import, and S2 real read-only Shadow code pa
 safety_boundary: Real endpoint access is read-only; approved mutations target registered simulators only.
 verification_summary:
   core_test_command: make test
-  core_tests: 72 passed with 4 subtests passed
+  core_tests: prior baseline 72 passed with 4 subtests passed; post-hardening full matrix pending because the shared disk-exclusive window is active
   python_line_coverage: 64% across backend, simulator, collector, and edge packages
-  python_lint: passed
-  python_typecheck: passed with 0 errors
+  python_lint: prior baseline passed; post-hardening full rerun pending
+  python_typecheck: prior baseline passed with 0 errors; post-hardening full rerun pending
   python_dependency_audit: full development and reduced production runtime hash locks passed with 0 known vulnerabilities
   python_runtime_sbom: reproducible CycloneDX 1.6 inventory generated with 58 components and 113 validated dependency edges
   batch_contracts: 24 passed
@@ -17,16 +17,16 @@ verification_summary:
   kubernetes_render: 27 resources parsed with 0 world CIDRs, explicit non-root identities, filesystem groups, and writable bounded temporary volumes
   container_runtime_smoke: pinned backend and web images passed non-root and read-only-root execution, backend health/version/89-operation OpenAPI checks, web security headers, and source-map denial
   frontend_api_contract: generated client matches 89 backend operations
-  frontend_tests: 15 passed
+  frontend_tests: post-OIDC hardening targeted run passed 23 tests; full matrix rerun pending
   browser_e2e: 5 passed in local Chrome, covering six permission personas, direct forbidden navigation, authentication fail-closed behavior, keyboard/i18n, and automated WCAG A/AA checks
-  frontend_build: passed
+  frontend_build: post-OIDC hardening targeted build passed; full matrix rerun pending
   frontend_dependency_audit: 0 known vulnerabilities
   network_opcua: passed with an independent asyncua client in insecure development and self-signed SignAndEncrypt/pinned-client-certificate modes; writes denied
   synthetic_demo_episodes: 174
   synthetic_demo_gate: passed_not_certification
   local_measured_benchmark: passed 174 Episodes (120 fault, 54 normal), Top-1/Top-3 1.0, false-positive rate 0.0, deterministic replay 1.0, all safety red lines 0; bundled deterministic model only
   production_gate_harnesses: implemented for non-mutating target preflight, live OIDC discovery/JWKS/personas/server RBAC, managed PostgreSQL restore RTO and source/target backup-role checks, external CA current/next rotation/CRL/EKU/KeyUsage/client-key matching, real SignAndEncrypt read-only OPC UA quality/timestamp/subscription checks, S3/KMS/Object Lock/TLS-only policy/account/rotation checks, exact live plane NetworkPolicy and RBAC probes, authenticated immutable backend-and-Web Docker Scout SARIF scanning, bounded warmup/circuit-breaker load, thresholded chaos recovery, exact-image rollback/RTO, release-bound signed security/privacy/human-accessibility assurance, signed formal benchmark recomputation, two-person approval signing, and closure-bound phased Kubernetes deployment with phase/resource allowlists, restricted workload security, narrow runner RBAC checks, exact prior-resource coverage, and verified automatic compensation from the first mutating apply
-  production_acceptance_binding: 15 source gates emit digest-sealed v2 evidence bound to one acceptance_run_id, five candidate/build/simulator/environment/deployment-plan release coordinates, freshness window, and purpose-scoped signer trust-store digest; probe exceptions emit redacted FAILED evidence
+  production_acceptance_binding: 17 source gates emit digest-sealed v2 evidence bound to one acceptance_run_id, five candidate/build/simulator/environment/deployment-plan release coordinates, freshness window, and purpose-scoped signer trust-store digest; probe exceptions emit redacted FAILED evidence
   external_integration_status: NOT_RUN
 batches:
   - batch: "01"

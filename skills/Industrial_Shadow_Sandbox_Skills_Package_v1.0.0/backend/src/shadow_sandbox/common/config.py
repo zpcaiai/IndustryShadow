@@ -10,6 +10,9 @@ from .models import DomainError
 
 RELEASE_DIGEST = re.compile(r"^(?:sha256:)?([a-f0-9]{64})$")
 PLACEHOLDER_FRAGMENT = re.compile(r"(?:replace[-_ ]?with|change[-_ ]?me)", re.IGNORECASE)
+SAFE_ID_TOKEN_ALGORITHMS = frozenset(
+    {"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +27,8 @@ class Settings:
     oidc_audience: str | None = None
     oidc_jwks_url: str | None = None
     oidc_client_id: str | None = None
+    oidc_service_client_ids: tuple[str, ...] = ()
+    oidc_id_token_signing_algorithms: tuple[str, ...] = ("RS256",)
     oidc_authorization_url: str | None = None
     oidc_token_url: str | None = None
     oidc_end_session_url: str | None = None
@@ -56,6 +61,16 @@ class Settings:
             oidc_audience=os.getenv("SHADOW_OIDC_AUDIENCE"),
             oidc_jwks_url=os.getenv("SHADOW_OIDC_JWKS_URL"),
             oidc_client_id=os.getenv("SHADOW_OIDC_CLIENT_ID"),
+            oidc_service_client_ids=tuple(
+                item.strip()
+                for item in os.getenv("SHADOW_OIDC_SERVICE_CLIENT_IDS", "").split(",")
+                if item.strip()
+            ),
+            oidc_id_token_signing_algorithms=tuple(
+                item.strip()
+                for item in os.getenv("SHADOW_OIDC_ID_TOKEN_SIGNING_ALGORITHMS", "RS256").split(",")
+                if item.strip()
+            ),
             oidc_authorization_url=os.getenv("SHADOW_OIDC_AUTHORIZATION_URL"),
             oidc_token_url=os.getenv("SHADOW_OIDC_TOKEN_URL"),
             oidc_end_session_url=os.getenv("SHADOW_OIDC_END_SESSION_URL"),
@@ -96,6 +111,7 @@ class Settings:
             or not self.oidc_client_id
             or not self.oidc_authorization_url
             or not self.oidc_token_url
+            or not self.oidc_end_session_url
         ):
             raise DomainError(
                 "OIDC_CONFIG_REQUIRED",
@@ -109,10 +125,9 @@ class Settings:
                 self.oidc_authorization_url or "", "OIDC_AUTHORIZATION_URL_INVALID"
             )
             self._validate_https_url(self.oidc_token_url or "", "OIDC_TOKEN_URL_INVALID")
-            if self.oidc_end_session_url:
-                self._validate_https_url(
-                    self.oidc_end_session_url, "OIDC_END_SESSION_URL_INVALID"
-                )
+            self._validate_https_url(
+                self.oidc_end_session_url or "", "OIDC_END_SESSION_URL_INVALID"
+            )
             if not (self.oidc_audience or "").strip():
                 raise DomainError(
                     "OIDC_AUDIENCE_INVALID",
@@ -123,6 +138,31 @@ class Settings:
                 raise DomainError(
                     "OIDC_CLIENT_ID_INVALID",
                     "production OIDC client ID must not be blank",
+                    status=503,
+                )
+            if (
+                len(self.oidc_service_client_ids) != len(set(self.oidc_service_client_ids))
+                or not self.oidc_service_client_ids
+                or any(not item.strip() for item in self.oidc_service_client_ids)
+                or self.oidc_client_id in self.oidc_service_client_ids
+            ):
+                raise DomainError(
+                    "OIDC_SERVICE_CLIENT_IDS_INVALID",
+                    "production OIDC service clients must be unique and separate from the human client",
+                    status=503,
+                )
+            if (
+                not self.oidc_id_token_signing_algorithms
+                or len(self.oidc_id_token_signing_algorithms)
+                != len(set(self.oidc_id_token_signing_algorithms))
+                or any(
+                    item not in SAFE_ID_TOKEN_ALGORITHMS
+                    for item in self.oidc_id_token_signing_algorithms
+                )
+            ):
+                raise DomainError(
+                    "OIDC_ID_TOKEN_ALGORITHMS_INVALID",
+                    "production OIDC ID token algorithms must use an explicit asymmetric allowlist",
                     status=503,
                 )
             if "openid" not in self.oidc_scopes or len(self.oidc_scopes) != len(
@@ -148,6 +188,11 @@ class Settings:
             "issuer": self.oidc_issuer,
             "audience": self.oidc_audience,
             "client_id": self.oidc_client_id,
+            "discovery_endpoint": (
+                (self.oidc_issuer or "").rstrip("/") + "/.well-known/openid-configuration"
+            ),
+            "jwks_uri": self.oidc_jwks_url,
+            "id_token_signing_algorithms": list(self.oidc_id_token_signing_algorithms),
             "authorization_endpoint": self.oidc_authorization_url,
             "token_endpoint": self.oidc_token_url,
             "end_session_endpoint": self.oidc_end_session_url,
@@ -193,9 +238,7 @@ class Settings:
                 "action plane requires a fixed simulator URL and digest",
                 status=503,
             )
-        if self.environment == "production" and not self._valid_digest(
-            self.simulator_digest or ""
-        ):
+        if self.environment == "production" and not self._valid_digest(self.simulator_digest or ""):
             raise DomainError(
                 "SIMULATOR_DIGEST_INVALID",
                 "production requires a non-placeholder simulator identity digest",
@@ -247,12 +290,16 @@ class Settings:
     def _is_secure_postgresql_url(value: str) -> bool:
         normalized = value.replace("postgresql+psycopg://", "postgresql://", 1)
         parsed = urlsplit(normalized)
-        sslmode = parse_qs(parsed.query).get("sslmode", [""])[-1]
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        sslmodes = query.get("sslmode", [])
+        root_certificates = query.get("sslrootcert", [])
         return bool(
             parsed.scheme == "postgresql"
             and parsed.hostname
             and parsed.path.strip("/")
-            and sslmode in {"require", "verify-ca", "verify-full"}
+            and sslmodes == ["verify-full"]
+            and len(root_certificates) == 1
+            and root_certificates[0].strip()
         )
 
     @staticmethod

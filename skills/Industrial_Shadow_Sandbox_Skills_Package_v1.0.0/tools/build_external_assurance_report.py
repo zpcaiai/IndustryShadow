@@ -19,11 +19,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _inside_root(path: Path) -> Path:
+    if path.is_symlink():
+        raise DomainError(
+            "ASSURANCE_ARTIFACT_INVALID",
+            "assurance artifact must not be a symlink",
+        )
     resolved = path.resolve(strict=True)
     if (
         ROOT.resolve() not in resolved.parents
-        or resolved.is_symlink()
         or not resolved.is_file()
+        or resolved.stat().st_nlink != 1
+        or not 1 <= resolved.stat().st_size <= 10 * 1024 * 1024
     ):
         raise DomainError(
             "ASSURANCE_ARTIFACT_INVALID",
@@ -33,6 +39,11 @@ def _inside_root(path: Path) -> Path:
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise DomainError(
+            "ASSURANCE_REPORT_EXISTS",
+            "refusing to overwrite an existing signed assurance report",
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
         prefix=".assurance-report-", dir=path.parent
@@ -42,7 +53,9 @@ def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(canonical_json(payload) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.chmod(temporary, 0o444)
+        os.link(temporary, path)
+        os.unlink(temporary)
     except Exception:
         try:
             os.unlink(temporary)
@@ -70,14 +83,33 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path, action="append", required=True)
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--trust-store", type=Path, required=True)
+    parser.add_argument("--trust-root-attestation", type=Path, required=True)
+    parser.add_argument("--trust-root-public-key", type=Path, required=True)
+    parser.add_argument("--trust-root-key-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    checks_value = json.loads(args.checks.read_text(encoding="utf-8"))
+    checks_path = _inside_root(args.checks)
+    checks_value = json.loads(checks_path.read_text(encoding="utf-8"))
     checks = checks_value.get("checks", ()) if isinstance(checks_value, Mapping) else ()
     if not isinstance(checks, list):
         raise DomainError(
             "ASSURANCE_CHECKS_INVALID", "checks file must contain a checks list"
+        )
+    required = ExternalAssuranceImporter.REQUIRED_CHECKS[args.gate]
+    by_name = {
+        str(item.get("name", "")): item
+        for item in checks
+        if isinstance(item, Mapping)
+    }
+    if set(by_name) != set(required) or any(
+        item.get("passed") is not True
+        or item.get("details") != {"artifact_kind": name}
+        for name, item in by_name.items()
+    ):
+        raise DomainError(
+            "ASSURANCE_CHECKS_INVALID",
+            "checks must bind every exact required control to one artifact kind",
         )
     artifacts = []
     observed: set[Path] = set()
@@ -88,15 +120,41 @@ def main() -> int:
                 "ASSURANCE_ARTIFACT_INVALID", "assurance artifacts are duplicated"
             )
         observed.add(path)
+        try:
+            artifact_value = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise DomainError(
+                "ASSURANCE_ARTIFACT_INVALID", "assurance artifacts must be structured JSON"
+            ) from error
+        if not isinstance(artifact_value, Mapping):
+            raise DomainError(
+                "ASSURANCE_ARTIFACT_INVALID", "assurance artifact must be an object"
+            )
+        kind = str(artifact_value.get("artifact_kind", ""))
         artifacts.append(
             {
+                "kind": kind,
                 "path": str(path.relative_to(ROOT)),
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "media_type": "application/json",
             }
+        )
+    if {str(item["kind"]) for item in artifacts} != set(required) or len(artifacts) != len(
+        required
+    ):
+        raise DomainError(
+            "ASSURANCE_ARTIFACT_INVALID",
+            "one exact structured artifact is required for each assurance control",
         )
 
     key_path = args.private_key.resolve(strict=True)
-    if stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+    if (
+        args.private_key.is_symlink()
+        or not key_path.is_file()
+        or key_path.stat().st_nlink != 1
+        or not 1 <= key_path.stat().st_size <= 1024 * 1024
+        or stat.S_IMODE(key_path.stat().st_mode) & 0o077
+    ):
         raise DomainError(
             "ASSURANCE_KEY_PERMISSIONS_INVALID",
             "assurance signing key must not be accessible to group or other users",
@@ -117,9 +175,14 @@ def main() -> int:
     public = private.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
-    trust_store = SignerTrustStore.load(args.trust_store)
+    trust_store = SignerTrustStore.load_verified(
+        args.trust_store,
+        root_attestation_path=args.trust_root_attestation,
+        root_public_key_path=args.trust_root_public_key,
+        expected_root_key_sha256=args.trust_root_key_sha256,
+    )
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "gate": args.gate,
         "assessment_id": args.assessment_id,
         "assessor": args.assessor,

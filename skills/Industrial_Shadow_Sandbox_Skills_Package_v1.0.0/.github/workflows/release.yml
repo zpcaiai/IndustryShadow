@@ -9,6 +9,8 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   verify-executable-gates:
@@ -54,7 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       REGISTRY: ghcr.io
-      GHCR_TOKEN: ${{ github.token }}
+      PYTHONPATH: backend/src:services/simulator/src:services/collector/src:services/edge-gateway/src
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
@@ -64,6 +66,8 @@ jobs:
           echo "BACKEND_IMAGE=$REGISTRY/$repository/backend" >> "$GITHUB_ENV"
           echo "WEB_IMAGE=$REGISTRY/$repository/web" >> "$GITHUB_ENV"
       - name: Authenticate to the candidate registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
         run: printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" --username "${{ github.actor }}" --password-stdin
       - name: Build and publish immutable backend candidate
         id: backend
@@ -85,39 +89,171 @@ jobs:
           tags: ${{ env.WEB_IMAGE }}:${{ github.sha }}
           provenance: mode=max
           sbom: true
-      - name: Write immutable candidate coordinates
+      - name: Prepare immutable release bundle directories
+        run: mkdir -p artifacts/release/sbom
+      - name: Generate backend SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ env.BACKEND_IMAGE }}@${{ steps.backend.outputs.digest }}
+          output-file: artifacts/release/sbom/backend.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Generate web SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ env.WEB_IMAGE }}@${{ steps.web.outputs.digest }}
+          output-file: artifacts/release/sbom/web.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest backend provenance
+        id: backend-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: ${{ env.BACKEND_IMAGE }}
+          subject-digest: ${{ steps.backend.outputs.digest }}
+          push-to-registry: true
+      - name: Attest backend SBOM
+        id: backend-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: ${{ env.BACKEND_IMAGE }}
+          subject-digest: ${{ steps.backend.outputs.digest }}
+          sbom-path: artifacts/release/sbom/backend.spdx.json
+          push-to-registry: true
+      - name: Attest web provenance
+        id: web-provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: ${{ env.WEB_IMAGE }}
+          subject-digest: ${{ steps.web.outputs.digest }}
+          push-to-registry: true
+      - name: Attest web SBOM
+        id: web-sbom
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: ${{ env.WEB_IMAGE }}
+          subject-digest: ${{ steps.web.outputs.digest }}
+          sbom-path: artifacts/release/sbom/web.spdx.json
+          push-to-registry: true
+      - name: Write immutable candidate, migration contract, and attestation bundle
         env:
           BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
           WEB_DIGEST: ${{ steps.web.outputs.digest }}
+          BACKEND_PROVENANCE_BUNDLE: ${{ steps.backend-provenance.outputs.bundle-path }}
+          BACKEND_SBOM_BUNDLE: ${{ steps.backend-sbom.outputs.bundle-path }}
+          WEB_PROVENANCE_BUNDLE: ${{ steps.web-provenance.outputs.bundle-path }}
+          WEB_SBOM_BUNDLE: ${{ steps.web-sbom.outputs.bundle-path }}
         run: |
           python - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
 
-          output = Path("artifacts/release-candidate.json")
-          output.parent.mkdir(parents=True, exist_ok=True)
-          output.write_text(
-              json.dumps(
-                  {
-                      "schema_version": 1,
-                      "source_revision": os.environ["GITHUB_SHA"],
-                      "backend_image": os.environ["BACKEND_IMAGE"] + "@" + os.environ["BACKEND_DIGEST"],
-                      "web_image": os.environ["WEB_IMAGE"] + "@" + os.environ["WEB_DIGEST"],
-                  },
-                  sort_keys=True,
-                  separators=(",", ":"),
+          from shadow_sandbox.common.models import canonical_digest
+          from tools.source_integrity import source_digest
+
+          root = Path("artifacts/release")
+          attestations = root / "attestations"
+          attestations.mkdir(parents=True, exist_ok=True)
+          bundles = {
+              "backend_provenance": Path(os.environ["BACKEND_PROVENANCE_BUNDLE"]),
+              "backend_sbom": Path(os.environ["BACKEND_SBOM_BUNDLE"]),
+              "web_provenance": Path(os.environ["WEB_PROVENANCE_BUNDLE"]),
+              "web_sbom": Path(os.environ["WEB_SBOM_BUNDLE"]),
+          }
+          copied = {}
+          for name, source in bundles.items():
+              if not source.is_file() or source.is_symlink():
+                  raise SystemExit(f"missing attestation bundle: {name}")
+              target = attestations / f"{name}.json"
+              target.write_bytes(source.read_bytes())
+              copied[name] = target
+
+          digest = source_digest()
+          contract = json.loads(
+              Path("deploy/production/postgresql-migration-contract.json").read_text(
+                  encoding="utf-8"
               )
-              + "\n",
+          )
+          if set(contract) != {
+              "schema_version", "prior_head", "candidate_head", "protected_tables"
+          }:
+              raise SystemExit("migration contract fields are invalid")
+          migration = {
+              **contract,
+              "source_revision": os.environ["GITHUB_SHA"],
+              "source_digest": digest,
+              "manifest_digest": "",
+          }
+          migration["manifest_digest"] = canonical_digest(migration)
+          migration_path = root / "postgresql-migration-manifest.json"
+          migration_path.write_text(
+              json.dumps(migration, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+
+          def artifact(path: Path) -> dict[str, str]:
+              return {
+                  "path": path.relative_to(root).as_posix(),
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+
+          candidate = {
+              "schema_version": 2,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "release_run_id": os.environ["GITHUB_RUN_ID"],
+              "release_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "source_revision": os.environ["GITHUB_SHA"],
+              "source_digest": digest,
+              "backend_image": os.environ["BACKEND_IMAGE"] + "@" + os.environ["BACKEND_DIGEST"],
+              "web_image": os.environ["WEB_IMAGE"] + "@" + os.environ["WEB_DIGEST"],
+              "backend_sbom": artifact(root / "sbom/backend.spdx.json"),
+              "web_sbom": artifact(root / "sbom/web.spdx.json"),
+              "postgresql_migration_manifest": artifact(migration_path),
+              "attestations": {
+                  name: {
+                      **artifact(path),
+                      "predicate_type": (
+                          "https://spdx.dev/Document/v2.3"
+                          if name.endswith("_sbom")
+                          else "https://slsa.dev/provenance/v1"
+                      ),
+                  }
+                  for name, path in copied.items()
+              },
+              "manifest_digest": "",
+          }
+          candidate["manifest_digest"] = canonical_digest(candidate)
+          output = root / "release-candidate.json"
+          output.write_text(
+              json.dumps(candidate, sort_keys=True, separators=(",", ":")) + "\n",
               encoding="utf-8",
           )
           PY
+      - name: Attest the immutable candidate manifest
+        id: candidate-manifest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: artifacts/release/release-candidate.json
+      - name: Seal and self-validate the complete release bundle
+        env:
+          CANDIDATE_BUNDLE: ${{ steps.candidate-manifest.outputs.bundle-path }}
+        run: |
+          install -m 0444 "$CANDIDATE_BUNDLE" artifacts/release/candidate-manifest.attestation.json
+          python tools/export_release_candidate.py \
+            --manifest artifacts/release/release-candidate.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: immutable-release-candidate
-          path: artifacts/release-candidate.json
+          path: artifacts/release
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
       - name: Remove candidate registry login
         if: always()
         run: docker logout "$REGISTRY"

@@ -46,6 +46,7 @@ REPORT_KEYS = frozenset(
         "candidate_image",
         "build_digest",
         "simulator_build_digest",
+        "deployment_plan_digest",
         "suite_digest",
         "bundle_digest",
         "result_digest",
@@ -83,9 +84,34 @@ TARGET_PROFILE_KEYS = frozenset(
         "memory_bytes",
         "orchestrator_version",
         "cluster_uid_digest",
+        "kubernetes_api_ca_digest",
+        "aws_account_id",
+        "aws_region",
+        "s3_bucket",
+        "s3_probe_prefix",
+        "snapshot_object_storage_prefix",
+        "backup_object_storage_prefix",
+        "kms_key_id_digest",
+        "backup_restore_receipt_digest",
+        "backup_workload_identity_arn_digest",
+        "snapshot_workload_identity_arn_digest",
+        "oidc_issuer",
+        "oidc_audience_digest",
+        "oidc_human_client_id_digest",
+        "oidc_service_client_ids_digest",
+        "managed_postgresql_provider",
+        "managed_postgresql_source_resource_digest",
+        "managed_postgresql_restore_resource_digest",
+        "managed_postgresql_source_coordinate_digest",
+        "managed_postgresql_restore_coordinate_digest",
+        "managed_postgresql_source_kms_key_digest",
+        "managed_postgresql_restore_kms_key_digest",
+        "managed_postgresql_source_ca_identifier_digest",
+        "managed_postgresql_restore_ca_identifier_digest",
         "candidate_image",
         "build_digest",
         "simulator_build_digest",
+        "deployment_plan_digest",
     }
 )
 
@@ -102,6 +128,7 @@ class FormalBenchmarkImporter:
         simulator_build_digest: str,
         trust_store: SignerTrustStore | None = None,
         environment_digest: str | None = None,
+        deployment_plan_digest: str | None = None,
     ) -> None:
         self.root = Path(repository_root).resolve()
         if not re.fullmatch(r"[^@\s]+@sha256:[a-f0-9]{64}", candidate_image):
@@ -117,6 +144,7 @@ class FormalBenchmarkImporter:
         self.simulator_build_digest = simulator_build_digest
         self.trust_store = trust_store
         self.environment_digest = environment_digest
+        self.deployment_plan_digest = deployment_plan_digest
         self.episodes = expand_mvp_benchmark()
         self.episodes_by_id = {item.episode_id: item for item in self.episodes}
         self.suite_digest = canonical_digest([asdict(item) for item in self.episodes])
@@ -134,12 +162,18 @@ class FormalBenchmarkImporter:
         if set(item) != {"kind", "path", "sha256"} or not DIGEST.fullmatch(
             str(item.get("sha256", ""))
         ):
-            raise DomainError(
-                "FORMAL_BENCHMARK_ARTIFACT_INVALID", "artifact fields are invalid"
-            )
+            raise DomainError("FORMAL_BENCHMARK_ARTIFACT_INVALID", "artifact fields are invalid")
         kind = str(item.get("kind", ""))
-        path = (self.root / str(item.get("path", ""))).resolve(strict=True)
-        if self.root not in path.parents or path.is_symlink():
+        source = self.root / str(item.get("path", ""))
+        if source.is_symlink():
+            raise DomainError("FORMAL_BENCHMARK_ARTIFACT_INVALID", "artifact is a symlink")
+        path = source.resolve(strict=True)
+        if (
+            self.root not in path.parents
+            or not path.is_file()
+            or path.stat().st_nlink != 1
+            or not 1 <= path.stat().st_size <= 64 * 1024 * 1024
+        ):
             raise DomainError("FORMAL_BENCHMARK_ARTIFACT_INVALID", "artifact is outside repository")
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         return (
@@ -265,9 +299,7 @@ class FormalBenchmarkImporter:
     def _validate_target_profile(self, path: Path) -> Mapping[str, Any]:
         profile = self._json_object(path, "FORMAL_TARGET_PROFILE_INVALID")
         try:
-            collected = dt.datetime.fromisoformat(
-                str(profile.get("collected_at", ""))
-            )
+            collected = dt.datetime.fromisoformat(str(profile.get("collected_at", "")))
         except ValueError as error:
             raise DomainError(
                 "FORMAL_TARGET_PROFILE_INVALID", "target profile timestamp is invalid"
@@ -287,13 +319,66 @@ class FormalBenchmarkImporter:
             or int(profile["memory_bytes"]) < 512 * 1024 * 1024
             or not str(profile.get("orchestrator_version", "")).strip()
             or not DIGEST.fullmatch(str(profile.get("cluster_uid_digest", "")))
+            or not DIGEST.fullmatch(str(profile.get("kubernetes_api_ca_digest", "")))
+            or not re.fullmatch(r"\d{12}", str(profile.get("aws_account_id", "")))
+            or not re.fullmatch(
+                r"[a-z]{2}(?:-gov)?-[a-z]+-[1-9][0-9]*",
+                str(profile.get("aws_region", "")),
+            )
+            or not re.fullmatch(
+                r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]",
+                str(profile.get("s3_bucket", "")),
+            )
+            or any(
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,511}", str(profile.get(name, "")))
+                or "//" in str(profile.get(name, ""))
+                or any(part in {"", ".", ".."} for part in str(profile.get(name, "")).split("/"))
+                for name in (
+                    "s3_probe_prefix",
+                    "snapshot_object_storage_prefix",
+                    "backup_object_storage_prefix",
+                )
+            )
+            or len(
+                {
+                    str(profile.get(name, ""))
+                    for name in (
+                        "s3_probe_prefix",
+                        "snapshot_object_storage_prefix",
+                        "backup_object_storage_prefix",
+                    )
+                }
+            )
+            != 3
+            or not str(profile.get("oidc_issuer", "")).startswith("https://")
+            or any(
+                not DIGEST.fullmatch(str(profile.get(name, "")))
+                for name in (
+                    "kms_key_id_digest",
+                    "backup_restore_receipt_digest",
+                    "backup_workload_identity_arn_digest",
+                    "snapshot_workload_identity_arn_digest",
+                    "oidc_audience_digest",
+                    "oidc_human_client_id_digest",
+                    "oidc_service_client_ids_digest",
+                    "managed_postgresql_source_resource_digest",
+                    "managed_postgresql_restore_resource_digest",
+                    "managed_postgresql_source_coordinate_digest",
+                    "managed_postgresql_restore_coordinate_digest",
+                    "managed_postgresql_source_kms_key_digest",
+                    "managed_postgresql_restore_kms_key_digest",
+                    "managed_postgresql_source_ca_identifier_digest",
+                    "managed_postgresql_restore_ca_identifier_digest",
+                    "deployment_plan_digest",
+                )
+            )
+            or profile.get("managed_postgresql_provider") != "aws-rds"
             or profile.get("candidate_image") != self.candidate_image
             or profile.get("build_digest") != self.build_digest
             or profile.get("simulator_build_digest") != self.simulator_build_digest
+            or profile.get("deployment_plan_digest") != self.deployment_plan_digest
         ):
-            raise DomainError(
-                "FORMAL_TARGET_PROFILE_INVALID", "target profile contract is invalid"
-            )
+            raise DomainError("FORMAL_TARGET_PROFILE_INVALID", "target profile contract is invalid")
         return profile
 
     def _validate_measurement_log(
@@ -305,12 +390,8 @@ class FormalBenchmarkImporter:
     ) -> Mapping[str, Any]:
         log = self._json_object(path, "FORMAL_MEASUREMENT_LOG_INVALID")
         try:
-            started = dt.datetime.fromisoformat(
-                str(log.get("started_at", ""))
-            )
-            completed = dt.datetime.fromisoformat(
-                str(log.get("completed_at", ""))
-            )
+            started = dt.datetime.fromisoformat(str(log.get("started_at", "")))
+            completed = dt.datetime.fromisoformat(str(log.get("completed_at", "")))
         except ValueError as error:
             raise DomainError(
                 "FORMAL_MEASUREMENT_LOG_INVALID", "measurement timestamps are invalid"
@@ -381,6 +462,8 @@ class FormalBenchmarkImporter:
                 started_time.tzinfo is not None
                 and completed_time.tzinfo is not None
                 and completed_time >= started_time
+                and completed_time <= dt.datetime.now(dt.UTC) + dt.timedelta(minutes=5)
+                and dt.datetime.now(dt.UTC) - completed_time <= dt.timedelta(days=90)
             )
         except ValueError:
             valid_times = False
@@ -401,6 +484,13 @@ class FormalBenchmarkImporter:
             raise DomainError(
                 "FORMAL_BENCHMARK_ENVIRONMENT_REQUIRED",
                 "an exact target environment digest is required",
+            )
+        if not self.deployment_plan_digest or not DIGEST.fullmatch(
+            self.deployment_plan_digest
+        ):
+            raise DomainError(
+                "FORMAL_BENCHMARK_DEPLOYMENT_PLAN_REQUIRED",
+                "an exact deployment plan digest is required",
             )
         signer_fingerprint = self.trust_store.verify_signer(
             identity=str(report.get("assessor", "")),
@@ -424,9 +514,7 @@ class FormalBenchmarkImporter:
                 "exactly one Episode, measurement-log, and target-profile artifact is required",
             )
         evaluation, result_digest = self.evaluate_results(by_kind["episode_results"])
-        target_profile_digest = hashlib.sha256(
-            by_kind["target_profile"].read_bytes()
-        ).hexdigest()
+        target_profile_digest = hashlib.sha256(by_kind["target_profile"].read_bytes()).hexdigest()
         target_profile = self._validate_target_profile(by_kind["target_profile"])
         measurement_log = self._validate_measurement_log(
             by_kind["measurement_log"],
@@ -444,14 +532,17 @@ class FormalBenchmarkImporter:
             and report.get("candidate_image") == self.candidate_image
             and report.get("build_digest") == self.build_digest
             and report.get("simulator_build_digest") == self.simulator_build_digest
+            and report.get("deployment_plan_digest")
+            == self.deployment_plan_digest
             and report.get("suite_digest") == self.suite_digest
             and report.get("bundle_digest") == self.bundle_digest
             and report.get("result_digest") == result_digest
             and report.get("evaluation_digest") == evaluation.digest
             and report.get("certification_digest") == gate.certification_digest
-            and report.get("target_profile_digest")
-            == target_profile_digest
+            and report.get("target_profile_digest") == target_profile_digest
             and report.get("target_profile_digest") == self.environment_digest
+            and target_profile.get("deployment_plan_digest")
+            == self.deployment_plan_digest
             and measurement_log.get("run_id") == report.get("benchmark_id")
             and measurement_log.get("started_at") == started
             and measurement_log.get("completed_at") == completed
@@ -484,6 +575,7 @@ class FormalBenchmarkImporter:
                 "trust_store_digest": self.trust_store.digest,
                 "signer_fingerprint": signer_fingerprint,
                 "environment_digest": self.environment_digest,
+                "deployment_plan_digest": self.deployment_plan_digest,
             },
             checks=checks,
             metrics={

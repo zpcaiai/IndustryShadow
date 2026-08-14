@@ -1,8 +1,10 @@
 {
   "endpoint_uri": "opc.tcp://replace-with-approved-readonly-endpoint:4840",
   "application_uri": "urn:replace-with-approved-application",
+  "client_application_uri": "urn:replace-with-approved-real-ot-collector",
   "namespace_uri": "urn:replace-with-approved-namespace",
   "certificate_fingerprint": "replace-with-approved-sha256-fingerprint",
+  "client_certificate_fingerprint": "replace-with-approved-client-sha256-fingerprint",
   "node_ids": ["ns=2;s=replace-with-approved-readonly-node"],
   "allowed_security_policies": ["Basic256Sha256", "Aes256_Sha256_RsaPss"],
   "sampling_interval_ms": 500,

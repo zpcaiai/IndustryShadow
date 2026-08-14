@@ -95,8 +95,15 @@ def sign_approval(
         raise DomainError(
             "CLOSURE_SIGNATORY_INVALID", "signatory identity or role is invalid"
         )
-    key_path = Path(private_key_path).resolve(strict=True)
-    if stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+    key_source = Path(private_key_path)
+    key_path = key_source.resolve(strict=True)
+    if (
+        key_source.is_symlink()
+        or not key_path.is_file()
+        or key_path.stat().st_nlink != 1
+        or not 1 <= key_path.stat().st_size <= 1024 * 1024
+        or stat.S_IMODE(key_path.stat().st_mode) & 0o077
+    ):
         raise DomainError(
             "CLOSURE_KEY_PERMISSIONS_INVALID",
             "closure signing key must not be accessible to group or other users",
@@ -161,6 +168,9 @@ def main() -> int:
     )
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--trust-store", type=Path, required=True)
+    parser.add_argument("--trust-root-attestation", type=Path, required=True)
+    parser.add_argument("--trust-root-public-key", type=Path, required=True)
+    parser.add_argument("--trust-root-key-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--append",
@@ -169,11 +179,35 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    trust_store = SignerTrustStore.load(args.trust_store)
+    trust_store = SignerTrustStore.load_verified(
+        args.trust_store,
+        root_attestation_path=args.trust_root_attestation,
+        root_public_key_path=args.trust_root_public_key,
+        expected_root_key_sha256=args.trust_root_key_sha256,
+    )
+    if (
+        args.approval_request.is_symlink()
+        or not args.approval_request.is_file()
+        or args.approval_request.stat().st_nlink != 1
+        or not 1 <= args.approval_request.stat().st_size <= 4 * 1024 * 1024
+    ):
+        raise DomainError(
+            "CLOSURE_APPROVAL_INVALID", "approval request must be a safe regular file"
+        )
     approval_value = json.loads(args.approval_request.read_text(encoding="utf-8"))
     approval = validate_approval(approval_value, trust_store)
     existing: list[Mapping[str, Any]] = []
     if args.append:
+        if (
+            args.output.is_symlink()
+            or not args.output.is_file()
+            or args.output.stat().st_nlink != 1
+            or not 1 <= args.output.stat().st_size <= 4 * 1024 * 1024
+        ):
+            raise DomainError(
+                "CLOSURE_SIGNATURE_FILE_INVALID",
+                "existing signature file must be a safe regular file",
+            )
         try:
             current = json.loads(args.output.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:

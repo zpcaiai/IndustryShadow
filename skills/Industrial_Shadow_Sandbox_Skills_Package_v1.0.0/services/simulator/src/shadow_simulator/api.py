@@ -71,6 +71,14 @@ def create_app(database_path: str | None = None) -> Any:
             "production simulator snapshots require an explicit KMS key",
             status=503,
         )
+    if environment == "production" and not os.environ.get(
+        "SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX", ""
+    ).strip():
+        raise DomainError(
+            "PRODUCTION_SNAPSHOT_PREFIX_REQUIRED",
+            "production simulator snapshots require a dedicated object prefix",
+            status=503,
+        )
     internal_token = os.environ.get("SHADOW_INTERNAL_SERVICE_TOKEN")
     if environment == "production" and (not internal_token or len(internal_token) < 32):
         raise DomainError(
@@ -90,7 +98,7 @@ def create_app(database_path: str | None = None) -> Any:
         region=os.environ.get("SHADOW_OBJECT_STORAGE_REGION"),
         endpoint_url=os.environ.get("SHADOW_OBJECT_STORAGE_ENDPOINT"),
         prefix=os.environ.get(
-            "SHADOW_OBJECT_STORAGE_PREFIX", "industrial-shadow/simulator"
+            "SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX", "industrial-shadow/simulator"
         ),
         kms_key_id=os.environ.get("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
         kms_encryption_context={

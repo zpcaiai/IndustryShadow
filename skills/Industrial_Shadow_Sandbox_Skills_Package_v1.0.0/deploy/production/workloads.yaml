@@ -8,6 +8,7 @@ spec:
   template:
     metadata: {labels: {app: control-api, plane: control}}
     spec:
+      serviceAccountName: shadow-control-api
       automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
@@ -17,7 +18,13 @@ spec:
           envFrom:
             - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-release-coordinates}
-            - secretRef: {name: shadow-api-secrets}
+          env:
+            - name: SHADOW_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shadow-api-secrets, key: SHADOW_DATABASE_URL}
+            - name: SHADOW_INTERNAL_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: shadow-api-secrets, key: SHADOW_INTERNAL_SERVICE_TOKEN}
           ports: [{name: http, containerPort: 8000}]
           readinessProbe: {httpGet: {path: /api/v1/health/ready, port: http}, periodSeconds: 10}
           livenessProbe: {httpGet: {path: /api/v1/health/live, port: http}, periodSeconds: 20}
@@ -51,6 +58,7 @@ spec:
   template:
     metadata: {labels: {app: worker, plane: data}}
     spec:
+      serviceAccountName: shadow-worker
       automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
@@ -60,7 +68,10 @@ spec:
           envFrom:
             - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-release-coordinates}
-            - secretRef: {name: shadow-worker-secrets}
+          env:
+            - name: SHADOW_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shadow-worker-secrets, key: SHADOW_DATABASE_URL}
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 2Gi}
@@ -78,6 +89,7 @@ spec:
   template:
     metadata: {labels: {app: action-executor, plane: action}}
     spec:
+      serviceAccountName: shadow-action-executor
       automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
@@ -87,7 +99,13 @@ spec:
           envFrom:
             - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-release-coordinates}
-            - secretRef: {name: shadow-action-secrets}
+          env:
+            - name: SHADOW_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shadow-action-secrets, key: SHADOW_DATABASE_URL}
+            - name: SHADOW_INTERNAL_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: shadow-action-secrets, key: SHADOW_INTERNAL_SERVICE_TOKEN}
           ports: [{name: http, containerPort: 8020}]
           resources:
             requests: {cpu: 100m, memory: 256Mi}
@@ -123,8 +141,10 @@ spec:
           envFrom:
             - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-release-coordinates}
-            - secretRef: {name: shadow-simulator-secrets}
           env:
+            - name: SHADOW_INTERNAL_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef: {name: shadow-simulator-secrets, key: SHADOW_INTERNAL_SERVICE_TOKEN}
             - {name: SHADOW_DATABASE_PATH, value: /var/lib/shadow/simulator.db}
             - {name: SHADOW_OPCUA_CERTIFICATE_PATH, value: /var/run/shadow-pki/server.crt}
             - {name: SHADOW_OPCUA_PRIVATE_KEY_PATH, value: /var/run/shadow-pki/server.key}
@@ -162,30 +182,101 @@ spec:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: collector}
+metadata: {name: real-ot-collector}
 spec:
   replicas: 1
   strategy: {type: Recreate}
-  selector: {matchLabels: {app: collector}}
+  selector: {matchLabels: {app: real-ot-collector}}
   template:
-    metadata: {labels: {app: collector, plane: collector}}
+    metadata: {labels: {app: real-ot-collector, plane: collector, collector-target: real-ot}}
     spec:
+      serviceAccountName: shadow-real-ot-collector
       automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
-        - name: collector
+        - name: real-ot-collector
           image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
           args: ["python", "-m", "shadow_collector.runner"]
           envFrom:
             - configMapRef: {name: shadow-runtime}
-            - configMapRef: {name: shadow-collector-binding}
-            - secretRef: {name: shadow-collector-secrets}
+            - configMapRef: {name: shadow-real-ot-collector-binding}
+          env:
+            - name: SHADOW_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shadow-real-ot-collector-secrets, key: SHADOW_DATABASE_URL}
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 2Gi}
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os,time;ps=('/tmp/collector-session-health','/tmp/collector-ingestion-health');raise SystemExit(0 if all(os.path.isfile(p) for p in ps) and time.time()-os.path.getmtime(ps[0])<20 and time.time()-os.path.getmtime(ps[1])<180 else 1)"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,time;p='/tmp/collector-session-health';raise SystemExit(0 if os.path.isfile(p) and time.time()-os.path.getmtime(p)<45 else 1)"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-          volumeMounts: [{name: tmp, mountPath: /tmp}]
-      volumes: [{name: tmp, emptyDir: {sizeLimit: 256Mi}}]
+          volumeMounts:
+            - {name: client-pki-current, mountPath: /var/run/shadow-pki/current, readOnly: true}
+            - {name: client-pki-next, mountPath: /var/run/shadow-pki/next, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: client-pki-current
+          secret: {secretName: shadow-real-ot-collector-pki-current, defaultMode: 0440}
+        - name: client-pki-next
+          secret: {secretName: shadow-real-ot-collector-pki-next, defaultMode: 0440}
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: simulator-collector}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: simulator-collector}}
+  template:
+    metadata: {labels: {app: simulator-collector, plane: collector, collector-target: simulator}}
+    spec:
+      serviceAccountName: shadow-simulator-collector
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: simulator-collector
+          image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["python", "-m", "shadow_collector.runner"]
+          envFrom:
+            - configMapRef: {name: shadow-runtime}
+            - configMapRef: {name: shadow-simulator-collector-binding}
+          env:
+            - name: SHADOW_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: shadow-simulator-collector-secrets, key: SHADOW_DATABASE_URL}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import os,time;ps=('/tmp/collector-session-health','/tmp/collector-ingestion-health');raise SystemExit(0 if all(os.path.isfile(p) for p in ps) and time.time()-os.path.getmtime(ps[0])<20 and time.time()-os.path.getmtime(ps[1])<180 else 1)"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os,time;p='/tmp/collector-session-health';raise SystemExit(0 if os.path.isfile(p) and time.time()-os.path.getmtime(p)<45 else 1)"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: client-pki-current, mountPath: /var/run/shadow-pki/current, readOnly: true}
+            - {name: client-pki-next, mountPath: /var/run/shadow-pki/next, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: client-pki-current
+          secret: {secretName: shadow-simulator-collector-pki-current, defaultMode: 0440}
+        - name: client-pki-next
+          secret: {secretName: shadow-simulator-collector-pki-next, defaultMode: 0440}
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -196,6 +287,7 @@ spec:
   template:
     metadata: {labels: {app: web, plane: ingress}}
     spec:
+      serviceAccountName: shadow-web
       automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 101, runAsGroup: 101, fsGroup: 101, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:

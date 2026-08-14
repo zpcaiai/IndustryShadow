@@ -9,14 +9,44 @@
     "status": {"const": "verified"},
     "approval": {
       "type": "object",
-      "required": ["schema_version", "acceptance_run_id", "release_digest", "trust_store_digest", "gate_digests", "attestation_digests", "release_coordinates", "scope", "exclusions", "approval_digest"]
+      "additionalProperties": false,
+      "required": ["schema_version", "acceptance_run_id", "release_digest", "trust_store_digest", "gate_digests", "attestation_digests", "release_coordinates", "scope", "exclusions", "approval_digest"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "acceptance_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+        "release_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "trust_store_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "gate_digests": {
+          "type": "object", "minProperties": 17, "maxProperties": 17,
+          "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        },
+        "attestation_digests": {
+          "type": "object", "minProperties": 4, "maxProperties": 4,
+          "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        },
+        "release_coordinates": {
+          "type": "object", "additionalProperties": false,
+          "required": ["candidate_image", "build_digest", "simulator_build_digest", "environment_digest", "deployment_plan_digest"],
+          "properties": {
+            "candidate_image": {"type": "string", "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"},
+            "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "simulator_build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "environment_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "deployment_plan_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+          }
+        },
+        "scope": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "exclusions": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "approval_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
     },
     "gates": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["production_preflight", "postgresql_migration", "backup_restore", "oidc", "s3", "opcua_interoperability", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"],
+      "required": ["production_preflight", "supply_chain", "postgresql_migration", "backup_restore", "oidc", "s3", "opcua_interoperability", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"],
       "properties": {
         "production_preflight": {"const": "PASSED"},
+        "supply_chain": {"const": "PASSED"},
         "postgresql_migration": {"const": "PASSED"},
         "backup_restore": {"const": "PASSED"},
         "oidc": {"const": "PASSED"},
@@ -45,13 +75,14 @@
     },
     "artifacts": {
       "type": "array",
-      "minItems": 15,
+      "minItems": 17,
+      "maxItems": 17,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["gate", "path", "sha256", "evidence_digest"],
         "properties": {
-          "gate": {"enum": ["preflight", "oidc", "backup_restore", "s3", "external_ca", "real_ot", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"]},
+          "gate": {"enum": ["preflight", "supply_chain", "postgresql_migration", "oidc", "backup_restore", "s3", "external_ca", "real_ot", "network_policy", "container_scan", "security", "resilience", "performance", "privacy", "accessibility", "upgrade_rollback", "benchmark_150"]},
           "path": {"type": "string"},
           "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
           "evidence_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}

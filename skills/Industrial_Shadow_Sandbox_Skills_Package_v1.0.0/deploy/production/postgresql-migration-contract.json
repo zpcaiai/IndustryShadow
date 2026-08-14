@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "prior_head": 2,
+  "candidate_head": 3,
+  "protected_tables": [
+    "artifacts",
+    "audit_records",
+    "domain_resources",
+    "outbox",
+    "runs"
+  ]
+}

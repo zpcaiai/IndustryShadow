@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version", "benchmark_id", "assessor", "started_at", "completed_at",
-    "candidate_image", "build_digest", "simulator_build_digest", "suite_digest",
+    "candidate_image", "build_digest", "simulator_build_digest", "deployment_plan_digest", "suite_digest",
     "bundle_digest", "result_digest", "evaluation_digest", "certification_digest",
     "target_profile_digest", "artifacts", "limitations", "public_key_b64",
     "report_digest", "signature_b64"
@@ -19,6 +19,7 @@
     "candidate_image": {"type": "string", "pattern": "^[^@\\s]+@sha256:[a-f0-9]{64}$"},
     "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "simulator_build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "deployment_plan_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "suite_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "bundle_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "result_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},

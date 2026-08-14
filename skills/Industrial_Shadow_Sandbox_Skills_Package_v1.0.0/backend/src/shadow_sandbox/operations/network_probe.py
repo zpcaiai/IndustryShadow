@@ -10,7 +10,7 @@ import socket
 import subprocess
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,37 @@ from typing import Any
 from shadow_sandbox.common.models import DomainError, canonical_digest, canonical_json, utc_now
 
 from .evidence import GateCheck, GateEvidence, complete
+from .production_deployment import (
+    ProductionDeploymentPlan,
+    cluster_identity,
+    validate_exact_rbac,
+)
+
+CommandRunner = Callable[[Sequence[str], int], str]
+PROBE_RBAC = frozenset(
+    {
+        ("", "pods", "create"),
+        ("", "pods", "delete"),
+        ("", "pods", "get"),
+        ("", "pods/log", "get"),
+        ("networking.k8s.io", "networkpolicies", "get"),
+        ("networking.k8s.io", "networkpolicies", "list"),
+    }
+)
+
+
+def _run(command: Sequence[str], timeout: int) -> str:
+    completed = subprocess.run(
+        list(command), capture_output=True, text=True, timeout=timeout, check=False
+    )
+    if completed.returncode:
+        raise DomainError(
+            "NETWORK_PROBE_COMMAND_FAILED",
+            "network probe Kubernetes command failed",
+            {"exit_code": completed.returncode},
+            status=503,
+        )
+    return completed.stdout
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +96,8 @@ def validate_policy_contract(path: str | Path) -> tuple[GateCheck, ...]:
         "control-api-ingress",
         "action-plane",
         "simulator-plane",
-        "collector-read-only-egress",
+        "real-ot-collector-read-only-egress",
+        "simulator-collector-read-only-egress",
         "data-jobs-egress",
     }
     return (
@@ -77,7 +109,11 @@ def validate_policy_contract(path: str | Path) -> tuple[GateCheck, ...]:
 
 
 def validate_live_policy_contract(
-    namespace: str, path: str | Path
+    namespace: str,
+    path: str | Path,
+    *,
+    context: str,
+    runner: CommandRunner = _run,
 ) -> tuple[GateCheck, ...]:
     import yaml  # type: ignore[import-untyped]
 
@@ -86,19 +122,22 @@ def validate_live_policy_contract(
         for item in yaml.safe_load_all(Path(path).read_text(encoding="utf-8"))
         if item and item.get("kind") == "NetworkPolicy"
     }
-    completed = subprocess.run(
-        ("kubectl", "-n", namespace, "get", "networkpolicy", "-o", "json"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if completed.returncode:
-        raise DomainError(
-            "NETWORK_POLICY_READ_FAILED", "could not read live NetworkPolicies", status=503
+    payload = json.loads(
+        runner(
+            (
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "get",
+                "networkpolicy",
+                "-o",
+                "json",
+            ),
+            60,
         )
-    payload = json.loads(completed.stdout)
+    )
     live = {
         str(item.get("metadata", {}).get("name")): item.get("spec", {})
         for item in payload.get("items", ())
@@ -108,35 +147,35 @@ def validate_live_policy_contract(
         GateCheck(
             "live_policy_specs_exact",
             set(live) == set(declared)
-            and all(canonical_digest(live[name]) == canonical_digest(spec) for name, spec in declared.items()),
+            and all(
+                canonical_digest(live[name]) == canonical_digest(spec)
+                for name, spec in declared.items()
+            ),
         ),
     )
 
 
-def validate_probe_rbac(namespace: str) -> tuple[GateCheck, ...]:
-    results = []
-    for verb, resource in (
-        ("create", "pods"),
-        ("delete", "pods"),
-        ("get", "pods"),
-        ("get", "pods/log"),
-        ("get", "networkpolicies.networking.k8s.io"),
-    ):
-        completed = subprocess.run(
-            ("kubectl", "auth", "can-i", verb, resource, "-n", namespace),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=30,
-            check=False,
+def validate_probe_rbac(
+    namespace: str, *, context: str, runner: CommandRunner = _run
+) -> tuple[GateCheck, ...]:
+    payload = json.loads(
+        runner(
+            (
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "auth",
+                "can-i",
+                "--list",
+                "-o",
+                "json",
+            ),
+            30,
         )
-        results.append(
-            GateCheck(
-                f"probe_rbac_{verb}_{resource.replace('/', '_').replace('.', '_')}",
-                completed.returncode == 0 and completed.stdout.strip() == "yes",
-            )
-        )
-    return tuple(results)
+    )
+    return (GateCheck("probe_rbac_exact", validate_exact_rbac(payload, PROBE_RBAC)),)
 
 
 def run_network_probe(
@@ -242,6 +281,7 @@ def run_kubernetes_network_probe(
     cases: Sequence[NetworkProbeCase],
     policy_path: str | Path,
     confirmation: str,
+    context: str,
     timeout_seconds: int = 120,
 ) -> GateEvidence:
     if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", namespace):
@@ -261,13 +301,18 @@ def run_kubernetes_network_probe(
     encoded = base64.b64encode(
         json.dumps([asdict(item) for item in cases], separators=(",", ":")).encode()
     ).decode("ascii")
+    labels = {"app": plane, "shadow-probe": "network-policy"}
+    if plane == "real-ot-collector":
+        labels["collector-target"] = "real-ot"
+    elif plane == "simulator-collector":
+        labels["collector-target"] = "simulator"
     manifest = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
             "name": pod,
             "namespace": namespace,
-            "labels": {"app": plane, "shadow-probe": "network-policy"},
+            "labels": labels,
         },
         "spec": {
             "automountServiceAccountToken": False,
@@ -300,7 +345,7 @@ def run_kubernetes_network_probe(
             ],
         },
     }
-    command = ["kubectl", "-n", namespace, "create", "-f", "-"]
+    command = ["kubectl", "--context", context, "-n", namespace, "create", "-f", "-"]
     started = utc_now()
     result: GateEvidence | None = None
     cleanup_succeeded = False
@@ -323,6 +368,8 @@ def run_kubernetes_network_probe(
             status = subprocess.run(
                 (
                     "kubectl",
+                    "--context",
+                    context,
                     "-n",
                     namespace,
                     "get",
@@ -343,7 +390,7 @@ def run_kubernetes_network_probe(
         if phase not in {"Succeeded", "Failed"}:
             raise DomainError("NETWORK_PROBE_TIMEOUT", "network probe pod timed out")
         logs = subprocess.run(
-            ("kubectl", "-n", namespace, "logs", pod),
+            ("kubectl", "--context", context, "-n", namespace, "logs", pod),
             capture_output=True,
             text=True,
             check=False,
@@ -369,7 +416,17 @@ def run_kubernetes_network_probe(
         )
     finally:
         deleted = subprocess.run(
-            ("kubectl", "-n", namespace, "delete", "pod", pod, "--ignore-not-found=true"),
+            (
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "delete",
+                "pod",
+                pod,
+                "--ignore-not-found=true",
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -394,16 +451,39 @@ def run_kubernetes_policy_suite(
     probes: Sequence[Mapping[str, Any]],
     policy_path: str | Path,
     confirmation: str,
+    context: str,
+    expected_cluster_uid_digest: str,
+    expected_kubernetes_api_ca_digest: str,
+    plan: ProductionDeploymentPlan,
+    runner: CommandRunner = _run,
     timeout_seconds: int = 120,
 ) -> GateEvidence:
     started = utc_now()
+    if (
+        namespace != plan.namespace
+        or Path(policy_path).resolve(strict=True) != plan.bootstrap_manifest.path
+    ):
+        raise DomainError(
+            "NETWORK_POLICY_PLAN_MISMATCH",
+            "network policy suite must use the sealed plan namespace and bootstrap policy artifact",
+        )
+    observed_cluster_uid_digest, api_ca_digest = cluster_identity(runner, context)
+    if (
+        observed_cluster_uid_digest != expected_cluster_uid_digest
+        or api_ca_digest != expected_kubernetes_api_ca_digest
+    ):
+        raise DomainError(
+            "KUBERNETES_CLUSTER_IDENTITY_MISMATCH",
+            "network probe cluster does not match the signed target profile",
+        )
     if not probes:
         raise DomainError("NETWORK_PROBE_EMPTY", "at least one plane probe is required")
     planes = [str(item.get("plane", "")) for item in probes]
     if len(planes) != len(set(planes)) or not {
         "control-api",
         "action-executor",
-        "collector",
+        "real-ot-collector",
+        "simulator-collector",
     }.issubset(planes):
         raise DomainError(
             "NETWORK_PROBE_COVERAGE_INVALID",
@@ -425,8 +505,8 @@ def run_kubernetes_policy_suite(
             )
     checks = [
         *validate_policy_contract(policy_path),
-        *validate_live_policy_contract(namespace, policy_path),
-        *validate_probe_rbac(namespace),
+        *validate_live_policy_contract(namespace, policy_path, context=context, runner=runner),
+        *validate_probe_rbac(namespace, context=context, runner=runner),
     ]
     case_count = 0
     connected = 0
@@ -447,6 +527,7 @@ def run_kubernetes_policy_suite(
             cases=cases,
             policy_path=policy_path,
             confirmation=confirmation,
+            context=context,
             timeout_seconds=timeout_seconds,
         )
         plane_digests[plane] = evidence.digest
@@ -465,6 +546,9 @@ def run_kubernetes_policy_suite(
             "namespace": namespace,
             "planes": plane_digests,
             "policy_digest": hashlib.sha256(Path(policy_path).read_bytes()).hexdigest(),
+            "plan_digest": plan.digest,
+            "cluster_uid_digest": observed_cluster_uid_digest,
+            "kubernetes_api_ca_digest": api_ca_digest,
         },
         checks=checks,
         metrics={

@@ -2,10 +2,18 @@ name: production-acceptance
 
 on:
   workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: Successful release-candidate workflow run to verify
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
   id-token: write
+  packages: read
+  attestations: read
 
 concurrency:
   group: industrial-shadow-production-acceptance
@@ -18,20 +26,28 @@ jobs:
     timeout-minutes: 240
     env:
       PYTHONPATH: backend/src:services/simulator/src:services/collector/src:services/edge-gateway/src
+      SHADOW_ENVIRONMENT: production
       SHADOW_ACCEPTANCE_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
       SHADOW_OIDC_ISSUER: ${{ vars.SHADOW_OIDC_ISSUER }}
       SHADOW_OIDC_AUDIENCE: ${{ vars.SHADOW_OIDC_AUDIENCE }}
       SHADOW_OIDC_JWKS_URL: ${{ vars.SHADOW_OIDC_JWKS_URL }}
       SHADOW_OIDC_CLIENT_ID: ${{ vars.SHADOW_OIDC_CLIENT_ID }}
+      SHADOW_OIDC_SERVICE_CLIENT_IDS: ${{ vars.SHADOW_OIDC_SERVICE_CLIENT_IDS }}
+      SHADOW_OIDC_ID_TOKEN_SIGNING_ALGORITHMS: ${{ vars.SHADOW_OIDC_ID_TOKEN_SIGNING_ALGORITHMS }}
       SHADOW_OIDC_AUTHORIZATION_URL: ${{ vars.SHADOW_OIDC_AUTHORIZATION_URL }}
       SHADOW_OIDC_TOKEN_URL: ${{ vars.SHADOW_OIDC_TOKEN_URL }}
       SHADOW_OIDC_END_SESSION_URL: ${{ vars.SHADOW_OIDC_END_SESSION_URL }}
       SHADOW_PRODUCTION_API_URL: ${{ vars.SHADOW_PRODUCTION_API_URL }}
+      SHADOW_PRODUCTION_WEB_URL: ${{ vars.SHADOW_PRODUCTION_WEB_URL }}
       SHADOW_OIDC_PROBE_SECRETS_FILE: ${{ secrets.SHADOW_OIDC_PROBE_SECRETS_FILE }}
+      SHADOW_OIDC_BROWSER_SECRETS_FILE: ${{ secrets.SHADOW_OIDC_BROWSER_SECRETS_FILE }}
+      SHADOW_OIDC_BROWSER_JOURNEY: web/test-results/production-oidc-journey.json
       SHADOW_OBJECT_STORAGE_BUCKET: ${{ vars.SHADOW_OBJECT_STORAGE_BUCKET }}
       SHADOW_OBJECT_STORAGE_REGION: ${{ vars.SHADOW_OBJECT_STORAGE_REGION }}
       SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/production-acceptance
+      SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: ${{ vars.SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX }}
       SHADOW_OBJECT_STORAGE_KMS_KEY_ID: ${{ vars.SHADOW_OBJECT_STORAGE_KMS_KEY_ID }}
+      SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: ${{ vars.SHADOW_BACKUP_OBJECT_STORAGE_PREFIX }}
       SHADOW_AWS_ACCOUNT_ID: ${{ vars.SHADOW_AWS_ACCOUNT_ID }}
       SHADOW_REQUIRE_OBJECT_LOCK: "true"
       SHADOW_RESTORE_SOURCE_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_SOURCE_DATABASE_URL }}
@@ -40,8 +56,20 @@ jobs:
       SHADOW_RESTORE_BACKUP_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_BACKUP_DATABASE_URL }}
       SHADOW_RESTORE_MAXIMUM_SECONDS: ${{ vars.SHADOW_RESTORE_MAXIMUM_SECONDS }}
       SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES: ${{ vars.SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES }}
+      SHADOW_RESTORE_MAXIMUM_RPO_SECONDS: ${{ vars.SHADOW_RESTORE_MAXIMUM_RPO_SECONDS }}
+      SHADOW_BACKUP_RESTORE_RECEIPT: ${{ secrets.SHADOW_BACKUP_RESTORE_RECEIPT }}
+      SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE: ${{ secrets.SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE }}
+      SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS: ${{ vars.SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS }}
+      SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS: ${{ vars.SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS }}
       SHADOW_MANAGED_POSTGRESQL_PROVIDER: ${{ vars.SHADOW_MANAGED_POSTGRESQL_PROVIDER }}
       SHADOW_MANAGED_POSTGRESQL_INSTANCE_DIGEST: ${{ vars.SHADOW_MANAGED_POSTGRESQL_INSTANCE_DIGEST }}
+      SHADOW_MANAGED_POSTGRESQL_SOURCE_RESOURCE_ARN: ${{ vars.SHADOW_MANAGED_POSTGRESQL_SOURCE_RESOURCE_ARN }}
+      SHADOW_MANAGED_POSTGRESQL_RESTORE_RESOURCE_ARN: ${{ vars.SHADOW_MANAGED_POSTGRESQL_RESTORE_RESOURCE_ARN }}
+      SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN: ${{ vars.SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN }}
+      SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN: ${{ vars.SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN }}
+      SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE: ${{ secrets.SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE }}
+      SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY: ${{ vars.SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY }}
+      SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY: ${{ vars.SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY }}
       SHADOW_ALLOW_DESTRUCTIVE_RESTORE_DRILL: "true"
       SHADOW_DATABASE_TENANT_ROLES: shadow_api,shadow_action,shadow_collector
       SHADOW_DATABASE_MAINTENANCE_ROLE: shadow_worker
@@ -70,15 +98,16 @@ jobs:
       SHADOW_PRIVACY_ASSURANCE_BUNDLE: ${{ secrets.SHADOW_PRIVACY_ASSURANCE_BUNDLE }}
       SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE: ${{ secrets.SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE }}
       SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE: ${{ secrets.SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE }}
+      SHADOW_IMAGE_REGISTRY_CREDENTIALS_FILE: ${{ secrets.SHADOW_IMAGE_REGISTRY_CREDENTIALS_FILE }}
       SHADOW_CONTAINER_SCAN_REPORT: docs/evidence/batch-24/production/container-scan.sarif.json
       SHADOW_KUBERNETES_DRILL_CONFIG: ${{ vars.SHADOW_KUBERNETES_DRILL_CONFIG }}
       SHADOW_CHAOS_DRILL_CONFIG: ${{ vars.SHADOW_CHAOS_DRILL_CONFIG }}
+      SHADOW_KUBERNETES_CONTEXT: ${{ vars.SHADOW_KUBERNETES_CONTEXT }}
+      SHADOW_KUBERNETES_CLUSTER_UID_DIGEST: ${{ vars.SHADOW_KUBERNETES_CLUSTER_UID_DIGEST }}
+      SHADOW_KUBERNETES_API_CA_DIGEST: ${{ vars.SHADOW_KUBERNETES_API_CA_DIGEST }}
       SHADOW_DRILL_DATABASE_URL: ${{ secrets.SHADOW_DRILL_DATABASE_URL }}
       SHADOW_PRODUCTION_DRILL_CONFIRMATION: ${{ secrets.SHADOW_PRODUCTION_DRILL_CONFIRMATION }}
       SHADOW_PRODUCTION_CHAOS_CONFIRMATION: ${{ secrets.SHADOW_PRODUCTION_CHAOS_CONFIRMATION }}
-      SHADOW_CANDIDATE_IMAGE: ${{ vars.SHADOW_CANDIDATE_IMAGE }}
-      SHADOW_BUILD_DIGEST: ${{ vars.SHADOW_BUILD_DIGEST }}
-      SHADOW_SIMULATOR_BUILD_DIGEST: ${{ vars.SHADOW_SIMULATOR_BUILD_DIGEST }}
       SHADOW_PRODUCTION_ENVIRONMENT_DIGEST: ${{ vars.SHADOW_PRODUCTION_ENVIRONMENT_DIGEST }}
       SHADOW_DEPLOYMENT_PLAN_DIGEST: ${{ vars.SHADOW_DEPLOYMENT_PLAN_DIGEST }}
       SHADOW_DEPLOYMENT_PLAN_BUNDLE: ${{ secrets.SHADOW_DEPLOYMENT_PLAN_BUNDLE }}
@@ -86,35 +115,140 @@ jobs:
       SHADOW_FORMAL_BENCHMARK_BUNDLE: ${{ secrets.SHADOW_FORMAL_BENCHMARK_BUNDLE }}
       SHADOW_ASSESSOR_TRUST_STORE: docs/evidence/batch-24/production/assessor-trust-store.json
       SHADOW_ASSESSOR_TRUST_STORE_SOURCE: ${{ secrets.SHADOW_ASSESSOR_TRUST_STORE }}
+      SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION: docs/evidence/batch-24/production/assessor-trust-root-attestation.json
+      SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION_SOURCE: ${{ secrets.SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION }}
+      SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY: docs/evidence/batch-24/production/assessor-trust-root-public-key.pem
+      SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE: ${{ secrets.SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY }}
+      SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256: ${{ vars.SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256 }}
       SHADOW_FORMAL_BENCHMARK_REPORT: docs/evidence/batch-24/production/formal-benchmark/report.json
       SHADOW_SECURITY_ASSURANCE_REPORT: docs/evidence/batch-24/production/security-assurance/report.json
       SHADOW_PRIVACY_ASSURANCE_REPORT: docs/evidence/batch-24/production/privacy-assurance/report.json
       SHADOW_ACCESSIBILITY_ASSURANCE_REPORT: docs/evidence/batch-24/production/accessibility-assurance/report.json
+      SHADOW_RELEASE_CANDIDATE_MANIFEST: docs/evidence/batch-24/production/supply-chain/release-candidate.json
+      SHADOW_RELEASE_CANDIDATE_BUNDLE: docs/evidence/batch-24/production/supply-chain/candidate-manifest.attestation.json
+      SHADOW_POSTGRESQL_MIGRATION_MANIFEST: docs/evidence/batch-24/production/supply-chain/postgresql-migration-manifest.json
     steps:
+      - name: Download immutable release candidate from the selected release run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: immutable-release-candidate
+          path: ${{ runner.temp }}/industrial-shadow-release-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.release_run_id }}
+      - name: Bind acceptance checkout to the successful release workflow
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          CANDIDATE_MANIFEST: ${{ runner.temp }}/industrial-shadow-release-candidate/release-candidate.json
+        run: |
+          [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          run_record="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" --jq '[.conclusion,.head_sha,.path,.head_repository.full_name,.event,.run_attempt] | @tsv')"
+          IFS=$'\t' read -r conclusion source_revision workflow_path source_repository event run_attempt <<< "$run_record"
+          test "$conclusion" = success
+          test "$workflow_path" = .github/workflows/release.yml
+          test "$source_repository" = "$GITHUB_REPOSITORY"
+          case "$event" in push|workflow_dispatch) ;; *) exit 1 ;; esac
+          [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
+          python3 - "$CANDIDATE_MANIFEST" "$GITHUB_REPOSITORY" "$RELEASE_RUN_ID" "$source_revision" "$run_attempt" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path, repository, run_id, revision, run_attempt = sys.argv[1:]
+          value = json.loads(Path(path).read_text(encoding="utf-8"))
+          if (
+              value.get("repository") != repository
+              or value.get("release_run_id") != run_id
+              or value.get("release_run_attempt") != int(run_attempt)
+              or value.get("source_revision") != revision
+              or not re.fullmatch(r"[a-f0-9]{40}", revision)
+          ):
+              raise SystemExit("release candidate does not match the selected workflow run")
+          PY
+          echo "source_revision=$source_revision" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.candidate.outputs.source_revision }}
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with: {python-version: "3.12"}
       - name: Install production probe dependencies
         run: python -m pip install --require-hashes -r backend/requirements.lock
+      - name: Validate and export immutable release coordinates
+        run: |
+          python tools/export_release_candidate.py \
+            --manifest "${{ runner.temp }}/industrial-shadow-release-candidate/release-candidate.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "${{ inputs.release_run_id }}" \
+            --run-attempt "${{ steps.candidate.outputs.run_attempt }}" \
+            --stage-dir docs/evidence/batch-24/production/supply-chain \
+            --github-env "$GITHUB_ENV"
       - name: Stage signed target reports and public signer trust store
         run: |
-          install -d docs/evidence/batch-24/production/formal-benchmark
-          install -d docs/evidence/batch-24/production/security-assurance
-          install -d docs/evidence/batch-24/production/privacy-assurance
-          install -d docs/evidence/batch-24/production/accessibility-assurance
-          install -d docs/evidence/batch-24/production-deployment
-          test -d "$SHADOW_FORMAL_BENCHMARK_BUNDLE" && cp -R "$SHADOW_FORMAL_BENCHMARK_BUNDLE"/. docs/evidence/batch-24/production/formal-benchmark/ || true
-          test -d "$SHADOW_SECURITY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_SECURITY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/security-assurance/ || true
-          test -d "$SHADOW_PRIVACY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_PRIVACY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/privacy-assurance/ || true
-          test -d "$SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE" && cp -R "$SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE"/. docs/evidence/batch-24/production/accessibility-assurance/ || true
-          test -d "$SHADOW_DEPLOYMENT_PLAN_BUNDLE" && cp -R "$SHADOW_DEPLOYMENT_PLAN_BUNDLE"/. docs/evidence/batch-24/production-deployment/ || true
-          test -f "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE" && install -m 0644 "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE" "$SHADOW_ASSESSOR_TRUST_STORE" || true
-      - name: Fail-closed non-mutating production input preflight
-        run: python tools/production_gate.py preflight --output docs/evidence/batch-24/production/preflight.json
-      - name: Execute bundled local diagnostic benchmark
-        run: python tools/production_gate.py benchmark_local --output docs/evidence/batch-24/production/benchmark_local.json --summary docs/evidence/batch-24/production/benchmark-local-summary.json
+          python tools/stage_signed_bundle.py --source "$SHADOW_FORMAL_BENCHMARK_BUNDLE" --destination docs/evidence/batch-24/production/formal-benchmark --manifest report.json --kind benchmark
+          python tools/stage_signed_bundle.py --source "$SHADOW_SECURITY_ASSURANCE_BUNDLE" --destination docs/evidence/batch-24/production/security-assurance --manifest report.json --kind assurance
+          python tools/stage_signed_bundle.py --source "$SHADOW_PRIVACY_ASSURANCE_BUNDLE" --destination docs/evidence/batch-24/production/privacy-assurance --manifest report.json --kind assurance
+          python tools/stage_signed_bundle.py --source "$SHADOW_ACCESSIBILITY_ASSURANCE_BUNDLE" --destination docs/evidence/batch-24/production/accessibility-assurance --manifest report.json --kind assurance
+          python tools/stage_signed_bundle.py --source "$SHADOW_DEPLOYMENT_PLAN_BUNDLE" --destination docs/evidence/batch-24/production-deployment --manifest deployment-plan.json --kind deployment
+          test -f "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE"
+          test ! -L "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE"
+          install -m 0444 "$SHADOW_ASSESSOR_TRUST_STORE_SOURCE" "$SHADOW_ASSESSOR_TRUST_STORE"
+          test -f "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION_SOURCE"
+          test ! -L "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION_SOURCE"
+          install -m 0444 "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION_SOURCE" "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION"
+          test -f "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE"
+          test ! -L "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE"
+          install -m 0444 "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE" "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY"
+      - name: Install locked browser-journey dependencies
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: Verify release provenance, SBOMs, and candidate manifest attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/production_gate.py supply_chain --output docs/evidence/batch-24/production/supply_chain.json
       - name: Independently recompute formal 150-Episode exact-bundle Gate
         run: python tools/production_gate.py benchmark_150 --output docs/evidence/batch-24/production/benchmark_150.json
+      - name: Fail-closed non-mutating production input preflight
+        run: python tools/production_gate.py preflight --output docs/evidence/batch-24/production/preflight.json
+      - name: Authorize all live production probes
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          paths = [
+              Path("docs/evidence/batch-24/production/preflight.json"),
+              Path("docs/evidence/batch-24/production/supply_chain.json"),
+              Path("docs/evidence/batch-24/production/benchmark_150.json"),
+          ]
+          values = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+          if any(
+              value.get("status") != "PASSED"
+              or value.get("limitations")
+              or value.get("schema_version") != 2
+              for value in values
+          ):
+              raise SystemExit("production prerequisite gate is not closure-eligible")
+          if len({value.get("acceptance_run_id") for value in values}) != 1:
+              raise SystemExit("production prerequisite gates use different acceptance runs")
+          if len({value.get("release_digest") for value in values}) != 1:
+              raise SystemExit("production prerequisite gates use different releases")
+          PY
+      - name: Execute bundled local diagnostic benchmark
+        run: python tools/production_gate.py benchmark_local --output docs/evidence/batch-24/production/benchmark_local.json --summary docs/evidence/batch-24/production/benchmark-local-summary.json
+      - name: Execute six-persona production OIDC PKCE and logout journey
+        working-directory: web
+        env:
+          SHADOW_E2E_PRODUCTION_URL: ${{ vars.SHADOW_PRODUCTION_WEB_URL }}
+          SHADOW_E2E_EXECUTABLE: ${{ vars.SHADOW_E2E_EXECUTABLE }}
+        run: npm run test:e2e -- production-oidc.spec.ts
+        continue-on-error: true
+      - name: Execute fresh and N-1 managed PostgreSQL migration drills
+        run: python tools/production_gate.py postgresql_migration --output docs/evidence/batch-24/production/postgresql_migration.json
         continue-on-error: true
       - name: Verify live OIDC and persona RBAC
         run: python tools/production_gate.py oidc --output docs/evidence/batch-24/production/oidc.json
@@ -164,6 +298,9 @@ jobs:
             --simulator-build-digest "$SHADOW_SIMULATOR_BUILD_DIGEST" \
             --environment-digest "$SHADOW_PRODUCTION_ENVIRONMENT_DIGEST" \
             --deployment-plan-digest "$SHADOW_DEPLOYMENT_PLAN_DIGEST" \
+            --trust-root-attestation "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION" \
+            --trust-root-public-key "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY" \
+            --trust-root-key-sha256 "$SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256" \
             --approval-request docs/evidence/batch-24/production/approval-request.json || test $? -eq 2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

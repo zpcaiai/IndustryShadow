@@ -6,7 +6,13 @@ const executablePath = process.env.SHADOW_E2E_EXECUTABLE ??
   (existsSync(systemChrome) ? systemChrome : undefined)
 const port = Number(process.env.SHADOW_E2E_PORT ?? '41873')
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('SHADOW_E2E_PORT is invalid')
-const baseURL = `http://127.0.0.1:${port}`
+const productionBaseURL = process.env.SHADOW_E2E_PRODUCTION_URL?.replace(/\/+$/, '')
+if (productionBaseURL) {
+  const target = new URL(productionBaseURL)
+  if (target.protocol !== 'https:' || target.username || target.password || target.search || target.hash)
+    throw new Error('SHADOW_E2E_PRODUCTION_URL must be a credential-free HTTPS origin')
+}
+const baseURL = productionBaseURL ?? `http://127.0.0.1:${port}`
 
 // Local readiness checks must never be sent through a workstation or CI proxy.
 // Preserve caller exclusions while making the loopback behavior deterministic.
@@ -32,12 +38,12 @@ export default defineConfig({
   use: {
     ...devices['Desktop Chrome'],
     baseURL,
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    trace: productionBaseURL ? 'off' : 'retain-on-failure',
+    screenshot: productionBaseURL ? 'off' : 'only-on-failure',
+    video: productionBaseURL ? 'off' : 'retain-on-failure',
     launchOptions: { executablePath },
   },
-  webServer: {
+  webServer: productionBaseURL ? undefined : {
     command: `npm run dev -- --port ${port} --strictPort`,
     url: baseURL,
     env: { ...process.env },

@@ -92,6 +92,9 @@ def create_app(database_path: str | None = None) -> Any:
             settings.oidc_issuer or "",
             settings.oidc_audience or "",
             settings.oidc_jwks_url or "",
+            settings.oidc_client_id or "",
+            service_client_ids=settings.oidc_service_client_ids,
+            algorithms=settings.oidc_id_token_signing_algorithms,
         )
 
         class OidcIdentityMiddleware(BaseHTTPMiddleware):

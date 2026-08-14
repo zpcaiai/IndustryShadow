@@ -20,11 +20,19 @@
       ]
     },
     {
-      "plane": "collector",
+      "plane": "real-ot-collector",
       "image": "registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "cases": [
-        {"name": "approved-ot", "host": "192.0.2.10", "port": 4840, "expect_allowed": true},
-        {"name": "web-denied", "host": "198.51.100.10", "port": 443, "expect_allowed": false}
+        {"name": "approved-real-ot", "host": "192.0.2.0", "port": 4840, "expect_allowed": true},
+        {"name": "simulator-denied", "host": "simulator", "port": 4840, "expect_allowed": false}
+      ]
+    },
+    {
+      "plane": "simulator-collector",
+      "image": "registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cases": [
+        {"name": "simulator", "host": "simulator", "port": 4840, "expect_allowed": true},
+        {"name": "real-ot-denied", "host": "192.0.2.0", "port": 4840, "expect_allowed": false}
       ]
     }
   ]

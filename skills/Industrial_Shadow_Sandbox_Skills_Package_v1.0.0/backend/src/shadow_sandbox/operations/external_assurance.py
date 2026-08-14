@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -76,6 +77,23 @@ class ExternalAssuranceImporter:
             }
         ),
     }
+    ARTIFACT_RECORD_KEYS = frozenset({"kind", "path", "sha256", "media_type"})
+    ARTIFACT_PAYLOAD_KEYS = frozenset(
+        {
+            "schema_version",
+            "assessment_id",
+            "gate",
+            "artifact_kind",
+            "assessor",
+            "executed_at",
+            "assessment_mode",
+            "target_digest",
+            "result",
+            "sample_count",
+            "findings",
+        }
+    )
+    FINDING_KEYS = frozenset({"id", "severity", "status", "description", "digest"})
 
     def __init__(
         self,
@@ -93,25 +111,143 @@ class ExternalAssuranceImporter:
         self.build_digest = build_digest
         self.environment_digest = environment_digest
         self.deployment_plan_digest = deployment_plan_digest
+        self.release_target_digest = canonical_digest(
+            {
+                "candidate_image": candidate_image,
+                "build_digest": build_digest,
+                "environment_digest": environment_digest,
+                "deployment_plan_digest": deployment_plan_digest,
+            }
+        )
 
-    def _artifact(self, item: Mapping[str, Any]) -> GateCheck:
-        if set(item) != {"path", "sha256"} or not re.fullmatch(
+    def _artifact(
+        self,
+        item: Mapping[str, Any],
+        *,
+        gate: str,
+        assessment_id: str,
+        assessor: str,
+        started: dt.datetime,
+        completed: dt.datetime,
+    ) -> tuple[str, GateCheck]:
+        if (
+            set(item) != self.ARTIFACT_RECORD_KEYS
+            or item.get("media_type") != "application/json"
+            or not str(item.get("kind", "")).strip()
+            or not re.fullmatch(
             r"[a-f0-9]{64}", str(item.get("sha256", ""))
+            )
         ):
             raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact fields are invalid")
-        path = (self.root / str(item.get("path", ""))).resolve(strict=True)
-        if self.root not in path.parents or path.is_symlink():
+        raw_path = str(item.get("path", ""))
+        relative_path = Path(raw_path)
+        if (
+            not raw_path
+            or relative_path.is_absolute()
+            or "\\" in raw_path
+            or any(part in {"", ".", ".."} for part in raw_path.split("/"))
+        ):
+            raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact path is invalid")
+        source = self.root / relative_path
+        current = self.root
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink():
+                raise DomainError(
+                    "ASSURANCE_ARTIFACT_INVALID", "artifact symlinks are forbidden"
+                )
+        if source.is_symlink():
+            raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact symlinks are forbidden")
+        try:
+            path = source.resolve(strict=True)
+        except OSError as error:
+            raise DomainError(
+                "ASSURANCE_ARTIFACT_INVALID", "artifact path cannot be resolved"
+            ) from error
+        if (
+            self.root not in path.parents
+            or not path.is_file()
+            or path.stat().st_nlink != 1
+            or not 1 <= path.stat().st_size <= 10 * 1024 * 1024
+        ):
             raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact is outside repository")
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        return GateCheck(
-            "artifact_"
-            + hashlib.sha256(str(path.relative_to(self.root)).encode()).hexdigest()[:16],
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise DomainError(
+                "ASSURANCE_ARTIFACT_INVALID", "artifact payload is invalid JSON"
+            ) from error
+        kind = str(item["kind"])
+        if not isinstance(payload, Mapping) or set(payload) != self.ARTIFACT_PAYLOAD_KEYS:
+            raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact payload fields are invalid")
+        findings = payload.get("findings")
+        sample_count = payload.get("sample_count")
+        try:
+            executed = dt.datetime.fromisoformat(str(payload.get("executed_at", "")))
+        except ValueError as error:
+            raise DomainError(
+                "ASSURANCE_ARTIFACT_INVALID", "artifact execution time is invalid"
+            ) from error
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("assessment_id") != assessment_id
+            or payload.get("gate") != gate
+            or payload.get("artifact_kind") != kind
+            or payload.get("assessor") != assessor
+            or payload.get("target_digest") != self.release_target_digest
+            or payload.get("result") != "PASSED"
+            or payload.get("assessment_mode")
+            not in {"human", "tool_assisted", "automated"}
+            or (gate == "accessibility" and payload.get("assessment_mode") != "human")
+            or isinstance(sample_count, bool)
+            or not isinstance(sample_count, int)
+            or sample_count < 1
+            or executed.tzinfo is None
+            or executed < started
+            or executed > completed
+            or not isinstance(findings, list)
+        ):
+            raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact payload values are invalid")
+        finding_ids: set[str] = set()
+        finding_digests: set[str] = set()
+        for finding in findings:
+            finding_id = str(finding.get("id", "")) if isinstance(finding, Mapping) else ""
+            finding_digest = (
+                str(finding.get("digest", "")) if isinstance(finding, Mapping) else ""
+            )
+            if (
+                not isinstance(finding, Mapping)
+                or set(finding) != self.FINDING_KEYS
+                or not isinstance(finding.get("id"), str)
+                or finding_id != finding_id.strip()
+                or not finding_id.strip()
+                or finding.get("severity")
+                not in {"info", "low", "medium", "high", "critical"}
+                or finding.get("status") not in {"remediated", "accepted"}
+                or (
+                    finding.get("severity") in {"high", "critical"}
+                    and finding.get("status") != "remediated"
+                )
+                or not isinstance(finding.get("description"), str)
+                or not str(finding.get("description", "")).strip()
+                or not re.fullmatch(r"[a-f0-9]{64}", finding_digest)
+                or finding_digest
+                != canonical_digest({**finding, "digest": ""})
+                or finding_id in finding_ids
+                or finding_digest in finding_digests
+            ):
+                raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact finding is invalid")
+            finding_ids.add(finding_id)
+            finding_digests.add(finding_digest)
+        return kind, GateCheck(
+            "artifact_" + kind,
             actual == item.get("sha256"),
-            {"size": path.stat().st_size},
+            {"size": path.stat().st_size, "samples": sample_count},
         )
 
     def import_report(self, report: Mapping[str, Any]) -> GateEvidence:
-        if set(report) != self.REPORT_KEYS or report.get("schema_version") != 2:
+        if set(report) != self.REPORT_KEYS or report.get("schema_version") != 3:
             raise DomainError("ASSURANCE_REPORT_INVALID", "assurance report fields are invalid")
         gate = str(report.get("gate", ""))
         if gate not in self.ALLOWED_GATES:
@@ -191,20 +327,44 @@ class ExternalAssuranceImporter:
         if not declared:
             raise DomainError("ASSURANCE_CHECKS_REQUIRED", "assurance checks are required")
         declared_names = {item.name for item in declared}
-        if len(declared_names) != len(declared) or not self.REQUIRED_CHECKS[gate].issubset(
-            declared_names
+        if len(declared_names) != len(declared) or declared_names != set(
+            self.REQUIRED_CHECKS[gate]
         ):
             raise DomainError(
                 "ASSURANCE_COVERAGE_INCOMPLETE", "required assurance controls are missing"
+            )
+        if any(
+            item.name in self.REQUIRED_CHECKS[gate]
+            and item.details != {"artifact_kind": item.name}
+            for item in declared
+        ):
+            raise DomainError(
+                "ASSURANCE_COVERAGE_INCOMPLETE",
+                "each required control must bind its exact evidence artifact",
             )
         artifact_values = report.get("artifacts", ())
         if not isinstance(artifact_values, list) or any(
             not isinstance(item, Mapping) for item in artifact_values
         ):
             raise DomainError("ASSURANCE_ARTIFACT_INVALID", "artifact list is invalid")
-        artifacts = tuple(self._artifact(item) for item in artifact_values)
-        if not artifacts:
-            raise DomainError("ASSURANCE_ARTIFACTS_REQUIRED", "assurance artifacts are required")
+        artifact_results = tuple(
+            self._artifact(
+                item,
+                gate=gate,
+                assessment_id=str(report["assessment_id"]),
+                assessor=str(report["assessor"]),
+                started=started_time,
+                completed=completed_time,
+            )
+            for item in artifact_values
+        )
+        kinds = [kind for kind, _check in artifact_results]
+        if len(kinds) != len(set(kinds)) or set(kinds) != set(self.REQUIRED_CHECKS[gate]):
+            raise DomainError(
+                "ASSURANCE_ARTIFACTS_REQUIRED",
+                "one unique structured artifact is required for every assurance control",
+            )
+        artifacts = tuple(check for _kind, check in artifact_results)
         checks: Sequence[GateCheck] = (
             GateCheck("signed_report", True),
             GateCheck("trusted_assessor", bool(signer_fingerprint)),

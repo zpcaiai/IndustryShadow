@@ -4,5 +4,6 @@
   "container": "api",
   "migration_job": "shadow-migrate",
   "readiness_url": "https://shadow.example.invalid/api/v1/health/ready"
+  ,"web_readiness_url": "https://shadow.example.invalid/"
   ,"maximum_rollback_seconds": 900
 }

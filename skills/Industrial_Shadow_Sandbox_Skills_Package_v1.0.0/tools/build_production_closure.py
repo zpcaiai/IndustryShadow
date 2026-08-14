@@ -6,10 +6,13 @@ import datetime as dt
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker
 
 from shadow_sandbox.common.models import DomainError, canonical_digest, canonical_json
 from shadow_sandbox.evaluation.formal_benchmark import FormalBenchmarkImporter
@@ -22,6 +25,8 @@ from shadow_sandbox.operations.trust_store import SignerTrustStore
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_GATES = (
     "preflight",
+    "supply_chain",
+    "postgresql_migration",
     "oidc",
     "backup_restore",
     "s3",
@@ -38,11 +43,45 @@ SOURCE_GATES = (
     "benchmark_150",
 )
 REQUIRED_SIGNATORY_ROLES = frozenset({"release_owner", "security_owner"})
+SIGNATORY_KEYS = frozenset(
+    {
+        "identity",
+        "role",
+        "approved",
+        "signed_at",
+        "approval_digest",
+        "public_key_b64",
+        "signature_b64",
+    }
+)
 
 
 def _inside_root(path: Path) -> Path:
+    try:
+        relative = path.absolute().relative_to(ROOT.resolve())
+    except ValueError as error:
+        raise DomainError(
+            "CLOSURE_ARTIFACT_INVALID", "closure artifact is outside the repository"
+        ) from error
+    cursor = ROOT.resolve()
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise DomainError(
+            "CLOSURE_ARTIFACT_INVALID", "closure artifact path is invalid"
+        )
+    for part in relative.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise DomainError(
+                "CLOSURE_ARTIFACT_INVALID",
+                "closure artifact paths must not contain symlinks",
+            )
     resolved = path.resolve(strict=True)
-    if ROOT.resolve() not in resolved.parents or resolved.is_symlink():
+    if (
+        ROOT.resolve() not in resolved.parents
+        or not resolved.is_file()
+        or resolved.stat().st_nlink != 1
+        or not 1 <= resolved.stat().st_size <= 64 * 1024 * 1024
+    ):
         raise DomainError(
             "CLOSURE_ARTIFACT_INVALID", "closure artifact is outside the repository"
         )
@@ -91,6 +130,23 @@ def load_gate_evidence(directory: Path) -> dict[str, tuple[Path, GateEvidence]]:
         raise DomainError(
             "CLOSURE_RUN_BINDING_MISMATCH",
             "all source gates must belong to one acceptance run and release",
+        )
+    ca_metrics = evidence["external_ca"][1].metrics
+    ot_metrics = evidence["real_ot"][1].metrics
+    shared_ot_coordinates = (
+        "server_certificate_fingerprint",
+        "client_certificate_fingerprint",
+        "next_client_certificate_fingerprint",
+        "client_application_uri",
+        "security_policy",
+    )
+    if any(
+        not ca_metrics.get(name) or ca_metrics.get(name) != ot_metrics.get(name)
+        for name in shared_ot_coordinates
+    ):
+        raise DomainError(
+            "CLOSURE_OT_BINDING_MISMATCH",
+            "external CA and real OT gates do not describe the same certificate-bound session",
         )
     try:
         starts = [
@@ -159,6 +215,9 @@ def load_source_attestations(
                 simulator_build_digest=str(report.get("simulator_build_digest", "")),
                 trust_store=trust_store,
                 environment_digest=release_coordinates["environment_digest"],
+                deployment_plan_digest=release_coordinates[
+                    "deployment_plan_digest"
+                ],
             ).import_report(report)
         if imported.digest != evidence[gate][1].digest:
             raise DomainError(
@@ -252,8 +311,14 @@ def verify_signatories(
         ) from error
     identities: set[str] = set()
     roles: set[str] = set()
+    key_fingerprints: set[str] = set()
     verified: list[dict[str, Any]] = []
     for item in signatories:
+        if set(item) != SIGNATORY_KEYS:
+            raise DomainError(
+                "CLOSURE_SIGNATORY_INVALID",
+                "signatory records contain missing or unknown fields",
+            )
         identity = str(item.get("identity", ""))
         role = str(item.get("role", ""))
         if (
@@ -261,7 +326,7 @@ def verify_signatories(
             or identity in identities
             or role not in REQUIRED_SIGNATORY_ROLES
             or role in roles
-            or not item.get("approved")
+            or item.get("approved") is not True
         ):
             raise DomainError(
                 "CLOSURE_SIGNATORY_INVALID", "signatories must be distinct approvals"
@@ -270,12 +335,17 @@ def verify_signatories(
             raise DomainError(
                 "CLOSURE_SIGNATORY_INVALID", "signatory approval digest mismatch"
             )
-        trust_store.verify_signer(
+        fingerprint = trust_store.verify_signer(
             identity=identity,
             purpose=f"closure_{role}",
             public_key_b64=str(item.get("public_key_b64", "")),
             signed_at=str(item.get("signed_at", "")),
         )
+        if fingerprint in key_fingerprints:
+            raise DomainError(
+                "CLOSURE_SIGNATORY_INVALID",
+                "two-person approval requires two distinct signing keys",
+            )
         try:
             public_key = base64.b64decode(str(item["public_key_b64"]), validate=True)
             signature = base64.b64decode(str(item["signature_b64"]), validate=True)
@@ -288,7 +358,8 @@ def verify_signatories(
             ) from error
         identities.add(identity)
         roles.add(role)
-        verified.append(dict(item))
+        key_fingerprints.add(fingerprint)
+        verified.append({key: item[key] for key in SIGNATORY_KEYS})
     if len(identities) < 2 or not REQUIRED_SIGNATORY_ROLES.issubset(roles):
         raise DomainError(
             "CLOSURE_SIGNATORIES_REQUIRED",
@@ -329,24 +400,32 @@ def build_closure(
         "unauthorized_actions": int(benchmark.metrics.get("unapproved_actions", -1)),
         "gold_exposures": int(benchmark.metrics.get("gold_leaks", -1)),
     }
+    def status(source: str) -> str:
+        return evidence[source][1].status
+
     gates = {
-        "production_preflight": "PASSED",
-        "postgresql_migration": "PASSED",
-        "backup_restore": "PASSED",
-        "oidc": "PASSED",
-        "s3": "PASSED",
-        "opcua_interoperability": "PASSED",
-        "network_policy": "PASSED",
-        "container_scan": "PASSED",
-        "security": "PASSED",
-        "resilience": "PASSED",
-        "performance": "PASSED",
-        "privacy": "PASSED",
-        "accessibility": "PASSED",
-        "upgrade_rollback": "PASSED",
-        "benchmark_150": "PASSED",
+        "production_preflight": status("preflight"),
+        "supply_chain": status("supply_chain"),
+        "postgresql_migration": status("postgresql_migration"),
+        "backup_restore": status("backup_restore"),
+        "oidc": status("oidc"),
+        "s3": status("s3"),
+        "opcua_interoperability": (
+            "PASSED"
+            if status("external_ca") == status("real_ot") == "PASSED"
+            else "FAILED"
+        ),
+        "network_policy": status("network_policy"),
+        "container_scan": status("container_scan"),
+        "security": status("security"),
+        "resilience": status("resilience"),
+        "performance": status("performance"),
+        "privacy": status("privacy"),
+        "accessibility": status("accessibility"),
+        "upgrade_rollback": status("upgrade_rollback"),
+        "benchmark_150": status("benchmark_150"),
     }
-    return {
+    closure = {
         "schema_version": 2,
         "status": "verified",
         "approval": approval,
@@ -356,9 +435,26 @@ def build_closure(
         "attestations": list(attestations),
         "signatories": verified_signatories,
     }
+    schema = json.loads(
+        (ROOT / "schemas/production/production-closure-input-v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    try:
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema, format_checker=FormatChecker()).validate(closure)
+    except Exception as error:
+        raise DomainError(
+            "CLOSURE_SCHEMA_INVALID", "generated closure does not satisfy its schema"
+        ) from error
+    return closure
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise DomainError(
+            "CLOSURE_OUTPUT_EXISTS", "refusing to overwrite signed closure material"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".closure-", dir=path.parent)
     try:
@@ -366,7 +462,9 @@ def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(canonical_json(payload) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.chmod(temporary, 0o444)
+        os.link(temporary, path)
+        os.unlink(temporary)
     except Exception:
         try:
             os.unlink(temporary)
@@ -387,6 +485,9 @@ def main() -> int:
     parser.add_argument("--simulator-build-digest", required=True)
     parser.add_argument("--environment-digest", required=True)
     parser.add_argument("--deployment-plan-digest", required=True)
+    parser.add_argument("--trust-root-attestation", type=Path, required=True)
+    parser.add_argument("--trust-root-public-key", type=Path, required=True)
+    parser.add_argument("--trust-root-key-sha256", required=True)
     parser.add_argument(
         "--output",
         type=Path,
@@ -394,7 +495,12 @@ def main() -> int:
     )
     args = parser.parse_args()
     trust_store_path = _inside_root(args.evidence_dir / "assessor-trust-store.json")
-    trust_store = SignerTrustStore.load(trust_store_path)
+    trust_store = SignerTrustStore.load_verified(
+        trust_store_path,
+        root_attestation_path=args.trust_root_attestation,
+        root_public_key_path=args.trust_root_public_key,
+        expected_root_key_sha256=args.trust_root_key_sha256,
+    )
     evidence = load_gate_evidence(args.evidence_dir)
     release_coordinates = {
         "candidate_image": args.candidate_image,
@@ -403,12 +509,22 @@ def main() -> int:
         "environment_digest": args.environment_digest,
         "deployment_plan_digest": args.deployment_plan_digest,
     }
-    ProductionDeploymentPlan.load(
+    deployment_plan = ProductionDeploymentPlan.load(
         ROOT,
         args.evidence_dir.parent / "production-deployment/deployment-plan.json",
         candidate_image=args.candidate_image,
         expected_digest=args.deployment_plan_digest,
     )
+    if (
+        deployment_plan.real_ot_node_allowlist_digest
+        != evidence["real_ot"][1].metrics.get("node_allowlist_digest")
+        or deployment_plan.real_ot_runtime_binding_digest
+        != evidence["real_ot"][1].metrics.get("runtime_binding_digest")
+    ):
+        raise DomainError(
+            "CLOSURE_OT_BINDING_MISMATCH",
+            "sealed deployment NodeId allowlist does not match real OT evidence",
+        )
     attestations = load_source_attestations(
         args.evidence_dir, evidence, trust_store, release_coordinates
     )
@@ -436,7 +552,19 @@ def main() -> int:
     if not args.signatories:
         print(canonical_json(approval))
         return 2
-    payload = json.loads(args.signatories.read_text(encoding="utf-8"))
+    signatories_path = args.signatories
+    if (
+        signatories_path.is_symlink()
+        or not signatories_path.is_file()
+        or signatories_path.stat().st_nlink != 1
+        or not 1 <= signatories_path.stat().st_size <= 4 * 1024 * 1024
+        or stat.S_IMODE(signatories_path.stat().st_mode) & 0o077
+    ):
+        raise DomainError(
+            "CLOSURE_SIGNATURE_FILE_INVALID",
+            "closure signature file must be a protected regular file",
+        )
+    payload = json.loads(signatories_path.read_text(encoding="utf-8"))
     if (
         not isinstance(payload, Mapping)
         or set(payload) != {"schema_version", "approval_digest", "signatories"}

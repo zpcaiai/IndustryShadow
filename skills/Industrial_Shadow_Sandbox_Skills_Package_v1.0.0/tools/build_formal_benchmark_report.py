@@ -17,8 +17,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _inside_root(path: Path) -> Path:
+    if path.is_symlink():
+        raise DomainError(
+            "FORMAL_BENCHMARK_ARTIFACT_INVALID",
+            "measurement artifact must not be a symlink",
+        )
     resolved = path.resolve(strict=True)
-    if ROOT.resolve() not in resolved.parents or resolved.is_symlink():
+    if (
+        ROOT.resolve() not in resolved.parents
+        or not resolved.is_file()
+        or resolved.stat().st_nlink != 1
+        or not 1 <= resolved.stat().st_size <= 64 * 1024 * 1024
+    ):
         raise DomainError(
             "FORMAL_BENCHMARK_ARTIFACT_INVALID",
             "measurement artifact is outside repository",
@@ -27,6 +37,11 @@ def _inside_root(path: Path) -> Path:
 
 
 def _atomic_write(path: Path, payload: dict[str, object]) -> None:
+    if path.exists() or path.is_symlink():
+        raise DomainError(
+            "FORMAL_BENCHMARK_REPORT_EXISTS",
+            "refusing to overwrite an existing signed benchmark report",
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".formal-report-", dir=path.parent)
     try:
@@ -34,7 +49,9 @@ def _atomic_write(path: Path, payload: dict[str, object]) -> None:
             handle.write(canonical_json(payload) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.chmod(temporary, 0o444)
+        os.link(temporary, path)
+        os.unlink(temporary)
     except Exception:
         try:
             os.unlink(temporary)
@@ -50,11 +67,15 @@ def main() -> int:
     parser.add_argument("--candidate-image", required=True)
     parser.add_argument("--build-digest", required=True)
     parser.add_argument("--simulator-build-digest", required=True)
+    parser.add_argument("--deployment-plan-digest", required=True)
     parser.add_argument("--episode-results", type=Path, required=True)
     parser.add_argument("--measurement-log", type=Path, required=True)
     parser.add_argument("--target-profile", type=Path, required=True)
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--trust-store", type=Path, required=True)
+    parser.add_argument("--trust-root-attestation", type=Path, required=True)
+    parser.add_argument("--trust-root-public-key", type=Path, required=True)
+    parser.add_argument("--trust-root-key-sha256", required=True)
     parser.add_argument("--benchmark-id", required=True)
     parser.add_argument("--assessor", required=True)
     parser.add_argument("--started-at", required=True)
@@ -66,7 +87,13 @@ def main() -> int:
     log_path = _inside_root(args.measurement_log)
     profile_path = _inside_root(args.target_profile)
     key_path = args.private_key.resolve(strict=True)
-    if stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+    if (
+        args.private_key.is_symlink()
+        or not key_path.is_file()
+        or key_path.stat().st_nlink != 1
+        or not 1 <= key_path.stat().st_size <= 1024 * 1024
+        or stat.S_IMODE(key_path.stat().st_mode) & 0o077
+    ):
         raise DomainError(
             "FORMAL_BENCHMARK_KEY_PERMISSIONS_INVALID",
             "signing key must not be accessible to group or other users",
@@ -92,8 +119,14 @@ def main() -> int:
         candidate_image=args.candidate_image,
         build_digest=args.build_digest,
         simulator_build_digest=args.simulator_build_digest,
-        trust_store=SignerTrustStore.load(args.trust_store),
+        trust_store=SignerTrustStore.load_verified(
+            args.trust_store,
+            root_attestation_path=args.trust_root_attestation,
+            root_public_key_path=args.trust_root_public_key,
+            expected_root_key_sha256=args.trust_root_key_sha256,
+        ),
         environment_digest=hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+        deployment_plan_digest=args.deployment_plan_digest,
     )
     evaluation, result_digest = importer.evaluate_results(result_path)
     gate = ReleaseGate().evaluate(
@@ -123,6 +156,7 @@ def main() -> int:
         "candidate_image": args.candidate_image,
         "build_digest": args.build_digest,
         "simulator_build_digest": args.simulator_build_digest,
+        "deployment_plan_digest": args.deployment_plan_digest,
         "suite_digest": importer.suite_digest,
         "bundle_digest": importer.bundle_digest,
         "result_digest": result_digest,

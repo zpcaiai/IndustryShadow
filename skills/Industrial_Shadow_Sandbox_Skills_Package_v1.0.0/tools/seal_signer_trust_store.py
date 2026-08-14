@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,6 +14,10 @@ from shadow_sandbox.operations.trust_store import SignerTrustStore
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise DomainError(
+            "TRUST_STORE_OUTPUT_EXISTS", "refusing to overwrite a sealed trust store"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".trust-store-", dir=path.parent)
     try:
@@ -20,7 +25,9 @@ def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(canonical_json(payload) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.chmod(temporary, 0o444)
+        os.link(temporary, path)
+        os.unlink(temporary)
     except Exception:
         try:
             os.unlink(temporary)
@@ -36,6 +43,14 @@ def main() -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if (
+        args.input.is_symlink()
+        or not args.input.is_file()
+        or not stat.S_ISREG(args.input.stat().st_mode)
+        or args.input.stat().st_nlink != 1
+        or not 1 <= args.input.stat().st_size <= 4 * 1024 * 1024
+    ):
+        raise DomainError("TRUST_STORE_INVALID", "trust store input is not a safe file")
     value = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
         raise DomainError("TRUST_STORE_INVALID", "trust store input must be an object")

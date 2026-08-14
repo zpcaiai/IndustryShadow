@@ -10,6 +10,8 @@ data:
   SHADOW_OIDC_AUDIENCE: replace-with-approved-oidc-audience
   SHADOW_OIDC_JWKS_URL: https://replace-with-approved-oidc-issuer.example.invalid/replace-with-reviewed-jwks-path
   SHADOW_OIDC_CLIENT_ID: replace-with-approved-oidc-public-client-id
+  SHADOW_OIDC_SERVICE_CLIENT_IDS: replace-with-approved-evaluator-service-client-id
+  SHADOW_OIDC_ID_TOKEN_SIGNING_ALGORITHMS: RS256
   SHADOW_OIDC_AUTHORIZATION_URL: https://replace-with-approved-oidc-issuer.example.invalid/replace-with-reviewed-authorization-path
   SHADOW_OIDC_TOKEN_URL: https://replace-with-approved-oidc-issuer.example.invalid/replace-with-reviewed-token-path
   SHADOW_OIDC_END_SESSION_URL: https://replace-with-approved-oidc-issuer.example.invalid/replace-with-reviewed-logout-path
@@ -22,12 +24,13 @@ data:
   SHADOW_OPCUA_ENDPOINT: opc.tcp://0.0.0.0:4840/shadow
   SHADOW_OPCUA_APPLICATION_URI: urn:industrial-shadow:simulator
   SHADOW_OPCUA_NAMESPACE_URI: urn:industrial-shadow:pump-tank
-  SHADOW_OPCUA_TRUSTED_CLIENT_FINGERPRINTS: replace-with-approved-collector-client-certificate-sha256
+  SHADOW_OPCUA_TRUSTED_CLIENT_FINGERPRINTS: replace-with-approved-simulator-collector-current-sha256,replace-with-approved-simulator-collector-next-sha256
   SHADOW_OBJECT_STORAGE_BACKEND: s3
   SHADOW_OBJECT_STORAGE_BUCKET: replace-with-approved-private-bucket
   SHADOW_OBJECT_STORAGE_REGION: replace-with-approved-region
   SHADOW_OBJECT_STORAGE_KMS_KEY_ID: replace-with-approved-kms-key-arn
-  SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/production
+  SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots
+  SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -41,17 +44,52 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: shadow-collector-binding
+  name: shadow-real-ot-collector-binding
 data:
+  SHADOW_COLLECTOR_IDENTITY: real_ot
   SHADOW_ENVIRONMENT_TYPE: real_readonly
   SHADOW_ENDPOINT_URI: opc.tcp://replace-with-approved-readonly-endpoint:4840
   SHADOW_APPLICATION_URI: urn:replace-with-approved-application
+  SHADOW_CLIENT_APPLICATION_URI: urn:replace-with-approved-real-ot-collector
   SHADOW_NAMESPACE_URI: urn:replace-with-approved-namespace
   SHADOW_CERTIFICATE_FINGERPRINT: replace-with-approved-sha256-fingerprint
+  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: replace-with-approved-client-sha256-fingerprint
+  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: replace-with-approved-next-client-sha256-fingerprint
   SHADOW_NODE_ALLOWLIST: "[]"
   SHADOW_TRUSTED_RUN_CONTEXT: "{}"
   SHADOW_MAXIMUM_NODES: "500"
   SHADOW_SAMPLING_INTERVAL_MS: "500"
+  SHADOW_OPCUA_SECURITY_PROFILE: Basic256Sha256,SignAndEncrypt
+  SHADOW_OPCUA_CLIENT_CERTIFICATE_CURRENT_PATH: /var/run/shadow-pki/current/client.crt
+  SHADOW_OPCUA_CLIENT_PRIVATE_KEY_CURRENT_PATH: /var/run/shadow-pki/current/client.key
+  SHADOW_OPCUA_CLIENT_CERTIFICATE_NEXT_PATH: /var/run/shadow-pki/next/client.crt
+  SHADOW_OPCUA_CLIENT_PRIVATE_KEY_NEXT_PATH: /var/run/shadow-pki/next/client.key
+  SHADOW_OPCUA_SERVER_CERTIFICATE_PATH: /var/run/shadow-pki/current/server.crt
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shadow-simulator-collector-binding
+data:
+  SHADOW_COLLECTOR_IDENTITY: simulator
+  SHADOW_ENVIRONMENT_TYPE: simulator
+  SHADOW_ENDPOINT_URI: opc.tcp://simulator:4840/shadow
+  SHADOW_APPLICATION_URI: urn:industrial-shadow:simulator
+  SHADOW_CLIENT_APPLICATION_URI: urn:replace-with-approved-simulator-collector
+  SHADOW_NAMESPACE_URI: urn:industrial-shadow:pump-tank
+  SHADOW_CERTIFICATE_FINGERPRINT: replace-with-approved-simulator-server-sha256-fingerprint
+  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: replace-with-approved-simulator-client-sha256-fingerprint
+  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: replace-with-approved-next-simulator-client-sha256-fingerprint
+  SHADOW_NODE_ALLOWLIST: "[]"
+  SHADOW_TRUSTED_RUN_CONTEXT: "{}"
+  SHADOW_MAXIMUM_NODES: "500"
+  SHADOW_SAMPLING_INTERVAL_MS: "500"
+  SHADOW_OPCUA_SECURITY_PROFILE: Basic256Sha256,SignAndEncrypt
+  SHADOW_OPCUA_CLIENT_CERTIFICATE_CURRENT_PATH: /var/run/shadow-pki/current/client.crt
+  SHADOW_OPCUA_CLIENT_PRIVATE_KEY_CURRENT_PATH: /var/run/shadow-pki/current/client.key
+  SHADOW_OPCUA_CLIENT_CERTIFICATE_NEXT_PATH: /var/run/shadow-pki/next/client.crt
+  SHADOW_OPCUA_CLIENT_PRIVATE_KEY_NEXT_PATH: /var/run/shadow-pki/next/client.key
+  SHADOW_OPCUA_SERVER_CERTIFICATE_PATH: /var/run/shadow-pki/current/server.crt
 ---
 apiVersion: v1
 kind: ConfigMap

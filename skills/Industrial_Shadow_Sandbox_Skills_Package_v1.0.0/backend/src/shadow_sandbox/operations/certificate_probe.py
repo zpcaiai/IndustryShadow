@@ -23,6 +23,7 @@ class CertificateAuthorityProbe:
         ca_bundle: str | Path,
         server_application_uri: str,
         client_application_uri: str,
+        security_policy: str,
         expected_server_fingerprint: str,
         expected_client_fingerprint: str,
         next_server_certificate: str | Path | None = None,
@@ -48,6 +49,12 @@ class CertificateAuthorityProbe:
         )
         self.server_application_uri = server_application_uri
         self.client_application_uri = client_application_uri
+        if security_policy not in {"Basic256Sha256", "Aes256_Sha256_RsaPss"}:
+            raise DomainError(
+                "CERTIFICATE_SECURITY_POLICY_INVALID",
+                "certificate evidence must bind an approved OPC UA security policy",
+            )
+        self.security_policy = security_policy
         self.expected_server_fingerprint = self._normalise_fingerprint(expected_server_fingerprint)
         self.expected_client_fingerprint = self._normalise_fingerprint(expected_client_fingerprint)
         self.expected_next_server_fingerprint = self._normalise_fingerprint(
@@ -367,6 +374,15 @@ class CertificateAuthorityProbe:
             coordinates={
                 "server_application_uri": self.server_application_uri,
                 "client_application_uri": self.client_application_uri,
+                "security_policy": self.security_policy,
+                "server_certificate_fingerprint": str(server["fingerprint"]),
+                "client_certificate_fingerprint": str(client["fingerprint"]),
+                "next_server_certificate_fingerprint": (
+                    str(next_server["fingerprint"]) if next_server else "missing"
+                ),
+                "next_client_certificate_fingerprint": (
+                    str(next_client["fingerprint"]) if next_client else "missing"
+                ),
                 "ca_bundle_digest": hashlib.sha256(self.ca_bundle.read_bytes()).hexdigest(),
                 "crl_digest": (
                     hashlib.sha256(self.crl_file.read_bytes()).hexdigest()
@@ -380,6 +396,16 @@ class CertificateAuthorityProbe:
                 "client_validity_days": client["validity_days"],
                 "server_key_bits": server["key_bits"],
                 "client_key_bits": client["key_bits"],
+                "server_certificate_fingerprint": str(server["fingerprint"]),
+                "client_certificate_fingerprint": str(client["fingerprint"]),
+                "next_server_certificate_fingerprint": (
+                    str(next_server["fingerprint"]) if next_server else "missing"
+                ),
+                "next_client_certificate_fingerprint": (
+                    str(next_client["fingerprint"]) if next_client else "missing"
+                ),
+                "client_application_uri": self.client_application_uri,
+                "security_policy": self.security_policy,
                 "next_server_validity_days": (next_server["validity_days"] if next_server else 0),
                 "next_client_validity_days": (next_client["validity_days"] if next_client else 0),
             },

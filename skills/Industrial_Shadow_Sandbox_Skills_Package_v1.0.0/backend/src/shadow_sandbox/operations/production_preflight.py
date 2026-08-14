@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -12,9 +13,16 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from shadow_sandbox.common.models import DomainError, canonical_digest, utc_now
+from shadow_sandbox.common.opcua_readonly import (
+    normalize_opcua_security_string,
+    opcua_runtime_binding_digest,
+)
 
+from .backup_job import database_coordinate_digest
 from .evidence import GateCheck, GateEvidence, complete
 from .production_deployment import ProductionDeploymentPlan
+from .restore_drill import BackupRestoreReceipt
+from .supply_chain import ReleaseCandidate
 from .trust_store import SignerTrustStore
 
 RELEASE_IMAGE = re.compile(r"^[^@\s]+@sha256:[a-f0-9]{64}$")
@@ -28,23 +36,47 @@ PLACEHOLDER = re.compile(
 REQUIRED_ENV = (
     "SHADOW_ACCEPTANCE_RUN_ID",
     "SHADOW_CANDIDATE_IMAGE",
+    "SHADOW_WEB_CANDIDATE_IMAGE",
     "SHADOW_BUILD_DIGEST",
     "SHADOW_SIMULATOR_BUILD_DIGEST",
     "SHADOW_PRODUCTION_ENVIRONMENT_DIGEST",
     "SHADOW_DEPLOYMENT_PLAN_DIGEST",
+    "SHADOW_RELEASE_CANDIDATE_MANIFEST",
+    "SHADOW_RELEASE_CANDIDATE_BUNDLE",
+    "SHADOW_RELEASE_SOURCE_REVISION",
+    "SHADOW_RELEASE_REPOSITORY",
+    "SHADOW_RELEASE_RUN_ID",
+    "SHADOW_RELEASE_RUN_ATTEMPT",
+    "SHADOW_POSTGRESQL_MIGRATION_MANIFEST",
+    "SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE",
+    "SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS",
+    "SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS",
     "SHADOW_PRODUCTION_DEPLOYMENT_PLAN",
+    "SHADOW_KUBERNETES_CONTEXT",
     "SHADOW_ASSESSOR_TRUST_STORE",
+    "SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION",
+    "SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY",
+    "SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256",
     "SHADOW_OIDC_ISSUER",
     "SHADOW_OIDC_AUDIENCE",
     "SHADOW_OIDC_JWKS_URL",
     "SHADOW_OIDC_CLIENT_ID",
+    "SHADOW_OIDC_SERVICE_CLIENT_IDS",
+    "SHADOW_OIDC_ID_TOKEN_SIGNING_ALGORITHMS",
     "SHADOW_OIDC_AUTHORIZATION_URL",
     "SHADOW_OIDC_TOKEN_URL",
+    "SHADOW_OIDC_END_SESSION_URL",
     "SHADOW_PRODUCTION_API_URL",
+    "SHADOW_PRODUCTION_WEB_URL",
     "SHADOW_OIDC_PROBE_SECRETS_FILE",
+    "SHADOW_OIDC_BROWSER_SECRETS_FILE",
+    "SHADOW_OIDC_BROWSER_JOURNEY",
     "SHADOW_OBJECT_STORAGE_BUCKET",
     "SHADOW_OBJECT_STORAGE_REGION",
+    "SHADOW_OBJECT_STORAGE_PREFIX",
+    "SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX",
     "SHADOW_OBJECT_STORAGE_KMS_KEY_ID",
+    "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX",
     "SHADOW_AWS_ACCOUNT_ID",
     "SHADOW_REQUIRE_OBJECT_LOCK",
     "SHADOW_RESTORE_SOURCE_DATABASE_URL",
@@ -53,8 +85,17 @@ REQUIRED_ENV = (
     "SHADOW_RESTORE_BACKUP_DATABASE_URL",
     "SHADOW_RESTORE_MAXIMUM_SECONDS",
     "SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES",
+    "SHADOW_RESTORE_MAXIMUM_RPO_SECONDS",
+    "SHADOW_BACKUP_RESTORE_RECEIPT",
     "SHADOW_MANAGED_POSTGRESQL_PROVIDER",
     "SHADOW_MANAGED_POSTGRESQL_INSTANCE_DIGEST",
+    "SHADOW_MANAGED_POSTGRESQL_SOURCE_RESOURCE_ARN",
+    "SHADOW_MANAGED_POSTGRESQL_RESTORE_RESOURCE_ARN",
+    "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN",
+    "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN",
+    "SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE",
+    "SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY",
+    "SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY",
     "SHADOW_ALLOW_DESTRUCTIVE_RESTORE_DRILL",
     "SHADOW_DATABASE_TENANT_ROLES",
     "SHADOW_DATABASE_MAINTENANCE_ROLE",
@@ -89,6 +130,7 @@ REQUIRED_ENV = (
     "SHADOW_PRIVACY_ASSURANCE_REPORT",
     "SHADOW_ACCESSIBILITY_ASSURANCE_REPORT",
     "SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE",
+    "SHADOW_IMAGE_REGISTRY_CREDENTIALS_FILE",
     "SHADOW_CONTAINER_SCAN_REPORT",
 )
 CONFIG_PATHS = (
@@ -101,8 +143,14 @@ CONFIG_PATHS = (
     "SHADOW_SECURITY_ASSURANCE_REPORT",
     "SHADOW_PRIVACY_ASSURANCE_REPORT",
     "SHADOW_ACCESSIBILITY_ASSURANCE_REPORT",
+    "SHADOW_OIDC_BROWSER_JOURNEY",
 )
 PUBLIC_FILES = (
+    "SHADOW_RELEASE_CANDIDATE_MANIFEST",
+    "SHADOW_RELEASE_CANDIDATE_BUNDLE",
+    "SHADOW_POSTGRESQL_MIGRATION_MANIFEST",
+    "SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION",
+    "SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY",
     "SHADOW_OPCUA_SERVER_CERTIFICATE",
     "SHADOW_OPCUA_CLIENT_CERTIFICATE",
     "SHADOW_OPCUA_NEXT_SERVER_CERTIFICATE",
@@ -112,10 +160,14 @@ PUBLIC_FILES = (
 )
 SECRET_FILES = (
     "SHADOW_OIDC_PROBE_SECRETS_FILE",
+    "SHADOW_OIDC_BROWSER_SECRETS_FILE",
     "SHADOW_LOAD_PROBE_SECRETS_FILE",
     "SHADOW_OPCUA_CLIENT_PRIVATE_KEY",
     "SHADOW_OPCUA_NEXT_CLIENT_PRIVATE_KEY",
     "SHADOW_DOCKER_SCOUT_CREDENTIALS_FILE",
+    "SHADOW_IMAGE_REGISTRY_CREDENTIALS_FILE",
+    "SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE",
+    "SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE",
 )
 
 
@@ -130,11 +182,12 @@ def _postgres_tls(url: str) -> bool:
     normalized = url.replace("postgresql+psycopg://", "postgresql://", 1)
     parsed = urlsplit(normalized)
     query = parse_qs(parsed.query)
-    return parsed.scheme == "postgresql" and query.get("sslmode", [""])[0] in {
-        "require",
-        "verify-ca",
-        "verify-full",
-    }
+    return (
+        parsed.scheme == "postgresql"
+        and query.get("sslmode") == ["verify-full"]
+        and len(query.get("sslrootcert", ())) == 1
+        and bool(query["sslrootcert"][0].strip())
+    )
 
 
 def _release_digest(value: str) -> bool:
@@ -190,7 +243,12 @@ class ProductionPreflight:
 
         trust_store: SignerTrustStore | None = None
         try:
-            trust_store = SignerTrustStore.load(self._value("SHADOW_ASSESSOR_TRUST_STORE"))
+            trust_store = SignerTrustStore.load_verified(
+                self._value("SHADOW_ASSESSOR_TRUST_STORE"),
+                root_attestation_path=self._value("SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION"),
+                root_public_key_path=self._value("SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY"),
+                expected_root_key_sha256=self._value("SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256"),
+            )
             placeholder_free = placeholder_free and not PLACEHOLDER.search(
                 Path(self._value("SHADOW_ASSESSOR_TRUST_STORE")).read_text(encoding="utf-8")
             )
@@ -204,6 +262,9 @@ class ProductionPreflight:
         environment_digest = self._value("SHADOW_PRODUCTION_ENVIRONMENT_DIGEST")
         deployment_plan_digest = self._value("SHADOW_DEPLOYMENT_PLAN_DIGEST")
         deployment_plan: ProductionDeploymentPlan | None = None
+        release_candidate: ReleaseCandidate | None = None
+        backup_receipt: BackupRestoreReceipt | None = None
+        target_profile: Mapping[str, Any] | None = None
         try:
             deployment_plan = ProductionDeploymentPlan.load(
                 Path(__file__).resolve().parents[4],
@@ -213,14 +274,179 @@ class ProductionPreflight:
             )
         except Exception:  # noqa: BLE001 - invalid deployment plans must fail preflight
             deployment_plan = None
+        try:
+            release_candidate = ReleaseCandidate.load(
+                self._value("SHADOW_RELEASE_CANDIDATE_MANIFEST"),
+                expected_repository=self._value("SHADOW_RELEASE_REPOSITORY"),
+                expected_run_id=self._value("SHADOW_RELEASE_RUN_ID"),
+                expected_run_attempt=int(
+                    self._value("SHADOW_RELEASE_RUN_ATTEMPT")
+                ),
+            )
+        except Exception:  # noqa: BLE001 - invalid release candidates fail preflight
+            release_candidate = None
+        try:
+            backup_receipt = BackupRestoreReceipt.load(
+                self._value("SHADOW_BACKUP_RESTORE_RECEIPT"),
+                expected_source_database_digest=database_coordinate_digest(
+                    self._value("SHADOW_RESTORE_SOURCE_DATABASE_URL")
+                ),
+            )
+        except Exception:  # noqa: BLE001 - malformed restore receipts fail preflight
+            backup_receipt = None
+        workload_sessions_valid = False
+        try:
+            sessions = _json_file(self._value("SHADOW_S3_WORKLOAD_IDENTITY_SESSIONS_FILE"))
+            if set(sessions) != {"backup", "snapshot"}:
+                raise DomainError(
+                    "PREFLIGHT_WORKLOAD_IDENTITY_INVALID", "two workload sessions are required"
+                )
+            for name in ("backup", "snapshot"):
+                value = sessions[name]
+                if not isinstance(value, Mapping) or set(value) != {
+                    "method",
+                    "profile",
+                    "role_arn",
+                    "web_identity_token_file",
+                    "role_session_name",
+                }:
+                    raise DomainError(
+                        "PREFLIGHT_WORKLOAD_IDENTITY_INVALID",
+                        "workload session fields are invalid",
+                    )
+                method = value.get("method")
+                profile = str(value.get("profile", ""))
+                role = str(value.get("role_arn", ""))
+                token = str(value.get("web_identity_token_file", ""))
+                session_name = str(value.get("role_session_name", ""))
+                expected_role = self._value(
+                    "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"
+                    if name == "backup"
+                    else "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"
+                )
+                token_file_valid = True
+                if method == "web_identity":
+                    token_path = Path(token)
+                    try:
+                        token_status = token_path.lstat()
+                    except OSError:
+                        token_status = None
+                    token_file_valid = bool(
+                        token_status is not None
+                        and stat.S_ISREG(token_status.st_mode)
+                        and token_status.st_nlink == 1
+                        and 1 <= token_status.st_size <= 1024 * 1024
+                        and not stat.S_IMODE(token_status.st_mode) & 0o077
+                    )
+                if (
+                    (method == "profile" and (not profile or role or token or session_name))
+                    or (
+                        method == "web_identity"
+                        and (
+                            profile
+                            or role != expected_role
+                            or not token_file_valid
+                            or not re.fullmatch(
+                                r"[A-Za-z0-9][A-Za-z0-9+=,.@_-]{1,63}",
+                                session_name,
+                            )
+                        )
+                    )
+                    or not re.fullmatch(
+                        r"arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/"
+                        r"[A-Za-z0-9+=,.@_/-]+",
+                        expected_role,
+                    )
+                    or method not in {"profile", "web_identity"}
+                ):
+                    raise DomainError(
+                        "PREFLIGHT_WORKLOAD_IDENTITY_INVALID",
+                        "workload session mode is not bound to the signed role",
+                    )
+            workload_sessions_valid = True
+        except Exception:  # noqa: BLE001 - malformed session contracts fail closed
+            workload_sessions_valid = False
+        try:
+            benchmark = configs["SHADOW_FORMAL_BENCHMARK_REPORT"]
+            target_records = [
+                item
+                for item in benchmark.get("artifacts", ())
+                if isinstance(item, Mapping) and item.get("kind") == "target_profile"
+            ]
+            if (
+                len(target_records) != 1
+                or benchmark.get("target_profile_digest") != environment_digest
+                or target_records[0].get("sha256") != environment_digest
+            ):
+                raise DomainError(
+                    "PREFLIGHT_TARGET_PROFILE_INVALID",
+                    "formal benchmark target profile binding is invalid",
+                )
+            repository_root = Path(__file__).resolve().parents[4]
+            target_path = (
+                repository_root / str(target_records[0].get("path", ""))
+            ).resolve(strict=True)
+            if repository_root.resolve() not in target_path.parents or target_path.is_symlink():
+                raise DomainError(
+                    "PREFLIGHT_TARGET_PROFILE_INVALID", "target profile path is unsafe"
+                )
+            if hashlib.sha256(target_path.read_bytes()).hexdigest() != environment_digest:
+                raise DomainError(
+                    "PREFLIGHT_TARGET_PROFILE_INVALID", "target profile digest mismatch"
+                )
+            target_profile = _json_file(str(target_path))
+        except Exception:  # noqa: BLE001 - target bindings must fail preflight closed
+            target_profile = None
+        real_ot_probe_binding_digest = ""
+        try:
+            ot_binding = configs["SHADOW_OPCUA_PROBE_CONFIG"]
+            raw_node_ids = ot_binding.get("node_ids")
+            if not isinstance(raw_node_ids, list) or any(
+                not isinstance(item, str) for item in raw_node_ids
+            ):
+                raise DomainError(
+                    "PREFLIGHT_OT_BINDING_INVALID",
+                    "real-OT probe NodeId allowlist is invalid",
+                )
+            security_profile, _certificate_path, _key_path, _server_path = (
+                normalize_opcua_security_string(
+                    self._value("SHADOW_OPCUA_SECURITY_STRING"),
+                    code="PREFLIGHT_OT_BINDING_INVALID",
+                )
+            )
+            real_ot_probe_binding_digest = opcua_runtime_binding_digest(
+                endpoint_uri=str(ot_binding.get("endpoint_uri", "")),
+                application_uri=str(ot_binding.get("application_uri", "")),
+                client_application_uri=str(
+                    ot_binding.get("client_application_uri", "")
+                ),
+                namespace_uri=str(ot_binding.get("namespace_uri", "")),
+                server_certificate_fingerprint=str(
+                    ot_binding.get("certificate_fingerprint", "")
+                ),
+                client_certificate_fingerprint=self._value(
+                    "SHADOW_CLIENT_CERTIFICATE_FINGERPRINT"
+                ),
+                next_client_certificate_fingerprint=self._value(
+                    "SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT"
+                ),
+                security_profile=security_profile,
+                node_ids=tuple(raw_node_ids),
+                code="PREFLIGHT_OT_BINDING_INVALID",
+            )
+        except Exception:  # noqa: BLE001 - OT coordinate drift must fail preflight closed
+            real_ot_probe_binding_digest = ""
         urls = (
             self._value("SHADOW_OIDC_ISSUER"),
             self._value("SHADOW_OIDC_JWKS_URL"),
             self._value("SHADOW_OIDC_AUTHORIZATION_URL"),
             self._value("SHADOW_OIDC_TOKEN_URL"),
+            self._value("SHADOW_OIDC_END_SESSION_URL"),
             self._value("SHADOW_PRODUCTION_API_URL"),
+            self._value("SHADOW_PRODUCTION_WEB_URL"),
             str(configs.get("SHADOW_LOAD_PROBE_CONFIG", {}).get("base_url", "")),
             str(configs.get("SHADOW_KUBERNETES_DRILL_CONFIG", {}).get("readiness_url", "")),
+            str(configs.get("SHADOW_KUBERNETES_DRILL_CONFIG", {}).get("web_readiness_url", "")),
         )
         endpoint_placeholders = any(PLACEHOLDER.search(value) for value in urls)
         database_urls = (
@@ -251,6 +477,22 @@ class ProductionPreflight:
         policy_ready = policy_path.is_file() and not PLACEHOLDER.search(
             policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
         )
+        plan_binding_ready = (
+            deployment_plan is not None
+            and target_profile is not None
+            and namespace == chaos_namespace == rollback_namespace == deployment_plan.namespace
+            and policy_path.resolve() == deployment_plan.bootstrap_manifest.path
+            and target_profile.get("snapshot_object_storage_prefix")
+            == deployment_plan.snapshot_object_storage_prefix
+            and target_profile.get("backup_object_storage_prefix")
+            == deployment_plan.backup_object_storage_prefix
+            and target_profile.get("snapshot_workload_identity_arn_digest")
+            == deployment_plan.snapshot_workload_identity_arn_digest
+            and target_profile.get("backup_workload_identity_arn_digest")
+            == deployment_plan.backup_workload_identity_arn_digest
+            and real_ot_probe_binding_digest
+            == deployment_plan.real_ot_runtime_binding_digest
+        )
         checks = (
             GateCheck("required_inputs", not missing, {"missing": len(missing)}),
             GateCheck("input_files", len(existing_files) == len(files), {"files": len(files)}),
@@ -276,8 +518,29 @@ class ProductionPreflight:
                 deployment_plan is not None,
                 {"workloads": len(deployment_plan.workloads) if deployment_plan else 0},
             ),
+            GateCheck(
+                "release_candidate",
+                release_candidate is not None
+                and release_candidate.backend_image == candidate
+                and release_candidate.web_image == self._value("SHADOW_WEB_CANDIDATE_IMAGE")
+                and release_candidate.source_digest == build_digest
+                and release_candidate.source_digest == simulator_digest
+                and release_candidate.source_revision
+                == self._value("SHADOW_RELEASE_SOURCE_REVISION")
+                and deployment_plan is not None
+                and deployment_plan.web_image == release_candidate.web_image
+                and release_candidate.postgresql_migration_manifest.path
+                == Path(self._value("SHADOW_POSTGRESQL_MIGRATION_MANIFEST")).resolve(),
+            ),
             GateCheck("https_endpoints", all(value.startswith("https://") for value in urls)),
             GateCheck("postgresql_tls", all(_postgres_tls(value) for value in database_urls)),
+            GateCheck(
+                "immutable_backup_receipt",
+                backup_receipt is not None
+                and -300
+                <= backup_receipt.age_seconds()
+                <= int(self._value("SHADOW_RESTORE_MAXIMUM_RPO_SECONDS") or "0"),
+            ),
             GateCheck(
                 "restore_target_disposable",
                 "restore_drill"
@@ -300,8 +563,118 @@ class ProductionPreflight:
             GateCheck(
                 "aws_coordinates",
                 bool(re.fullmatch(r"\d{12}", self._value("SHADOW_AWS_ACCOUNT_ID")))
-                and self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID").startswith("arn:aws:kms:")
+                and bool(
+                    re.fullmatch(
+                        rf"arn:(?:aws|aws-us-gov|aws-cn):kms:"
+                        rf"{re.escape(self._value('SHADOW_OBJECT_STORAGE_REGION'))}:"
+                        rf"{re.escape(self._value('SHADOW_AWS_ACCOUNT_ID'))}:key/[A-Za-z0-9/_-]+",
+                        self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
+                    )
+                )
                 and self._value("SHADOW_REQUIRE_OBJECT_LOCK") == "true",
+            ),
+            GateCheck(
+                "storage_prefix_isolation",
+                len(
+                    {
+                        self._value("SHADOW_OBJECT_STORAGE_PREFIX").rstrip("/"),
+                        self._value("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX").rstrip("/"),
+                        self._value("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX").rstrip("/"),
+                    }
+                )
+                == 3,
+            ),
+            GateCheck(
+                "signed_cloud_coordinates",
+                target_profile is not None
+                and target_profile.get("candidate_image") == candidate
+                and target_profile.get("build_digest") == build_digest
+                and target_profile.get("simulator_build_digest") == simulator_digest
+                and target_profile.get("deployment_plan_digest")
+                == deployment_plan_digest
+                and target_profile.get("aws_account_id")
+                == self._value("SHADOW_AWS_ACCOUNT_ID")
+                and target_profile.get("aws_region")
+                == self._value("SHADOW_OBJECT_STORAGE_REGION")
+                and target_profile.get("s3_bucket")
+                == self._value("SHADOW_OBJECT_STORAGE_BUCKET")
+                and target_profile.get("s3_probe_prefix")
+                == self._value("SHADOW_OBJECT_STORAGE_PREFIX")
+                and target_profile.get("snapshot_object_storage_prefix")
+                == self._value("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX")
+                and target_profile.get("backup_object_storage_prefix")
+                == self._value("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX")
+                and target_profile.get("kms_key_id_digest")
+                == canonical_digest(
+                    {"kms_key_id": self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID")}
+                )
+                and target_profile.get("backup_workload_identity_arn_digest")
+                == canonical_digest(
+                    {
+                        "workload_identity_arn": self._value(
+                            "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"
+                        )
+                    }
+                )
+                and target_profile.get("snapshot_workload_identity_arn_digest")
+                == canonical_digest(
+                    {
+                        "workload_identity_arn": self._value(
+                            "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"
+                        )
+                    }
+                )
+                and backup_receipt is not None
+                and target_profile.get("backup_restore_receipt_digest")
+                == backup_receipt.receipt_digest
+                and target_profile.get("oidc_issuer")
+                == self._value("SHADOW_OIDC_ISSUER").rstrip("/")
+                and target_profile.get("oidc_audience_digest")
+                == canonical_digest(
+                    {"audience": self._value("SHADOW_OIDC_AUDIENCE")}
+                )
+                and target_profile.get("oidc_human_client_id_digest")
+                == canonical_digest(
+                    {"client_id": self._value("SHADOW_OIDC_CLIENT_ID")}
+                )
+                and target_profile.get("oidc_service_client_ids_digest")
+                == canonical_digest(
+                    sorted(
+                        item.strip()
+                        for item in self._value("SHADOW_OIDC_SERVICE_CLIENT_IDS").split(",")
+                        if item.strip()
+                    )
+                )
+                and target_profile.get("managed_postgresql_provider")
+                == self._value("SHADOW_MANAGED_POSTGRESQL_PROVIDER")
+                and target_profile.get("managed_postgresql_source_resource_digest")
+                == canonical_digest(
+                    {
+                        "provider": "aws-rds",
+                        "resource_arn": self._value(
+                            "SHADOW_MANAGED_POSTGRESQL_SOURCE_RESOURCE_ARN"
+                        ),
+                    }
+                )
+                and target_profile.get("managed_postgresql_restore_resource_digest")
+                == canonical_digest(
+                    {
+                        "provider": "aws-rds",
+                        "resource_arn": self._value(
+                            "SHADOW_MANAGED_POSTGRESQL_RESTORE_RESOURCE_ARN"
+                        ),
+                    }
+                ),
+            ),
+            GateCheck(
+                "workload_identity_sessions",
+                workload_sessions_valid
+                and self._value("SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY").startswith(
+                    self._value("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX").rstrip("/") + "/"
+                )
+                and self._value("SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY").startswith(
+                    self._value("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX").rstrip("/") + "/"
+                ),
             ),
             GateCheck(
                 "certificate_fingerprints",
@@ -327,10 +700,16 @@ class ProductionPreflight:
             ),
             GateCheck(
                 "probe_coverage",
-                {"control-api", "action-executor", "collector"}.issubset(network_planes)
+                {
+                    "control-api",
+                    "action-executor",
+                    "real-ot-collector",
+                    "simulator-collector",
+                }.issubset(network_planes)
                 and chaos_categories == {"api", "worker", "collector", "simulator"},
             ),
             GateCheck("production_network_policy_manifest", bool(policy_ready)),
+            GateCheck("kubernetes_plan_binding", plan_binding_ready),
             GateCheck(
                 "trusted_signer_coverage",
                 trust_store is not None
@@ -343,13 +722,16 @@ class ProductionPreflight:
                         "closure_release_owner",
                         "closure_security_owner",
                     )
+                )
+                and trust_store.purposes_have_distinct_keys(
+                    ("closure_release_owner", "closure_security_owner")
                 ),
             ),
             GateCheck(
                 "required_binaries",
                 all(
                     shutil.which(name)
-                    for name in ("pg_dump", "pg_restore", "psql", "kubectl", "openssl")
+                    for name in ("pg_dump", "pg_restore", "psql", "kubectl", "openssl", "gh")
                 )
                 and _docker_scout_available(),
             ),

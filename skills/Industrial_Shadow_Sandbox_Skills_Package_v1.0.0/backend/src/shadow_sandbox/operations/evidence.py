@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import re
 import tempfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -16,27 +18,113 @@ STATUSES = frozenset({"PASSED", "FAILED", "NOT_RUN"})
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
 SENSITIVE_NAMES = frozenset(
-    {"authorization", "cookie", "password", "secret", "token", "private_key", "access_key"}
+    {
+        "access_key",
+        "api_key",
+        "authorization",
+        "authorization_header",
+        "bearer",
+        "bearer_value",
+        "bearer_values",
+        "connection_string",
+        "cookie",
+        "credential",
+        "credentials",
+        "database_url",
+        "dsn",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+    }
 )
+SENSITIVE_VALUE_SUFFIXES = frozenset(
+    {"b64", "contents", "data", "plaintext", "raw", "text", "value", "values"}
+)
+SAFE_OPAQUE_NAMES = frozenset(
+    {"checksum", "digest", "fingerprint", "hash", "public_key", "signature"}
+)
+URI_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s?#@]+(?::[^/\s?#@]*)?@")
+BEARER_VALUE = re.compile(r"(?i)(?:^|[\s\"'=,:])bearer\s+[A-Za-z0-9._~+/=-]{16,}")
+JWT_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\."
+    r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
+KNOWN_SECRET_VALUE = re.compile(
+    r"(?:AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|"
+    r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})|"
+    r"(?:sk-|dckr_pat_|xox[baprs]-)[A-Za-z0-9_-]{20,})"
+)
+PRIVATE_KEY_VALUE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+OPAQUE_VALUE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
+HEX_VALUE = re.compile(r"[A-Fa-f0-9]{64}")
+
+
+def _normalized_name(value: str) -> str:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
 
 
 def _sensitive_name(value: str) -> bool:
-    normalized = value.lower().replace("-", "_")
-    return normalized in SENSITIVE_NAMES or any(
-        normalized.endswith("_" + suffix)
-        for suffix in (
-            "authorization",
-            "cookie",
-            "password",
-            "secret",
-            "token",
-            "private_key",
-            "access_key",
-        )
+    normalized = _normalized_name(value)
+    if normalized in SENSITIVE_NAMES or any(
+        normalized.endswith("_" + name) for name in SENSITIVE_NAMES
+    ):
+        return True
+    return any(
+        normalized == f"{name}_{suffix}"
+        for name in SENSITIVE_NAMES
+        for suffix in SENSITIVE_VALUE_SUFFIXES
     )
 
 
-def _assert_redacted(value: Any, path: str = "$") -> None:
+def _safe_opaque_name(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = _normalized_name(value)
+    return any(
+        normalized == name or normalized.endswith("_" + name) for name in SAFE_OPAQUE_NAMES
+    ) or normalized.endswith(("_sha256", "_sha512"))
+
+
+def _entropy(value: str) -> float:
+    counts = Counter(value)
+    length = len(value)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
+
+def _sensitive_value(value: str, field_name: str | None) -> str | None:
+    stripped = value.strip()
+    if URI_USERINFO.search(stripped):
+        return "uri_userinfo"
+    if BEARER_VALUE.search(stripped):
+        return "bearer_value"
+    if JWT_VALUE.search(stripped):
+        return "jwt_value"
+    if PRIVATE_KEY_VALUE.search(stripped) or KNOWN_SECRET_VALUE.search(stripped):
+        return "secret_key_value"
+    if _safe_opaque_name(field_name):
+        return None
+    if HEX_VALUE.fullmatch(stripped):
+        if _entropy(stripped) >= 3.5:
+            return "high_entropy_value"
+        return None
+    if not OPAQUE_VALUE.fullmatch(stripped):
+        return None
+    character_classes = sum(
+        (
+            any(character.islower() for character in stripped),
+            any(character.isupper() for character in stripped),
+            any(character.isdigit() for character in stripped),
+            any(character in "_+/=-" for character in stripped),
+        )
+    )
+    if character_classes >= 2 and _entropy(stripped) >= 4.3:
+        return "high_entropy_value"
+    return None
+
+
+def _assert_redacted(value: Any, path: str = "$", field_name: str | None = None) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             if _sensitive_name(str(key)):
@@ -45,10 +133,18 @@ def _assert_redacted(value: Any, path: str = "$") -> None:
                     "production evidence must not contain secret-bearing fields",
                     {"path": f"{path}.{key}"},
                 )
-            _assert_redacted(child, f"{path}.{key}")
+            _assert_redacted(child, f"{path}.{key}", str(key))
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, child in enumerate(value):
-            _assert_redacted(child, f"{path}[{index}]")
+            _assert_redacted(child, f"{path}[{index}]", field_name)
+    elif isinstance(value, str):
+        reason = _sensitive_value(value, field_name)
+        if reason is not None:
+            raise DomainError(
+                "EVIDENCE_SECRET_FORBIDDEN",
+                "production evidence must not contain secret-bearing values",
+                {"path": path, "reason": reason},
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +210,7 @@ class GateEvidence:
         if self.status == "FAILED" and (
             not self.checks or all(item.passed for item in self.checks)
         ):
-            raise DomainError(
-                "GATE_EVIDENCE_INVALID", "FAILED evidence requires a failed check"
-            )
+            raise DomainError("GATE_EVIDENCE_INVALID", "FAILED evidence requires a failed check")
         _assert_redacted(asdict(self))
 
     @property
@@ -219,9 +313,7 @@ def failed_execution(
         checks=(GateCheck("execution_completed", False, {"error_code": safe_code}),),
         limitations=("gate_execution_failed",),
     )
-    return bind_to_acceptance_run(
-        evidence, run_id=run_id, release_digest=release_digest
-    )
+    return bind_to_acceptance_run(evidence, run_id=run_id, release_digest=release_digest)
 
 
 def write_evidence(path: str | Path, evidence: GateEvidence) -> Path:

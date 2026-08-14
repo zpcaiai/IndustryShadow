@@ -164,13 +164,24 @@ class CollectorAndOtProbeTests(unittest.TestCase):
 
         fake_asyncua = types.ModuleType("asyncua")
         fake_asyncua.Client = object  # type: ignore[attr-defined]
+        fake_asyncua.ua = object()  # type: ignore[attr-defined]
         environment = {
+            "SHADOW_COLLECTOR_IDENTITY": "real_ot",
             "SHADOW_ENDPOINT_URI": "opc.tcp://ot.example:4840",
             "SHADOW_APPLICATION_URI": "urn:ot:server",
+            "SHADOW_CLIENT_APPLICATION_URI": "urn:ot:client",
             "SHADOW_CERTIFICATE_FINGERPRINT": "a" * 64,
+            "SHADOW_CLIENT_CERTIFICATE_FINGERPRINT": "b" * 64,
+            "SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT": "c" * 64,
             "SHADOW_NAMESPACE_URI": "urn:ot:namespace",
             "SHADOW_NODE_ALLOWLIST": "[]",
             "SHADOW_TRUSTED_RUN_CONTEXT": "{}",
+            "SHADOW_OPCUA_SECURITY_PROFILE": "Basic256Sha256,SignAndEncrypt",
+            "SHADOW_OPCUA_CLIENT_CERTIFICATE_CURRENT_PATH": "/missing/current.crt",
+            "SHADOW_OPCUA_CLIENT_PRIVATE_KEY_CURRENT_PATH": "/missing/current.key",
+            "SHADOW_OPCUA_CLIENT_CERTIFICATE_NEXT_PATH": "/missing/next.crt",
+            "SHADOW_OPCUA_CLIENT_PRIVATE_KEY_NEXT_PATH": "/missing/next.key",
+            "SHADOW_OPCUA_SERVER_CERTIFICATE_PATH": "/missing/server.crt",
         }
         with patch.dict(os.environ, environment, clear=True), patch.dict(
             sys.modules, {"asyncua": fake_asyncua}
@@ -183,6 +194,9 @@ class CollectorAndOtProbeTests(unittest.TestCase):
         certificate = b"pinned-endpoint-certificate"
         fingerprint = hashlib.sha256(certificate).hexdigest()
         application_uri = "urn:industrial-shadow:test-server"
+        client_application_uri = "urn:industrial-shadow:test-client"
+        client_certificate = b"client-certificate-der"
+        client_fingerprint = hashlib.sha256(client_certificate).hexdigest()
         namespace_uri = "urn:industrial-shadow:test-namespace"
         node_ids = ("ns=2;s=Tank.Level", "ns=2;s=Pump.Speed")
 
@@ -192,8 +206,26 @@ class CollectorAndOtProbeTests(unittest.TestCase):
                 return True
 
         class FakeNode:
+            access_level = 1
+            user_access_level = 1
+
             def __init__(self, node_id: str) -> None:
                 self.nodeid = SimpleNamespace(to_string=lambda: node_id)
+
+            async def read_attributes(self, _attributes: object) -> list[object]:
+                def attribute(value: int) -> object:
+                    return SimpleNamespace(
+                        Value=SimpleNamespace(Value=value), StatusCode=GoodStatus()
+                    )
+
+                return [
+                    attribute(self.access_level),
+                    attribute(self.user_access_level),
+                    attribute(2),
+                ]
+
+            async def get_methods(self) -> list[object]:
+                return []
 
             async def read_data_value(self) -> object:
                 return SimpleNamespace(
@@ -236,6 +268,9 @@ class CollectorAndOtProbeTests(unittest.TestCase):
 
             async def set_security_string(self, value: str) -> None:
                 self.security = value
+                self.security_policy = SimpleNamespace(
+                    host_certificate=client_certificate
+                )
 
             async def connect_and_get_server_endpoints(self) -> list[object]:
                 return [endpoint]
@@ -262,6 +297,11 @@ class CollectorAndOtProbeTests(unittest.TestCase):
 
         fake_asyncua = types.ModuleType("asyncua")
         fake_asyncua.Client = FakeClient  # type: ignore[attr-defined]
+        fake_asyncua.ua = SimpleNamespace(  # type: ignore[attr-defined]
+            AttributeIds=SimpleNamespace(
+                AccessLevel=17, UserAccessLevel=18, NodeClass=2
+            )
+        )
 
         async def immediate_sleep(_seconds: float) -> None:
             return None
@@ -269,8 +309,11 @@ class CollectorAndOtProbeTests(unittest.TestCase):
         probe = ReadonlyOpcUaProbe(
             endpoint_uri="opc.tcp://ot.example:4840",
             application_uri=application_uri,
+            client_application_uri=client_application_uri,
             namespace_uri=namespace_uri,
             certificate_fingerprint=fingerprint,
+            client_certificate_fingerprint=client_fingerprint,
+            next_client_certificate_fingerprint="c" * 64,
             node_ids=node_ids,
             security_string="Basic256Sha256,SignAndEncrypt,client.pem,client-key.pem",
             observation_seconds=5,
@@ -281,14 +324,36 @@ class CollectorAndOtProbeTests(unittest.TestCase):
             evidence = asyncio.run(probe.run())
         self.assertEqual("PASSED", evidence.status)
         self.assertEqual(len(node_ids), evidence.metrics["notifications"])
+        self.assertEqual(fingerprint, evidence.metrics["server_certificate_fingerprint"])
+        self.assertEqual(client_application_uri, evidence.metrics["client_application_uri"])
+        self.assertEqual("Basic256Sha256", evidence.metrics["security_policy"])
+        self.assertEqual(64, len(str(evidence.metrics["node_allowlist_digest"])))
         self.assertEqual((), tuple(check.name for check in evidence.checks if not check.passed))
+
+        FakeNode.access_level = 3
+        with patch.dict(sys.modules, {"asyncua": fake_asyncua}), patch(
+            "shadow_sandbox.operations.opcua_probe.asyncio.sleep", immediate_sleep
+        ):
+            rejected = asyncio.run(probe.run())
+        self.assertEqual("FAILED", rejected.status)
+        self.assertEqual(0, rejected.metrics["notifications"])
+        self.assertFalse(
+            next(
+                check.passed
+                for check in rejected.checks
+                if check.name == "access_levels_read_only"
+            )
+        )
 
     def test_ot_probe_rejects_write_capable_or_unpinned_profiles(self) -> None:
         arguments = {
             "endpoint_uri": "opc.tcp://ot.example:4840",
             "application_uri": "urn:server",
+            "client_application_uri": "urn:client",
             "namespace_uri": "urn:namespace",
             "certificate_fingerprint": "a" * 64,
+            "client_certificate_fingerprint": "b" * 64,
+            "next_client_certificate_fingerprint": "c" * 64,
             "node_ids": ("ns=2;s=Level",),
             "security_string": "Basic256Sha256,None,client.pem,client-key.pem",
         }

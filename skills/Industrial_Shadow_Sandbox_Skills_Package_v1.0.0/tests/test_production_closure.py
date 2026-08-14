@@ -42,6 +42,7 @@ from shadow_sandbox.operations.load_probe import HttpLoadProbe, LoadTarget
 from shadow_sandbox.operations.network_probe import validate_policy_contract
 from shadow_sandbox.operations.oidc_probe import OidcLiveProbe
 from shadow_sandbox.operations.production_deployment import (
+    PUBLISH_RBAC,
     KubernetesProductionPublisher,
     ProductionDeploymentPlan,
 )
@@ -83,6 +84,62 @@ def trust_store_for(
     }
     payload["digest"] = canonical_digest(payload)
     return SignerTrustStore(payload)
+
+
+def assurance_artifacts(
+    directory: Path,
+    *,
+    gate: str,
+    assessment_id: str,
+    assessor: str,
+    executed_at: str,
+    candidate_image: str,
+    build_digest: str,
+    environment_digest: str,
+    deployment_plan_digest: str,
+) -> list[dict[str, str]]:
+    target_digest = canonical_digest(
+        {
+            "candidate_image": candidate_image,
+            "build_digest": build_digest,
+            "environment_digest": environment_digest,
+            "deployment_plan_digest": deployment_plan_digest,
+        }
+    )
+    records = []
+    for kind in sorted(ExternalAssuranceImporter.REQUIRED_CHECKS[gate]):
+        artifact = directory / f"{kind}.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "assessment_id": assessment_id,
+                    "gate": gate,
+                    "artifact_kind": kind,
+                    "assessor": assessor,
+                    "executed_at": executed_at,
+                    "assessment_mode": "human"
+                    if gate == "accessibility"
+                    else "tool_assisted",
+                    "target_digest": target_digest,
+                    "result": "PASSED",
+                    "sample_count": 1,
+                    "findings": [],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "kind": kind,
+                "path": str(artifact.relative_to(ROOT)),
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "media_type": "application/json",
+            }
+        )
+    return records
 
 
 class FakeBody(io.BytesIO):
@@ -147,6 +204,14 @@ class FakeS3:
             }
         }
 
+    def get_object_retention(self, **_kwargs: object) -> dict[str, object]:
+        return {
+            "Retention": {
+                "Mode": "COMPLIANCE",
+                "RetainUntilDate": dt.datetime.now(dt.UTC) + dt.timedelta(days=30),
+            }
+        }
+
     def put_object(self, **kwargs: object) -> dict[str, object]:
         self.last_put = kwargs
         key = str(kwargs["Key"])
@@ -159,9 +224,11 @@ class FakeS3:
     def head_object(self, **kwargs: object) -> dict[str, object]:
         data = self.objects[str(kwargs["Key"])]
         return {
+            "ContentLength": len(data),
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": self.kms_key,
             "Metadata": {"sha256": hashlib.sha256(data).hexdigest()},
+            "VersionId": "v1",
         }
 
     def get_object(self, **kwargs: object) -> dict[str, object]:
@@ -172,6 +239,7 @@ class FakeS3:
             "Metadata": {"sha256": hashlib.sha256(data).hexdigest()},
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": self.kms_key,
+            "VersionId": "v1",
         }
 
     def list_object_versions(self, **kwargs: object) -> dict[str, object]:
@@ -190,9 +258,19 @@ class FakeOidcValidator:
         roles = {
             "viewer-value": {"Viewer"},
             "engineer-value": {"Engineer"},
+            "approver-value": {"Approver"},
+            "pack-author-value": {"PackAuthor"},
             "admin-value": {"Admin"},
+            "auditor-value": {"Auditor"},
+            "evaluator-value": {"EvaluatorService"},
         }[name]
-        return ActorContext(name, "tenant", "workspace", frozenset(roles))
+        return ActorContext(
+            name,
+            "tenant",
+            "workspace",
+            frozenset(roles),
+            name == "evaluator-value",
+        )
 
 
 class FakeRoleStore:
@@ -276,6 +354,85 @@ class ProductionClosureTests(unittest.TestCase):
                 checks=(GateCheck("unsafe", True, {"access_token": "forbidden"}),),
             )
 
+    def test_gate_evidence_rejects_sensitive_field_aliases(self) -> None:
+        for field_name in (
+            "api_key",
+            "api-key",
+            "apiKey",
+            "bearer",
+            "bearer_value",
+            "authorization_header",
+            "authorizationHeader",
+            "credential",
+            "credentials",
+            "dsn",
+            "database_url",
+            "databaseUrl",
+            "connection_string",
+            "connectionString",
+        ):
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(DomainError) as raised:
+                    complete(
+                        "security",
+                        started_at=utc_now(),
+                        coordinates={"target": "test"},
+                        checks=(GateCheck("unsafe", True, {field_name: "redacted"}),),
+                    )
+                self.assertEqual("EVIDENCE_SECRET_FORBIDDEN", raised.exception.code)
+
+    def test_gate_evidence_rejects_secret_bearing_string_values(self) -> None:
+        opaque_secret = base64.b64encode(
+            hashlib.sha512(b"industrial-shadow-test-secret").digest()
+        ).decode("ascii")
+        values = {
+            "uri_userinfo": "postgresql://shadow:top-secret@db.internal/shadow",
+            "bearer": "Bearer QWxhZGRpbjpvcGVuIHNlc2FtZQ1234567890",
+            "jwt": (
+                "eyJhbGciOiJSUzI1NiJ9."
+                "eyJzdWIiOiJzaGFkb3ctYWRtaW4ifQ."
+                "VGVzdFNpZ25hdHVyZVZhbHVlMTIzNDU2"
+            ),
+            "high_entropy": opaque_secret,
+            "high_entropy_hex": hashlib.sha256(b"industrial-shadow-hex-secret")
+            .hexdigest()
+            .upper(),
+        }
+        for reason, secret_value in values.items():
+            with self.subTest(reason=reason):
+                with self.assertRaises(DomainError) as raised:
+                    complete(
+                        "security",
+                        started_at=utc_now(),
+                        coordinates={"target": "test"},
+                        checks=(
+                            GateCheck("unsafe", True, {"observation": secret_value}),
+                        ),
+                    )
+                self.assertEqual("EVIDENCE_SECRET_FORBIDDEN", raised.exception.code)
+
+    def test_gate_evidence_allows_digest_and_public_identifier_values(self) -> None:
+        evidence = complete(
+            "security",
+            started_at=utc_now(),
+            coordinates={"target": "test"},
+            checks=(
+                GateCheck(
+                    "safe",
+                    True,
+                    {
+                        "artifact_sha256": "a" * 64,
+                        "candidate_image": "registry.test/shadow@sha256:" + "b" * 64,
+                        "public_key": base64.b64encode(
+                            hashlib.sha256(b"public-test-key").digest()
+                        ).decode("ascii"),
+                        "public_endpoint": "https://shadow.test.internal/health",
+                    },
+                ),
+            ),
+        )
+        evidence.verify()
+
     def test_gate_evidence_acceptance_binding_and_failed_execution_are_sealed(
         self,
     ) -> None:
@@ -355,27 +512,72 @@ class ProductionClosureTests(unittest.TestCase):
                 return 200, {
                     "issuer": issuer,
                     "jwks_uri": jwks,
+                    "authorization_endpoint": issuer + "/authorize",
+                    "token_endpoint": issuer + "/token",
+                    "end_session_endpoint": issuer + "/logout",
                     "id_token_signing_alg_values_supported": ["RS256"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "response_types_supported": ["code"],
+                    "scopes_supported": ["openid", "profile"],
+                    "token_endpoint_auth_methods_supported": ["none"],
                 }
             if url == jwks:
                 return 200, {"keys": [{"kid": "key-1", "kty": "RSA"}]}
             value = headers.get("Authorization", "")
             if url.endswith("/api/v1/me") and value.startswith("Bearer "):
                 actor = value.removeprefix("Bearer ")
+                roles = {
+                    "viewer-value": ["Viewer"],
+                    "engineer-value": ["Engineer"],
+                    "approver-value": ["Approver"],
+                    "pack-author-value": ["PackAuthor"],
+                    "admin-value": ["Admin"],
+                    "auditor-value": ["Auditor"],
+                    "evaluator-value": ["EvaluatorService"],
+                }[actor]
                 return 200, {
                     "actor_id": actor,
                     "tenant_id": "tenant",
                     "workspace_id": "workspace",
+                    "roles": roles,
+                    "service": actor == "evaluator-value",
                 }
             if not value or value == "Bearer invalid-production-probe-token":
                 return 401, {}
-            return (200 if value == "Bearer admin-value" else 403), {}
+            if "/api/v1/authorization-probe/" in url:
+                capability = url.rsplit("/", 1)[-1].replace("-", "_")
+                identity = (
+                    value.removeprefix("Bearer ")
+                    .removesuffix("-value")
+                    .replace("-", "_")
+                )
+                allowed = {
+                    "viewer": {"viewer"},
+                    "engineer": {"viewer", "engineer"},
+                    "approver": {"viewer", "approver"},
+                    "pack_author": {"viewer", "pack_author"},
+                    "admin": {"viewer", "admin"},
+                    "auditor": {"viewer", "auditor"},
+                    "evaluator": {"evaluator_service"},
+                }
+                return (
+                    (200, {"authorized": True})
+                    if capability in allowed.get(identity, set())
+                    else (403, {})
+                )
+            return 404, {}
 
         probe = OidcLiveProbe(
             issuer,
             "industrial-shadow",
             jwks,
             "https://shadow.example.invalid",
+            client_id="test-client",
+            authorization_url=issuer + "/authorize",
+            token_url=issuer + "/token",
+            end_session_url=issuer + "/logout",
+            service_client_ids=("test-evaluator-client",),
             http_get=http_get,
             validator=FakeOidcValidator(),  # type: ignore[arg-type]
         )
@@ -383,8 +585,37 @@ class ProductionClosureTests(unittest.TestCase):
             {
                 "viewer": "viewer-value",
                 "engineer": "engineer-value",
+                "approver": "approver-value",
+                "pack_author": "pack-author-value",
                 "admin": "admin-value",
-            }
+                "auditor": "auditor-value",
+                "evaluator_service": "evaluator-value",
+            },
+            browser_journey={
+                "schema_version": 1,
+                "started_at": utc_now(),
+                "completed_at": utc_now(),
+                "web_origin": "https://shadow.example.invalid",
+                "issuer": issuer,
+                "client_id_digest": hashlib.sha256(b"test-client").hexdigest(),
+                "personas": [
+                    "viewer",
+                    "engineer",
+                    "approver",
+                    "pack_author",
+                    "admin",
+                    "auditor",
+                ],
+                "checks": {
+                    "authorization_code": True,
+                    "pkce_s256": True,
+                    "token_exchange": True,
+                    "id_token_verified": True,
+                    "access_token_api": True,
+                    "logout": True,
+                    "no_cross_origin_redirect": True,
+                },
+            },
         )
         self.assertEqual("PASSED", result.status)
 
@@ -489,6 +720,7 @@ class ProductionClosureTests(unittest.TestCase):
                 crl_file=crl_path,
                 server_application_uri=server_uri,
                 client_application_uri=client_uri,
+                security_policy="Basic256Sha256",
                 expected_server_fingerprint=values["server"]
                 .fingerprint(hashes.SHA256())
                 .hex(),
@@ -507,12 +739,35 @@ class ProductionClosureTests(unittest.TestCase):
                 result.status,
                 [check.name for check in result.checks if not check.passed],
             )
+            self.assertEqual(
+                values["server"].fingerprint(hashes.SHA256()).hex(),
+                result.metrics["server_certificate_fingerprint"],
+            )
+            self.assertEqual(client_uri, result.metrics["client_application_uri"])
+            self.assertEqual("Basic256Sha256", result.metrics["security_policy"])
 
     def test_restore_and_cluster_drills_require_exact_disposable_targets(self) -> None:
         with self.assertRaises(DomainError):
             PostgreSqlRestoreDrill(
                 "postgresql://a/source", "postgresql://a/production", allow_restore=True
             )
+
+    def test_production_load_probe_rejects_write_targets(self) -> None:
+        for method, body in (
+            ("POST", {"action": "mutate"}),
+            ("GET", {"query": "body"}),
+        ):
+            with self.subTest(method=method, body=body), self.assertRaises(DomainError):
+                HttpLoadProbe(
+                    "https://shadow.example.invalid",
+                    LoadTarget("unsafe", "/api/v1/actions", method=method, body=body),
+                    bearer_value=None,
+                    requests_per_second=1,
+                    concurrency=1,
+                    duration_seconds=1,
+                    p95_limit_ms=1000,
+                    maximum_error_rate=0,
+                )
 
     def test_database_roles_are_distinct_and_least_privilege(self) -> None:
         store = FakeRoleStore()
@@ -533,6 +788,7 @@ class ProductionClosureTests(unittest.TestCase):
                 "control-api",
                 "api",
                 "https://shadow.example.invalid/api/v1/health/ready",
+                "https://shadow.example.invalid/",
                 "postgresql://db/shadow",
                 confirmation="wrong",
             )
@@ -558,8 +814,7 @@ class ProductionClosureTests(unittest.TestCase):
 
     def test_signed_external_assurance_is_artifact_bound(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            artifact = Path(directory) / "assessment.json"
-            artifact.write_text('{"result":"passed"}\n', encoding="utf-8")
+            root = Path(directory)
             private = Ed25519PrivateKey.generate()
             public = private.public_key().public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw
@@ -568,29 +823,37 @@ class ProductionClosureTests(unittest.TestCase):
             trust_store = trust_store_for(
                 [("independent-lab", ["security_assessment"], public)]
             )
+            started_at = utc_now()
+            completed_at = utc_now()
+            artifacts = assurance_artifacts(
+                root,
+                gate="security",
+                assessment_id="security-2026-08",
+                assessor="independent-lab",
+                executed_at=completed_at,
+                candidate_image=candidate,
+                build_digest="b" * 64,
+                environment_digest="d" * 64,
+                deployment_plan_digest="e" * 64,
+            )
             report: dict[str, object] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "gate": "security",
                 "assessment_id": "security-2026-08",
                 "assessor": "independent-lab",
-                "started_at": utc_now(),
-                "completed_at": utc_now(),
+                "started_at": started_at,
+                "completed_at": completed_at,
                 "candidate_image": candidate,
                 "build_digest": "b" * 64,
                 "environment_digest": "d" * 64,
                 "deployment_plan_digest": "e" * 64,
                 "checks": [
-                    {"name": name, "passed": True, "details": {}}
+                    {"name": name, "passed": True, "details": {"artifact_kind": name}}
                     for name in sorted(
                         ExternalAssuranceImporter.REQUIRED_CHECKS["security"]
                     )
                 ],
-                "artifacts": [
-                    {
-                        "path": str(artifact.relative_to(ROOT)),
-                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                    }
-                ],
+                "artifacts": artifacts,
                 "limitations": [],
                 "public_key_b64": base64.b64encode(public).decode(),
                 "report_digest": "",
@@ -618,8 +881,7 @@ class ProductionClosureTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
-            artifact = Path(directory) / "human-accessibility-assessment.json"
-            artifact.write_text('{"review":"completed"}\n', encoding="utf-8")
+            root = Path(directory)
             private = Ed25519PrivateKey.generate()
             public = private.public_key().public_bytes(
                 serialization.Encoding.Raw, serialization.PublicFormat.Raw
@@ -628,29 +890,37 @@ class ProductionClosureTests(unittest.TestCase):
             trust_store = trust_store_for(
                 [("accessibility-lab", ["accessibility_assessment"], public)]
             )
+            started_at = utc_now()
+            completed_at = utc_now()
+            artifacts = assurance_artifacts(
+                root,
+                gate="accessibility",
+                assessment_id="accessibility-2026-08",
+                assessor="accessibility-lab",
+                executed_at=completed_at,
+                candidate_image=candidate,
+                build_digest="b" * 64,
+                environment_digest="d" * 64,
+                deployment_plan_digest="e" * 64,
+            )
             report: dict[str, object] = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "gate": "accessibility",
                 "assessment_id": "accessibility-2026-08",
                 "assessor": "accessibility-lab",
-                "started_at": utc_now(),
-                "completed_at": utc_now(),
+                "started_at": started_at,
+                "completed_at": completed_at,
                 "candidate_image": candidate,
                 "build_digest": "b" * 64,
                 "environment_digest": "d" * 64,
                 "deployment_plan_digest": "e" * 64,
                 "checks": [
-                    {"name": name, "passed": True, "details": {}}
+                    {"name": name, "passed": True, "details": {"artifact_kind": name}}
                     for name in sorted(
                         ExternalAssuranceImporter.REQUIRED_CHECKS["accessibility"]
                     )
                 ],
-                "artifacts": [
-                    {
-                        "path": str(artifact.relative_to(ROOT)),
-                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                    }
-                ],
+                "artifacts": artifacts,
                 "limitations": [],
                 "public_key_b64": base64.b64encode(public).decode(),
                 "report_digest": "",
@@ -696,6 +966,18 @@ class ProductionClosureTests(unittest.TestCase):
                 encoding="utf-8",
             )
             credentials.chmod(0o600)
+            registry_credentials = root / "registry.json"
+            registry_credentials.write_text(
+                json.dumps(
+                    {
+                        "registry": "registry.example.invalid",
+                        "username": "puller",
+                        "access_token": "registry-test-value",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry_credentials.chmod(0o600)
 
             def runner(
                 command: list[str], **_kwargs: object
@@ -703,6 +985,10 @@ class ProductionClosureTests(unittest.TestCase):
                 if command[1:3] == ["scout", "version"]:
                     return subprocess.CompletedProcess(
                         command, 0, "version: v1.21.0\n", ""
+                    )
+                if command[1:3] == ["image", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps([command[-1]]) + "\n", ""
                     )
                 if command[1:3] == ["scout", "cves"]:
                     report = Path(command[command.index("--output") + 1])
@@ -728,6 +1014,7 @@ class ProductionClosureTests(unittest.TestCase):
                 candidate_image="registry.example.invalid/shadow@sha256:" + "a" * 64,
                 report_path=report,
                 credentials_file=credentials,
+                registry_credentials_file=registry_credentials,
                 run_command=runner,
             ).run()
             self.assertEqual("PASSED", evidence.status)
@@ -739,6 +1026,7 @@ class ProductionClosureTests(unittest.TestCase):
                 web_image="registry.example.invalid/web@sha256:" + "b" * 64,
                 backend_report_path=report,
                 credentials_file=credentials,
+                registry_credentials_file=registry_credentials,
                 run_command=runner,
             ).run()
             self.assertEqual("PASSED", release_evidence.status)
@@ -753,6 +1041,10 @@ class ProductionClosureTests(unittest.TestCase):
                 if command[1:3] == ["scout", "version"]:
                     return subprocess.CompletedProcess(
                         command, 0, "version: v1.21.0\n", ""
+                    )
+                if command[1:3] == ["image", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps([command[-1]]) + "\n", ""
                     )
                 if command[1:3] == ["scout", "cves"]:
                     output = Path(command[command.index("--output") + 1])
@@ -778,10 +1070,54 @@ class ProductionClosureTests(unittest.TestCase):
                 candidate_image="registry.example.invalid/shadow@sha256:" + "a" * 64,
                 report_path=report,
                 credentials_file=credentials,
+                registry_credentials_file=registry_credentials,
                 run_command=vulnerable_runner,
             ).run()
             self.assertEqual("FAILED", failed.status)
             self.assertEqual(1, failed.metrics["critical_or_high_findings"])
+
+    def test_docker_scout_rejects_conflicting_docker_hub_identities(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            credentials = root / "docker-scout.json"
+            credentials.write_text(
+                json.dumps(
+                    {"username": "scanner", "personal_access_token": "scout-token"}
+                ),
+                encoding="utf-8",
+            )
+            credentials.chmod(0o600)
+            registry_credentials = root / "registry.json"
+            registry_credentials.write_text(
+                json.dumps(
+                    {
+                        "registry": "docker.io",
+                        "username": "puller",
+                        "access_token": "registry-token",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry_credentials.chmod(0o600)
+
+            calls: list[list[str]] = []
+
+            def runner(
+                command: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self.assertRaises(DomainError):
+                DockerScoutImageProbe(
+                    ROOT,
+                    candidate_image="docker.io/example/shadow@sha256:" + "a" * 64,
+                    report_path=root / "container-scan.sarif.json",
+                    credentials_file=credentials,
+                    registry_credentials_file=registry_credentials,
+                    run_command=runner,
+                ).run()
+            self.assertEqual(1, len(calls))
 
     def test_production_approval_signer_checks_role_key_and_digest(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as directory:
@@ -864,7 +1200,20 @@ class ProductionClosureTests(unittest.TestCase):
                 ("deployment", "worker", "worker", "backend", ""),
                 ("deployment", "action-executor", "action-executor", "backend", ""),
                 ("statefulset", "simulator", "simulator", "backend", ""),
-                ("deployment", "collector", "collector", "backend", ""),
+                (
+                    "deployment",
+                    "real-ot-collector",
+                    "real-ot-collector",
+                    "backend",
+                    "",
+                ),
+                (
+                    "deployment",
+                    "simulator-collector",
+                    "simulator-collector",
+                    "backend",
+                    "",
+                ),
                 ("deployment", "web", "web", "web", "https://shadow.test.internal/"),
             ]
 
@@ -872,26 +1221,273 @@ class ProductionClosureTests(unittest.TestCase):
                 kind: str, name: str, container: str, image: str
             ) -> str:
                 api_kind = "StatefulSet" if kind == "statefulset" else "Deployment"
+                accounts = {
+                    "control-api": "shadow-control-api",
+                    "worker": "shadow-worker",
+                    "action-executor": "shadow-action-executor",
+                    "simulator": "shadow-simulator-storage",
+                    "real-ot-collector": "shadow-real-ot-collector",
+                    "simulator-collector": "shadow-simulator-collector",
+                    "web": "shadow-web",
+                }
+                args = {
+                    "control-api": [
+                        "uvicorn",
+                        "shadow_sandbox.main:create_app",
+                        "--factory",
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        "8000",
+                        "--proxy-headers",
+                    ],
+                    "worker": ["python", "-m", "shadow_sandbox.worker"],
+                    "action-executor": [
+                        "uvicorn",
+                        "shadow_sandbox.action_api:create_app",
+                        "--factory",
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        "8020",
+                    ],
+                    "simulator": [
+                        "uvicorn",
+                        "shadow_simulator.api:create_app",
+                        "--factory",
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        "8010",
+                    ],
+                    "real-ot-collector": ["python", "-m", "shadow_collector.runner"],
+                    "simulator-collector": ["python", "-m", "shadow_collector.runner"],
+                    "web": [],
+                }
+                environment_references = {
+                    "control-api": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-release-coordinates"),
+                    ],
+                    "worker": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-release-coordinates"),
+                    ],
+                    "action-executor": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-release-coordinates"),
+                    ],
+                    "simulator": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-release-coordinates"),
+                    ],
+                    "real-ot-collector": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-real-ot-collector-binding"),
+                    ],
+                    "simulator-collector": [
+                        ("configMapRef", "shadow-runtime"),
+                        ("configMapRef", "shadow-simulator-collector-binding"),
+                    ],
+                    "web": [],
+                }
+                secret_environment = {
+                    "control-api": [
+                        (
+                            "SHADOW_DATABASE_URL",
+                            "shadow-api-secrets",
+                            "SHADOW_DATABASE_URL",
+                        ),
+                        (
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                            "shadow-api-secrets",
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                        ),
+                    ],
+                    "worker": [
+                        (
+                            "SHADOW_DATABASE_URL",
+                            "shadow-worker-secrets",
+                            "SHADOW_DATABASE_URL",
+                        )
+                    ],
+                    "action-executor": [
+                        (
+                            "SHADOW_DATABASE_URL",
+                            "shadow-action-secrets",
+                            "SHADOW_DATABASE_URL",
+                        ),
+                        (
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                            "shadow-action-secrets",
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                        ),
+                    ],
+                    "simulator": [
+                        (
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                            "shadow-simulator-secrets",
+                            "SHADOW_INTERNAL_SERVICE_TOKEN",
+                        )
+                    ],
+                    "real-ot-collector": [
+                        (
+                            "SHADOW_DATABASE_URL",
+                            "shadow-real-ot-collector-secrets",
+                            "SHADOW_DATABASE_URL",
+                        )
+                    ],
+                    "simulator-collector": [
+                        (
+                            "SHADOW_DATABASE_URL",
+                            "shadow-simulator-collector-secrets",
+                            "SHADOW_DATABASE_URL",
+                        )
+                    ],
+                    "web": [],
+                }
+                secret_names = {
+                    "simulator": ["shadow-simulator-pki"],
+                    "real-ot-collector": [
+                        "shadow-real-ot-collector-pki-current",
+                        "shadow-real-ot-collector-pki-next",
+                    ],
+                    "simulator-collector": [
+                        "shadow-simulator-collector-pki-current",
+                        "shadow-simulator-collector-pki-next",
+                    ],
+                }
+                env_from = "".join(
+                    f"            - {reference}: {{name: {target}}}\n"
+                    for reference, target in environment_references[name]
+                )
+                env_entries = "".join(
+                    "            - name: "
+                    + variable
+                    + "\n"
+                    + "              valueFrom:\n"
+                    + "                secretKeyRef:\n"
+                    + f"                  name: {secret}\n"
+                    + f"                  key: {key}\n"
+                    for variable, secret, key in secret_environment[name]
+                )
+                if name == "simulator":
+                    env_entries += (
+                        "            - {name: SHADOW_DATABASE_PATH, value: /var/lib/shadow/simulator.db}\n"
+                        "            - {name: SHADOW_OPCUA_CERTIFICATE_PATH, value: /var/run/shadow-pki/server.crt}\n"
+                        "            - {name: SHADOW_OPCUA_PRIVATE_KEY_PATH, value: /var/run/shadow-pki/server.key}\n"
+                    )
+                secret_volumes = "".join(
+                    f"        - name: secret-{index}\n          secret: {{secretName: {secret}}}\n"
+                    for index, secret in enumerate(secret_names.get(name, []))
+                )
+                labels = {
+                    "control-api": "{app: control-api, plane: control}",
+                    "worker": "{app: worker, plane: data}",
+                    "action-executor": "{app: action-executor, plane: action}",
+                    "simulator": "{app: simulator, plane: simulator}",
+                    "real-ot-collector": "{app: real-ot-collector, plane: collector, collector-target: real-ot}",
+                    "simulator-collector": "{app: simulator-collector, plane: collector, collector-target: simulator}",
+                    "web": "{app: web, plane: ingress}",
+                }
                 return (
                     "apiVersion: apps/v1\n"
                     f"kind: {api_kind}\n"
                     f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
                     "spec:\n"
+                    f"  selector: {{matchLabels: {{app: {name}}}}}\n"
                     "  template:\n"
+                    f"    metadata: {{labels: {labels[name]}}}\n"
                     "    spec:\n"
+                    f"      serviceAccountName: {accounts[name]}\n"
+                    f"      automountServiceAccountToken: {'true' if name == 'simulator' else 'false'}\n"
                     "      securityContext:\n"
                     "        runAsNonRoot: true\n"
                     "        seccompProfile: {type: RuntimeDefault}\n"
                     "      containers:\n"
                     f"        - name: {container}\n"
                     f"          image: {image}\n"
-                    "          securityContext:\n"
+                    + (
+                        f"          args: {json.dumps(args[name])}\n"
+                        if args[name]
+                        else ""
+                    )
+                    + ("          envFrom:\n" + env_from if env_from else "")
+                    + ("          env:\n" + env_entries if env_entries else "")
+                    + "          securityContext:\n"
                     "            allowPrivilegeEscalation: false\n"
                     "            readOnlyRootFilesystem: true\n"
                     "            capabilities: {drop: [ALL]}\n"
+                    + ("      volumes:\n" + secret_volumes if secret_volumes else "")
                 )
 
-            runtime = "---\n".join(
+            services = (
+                "apiVersion: v1\nkind: Service\nmetadata: {name: control-api, namespace: industrial-shadow}\nspec: {selector: {app: control-api}, ports: [{name: http, port: 8000, targetPort: http}]}\n---\n"
+                "apiVersion: v1\nkind: Service\nmetadata: {name: action-executor, namespace: industrial-shadow}\nspec: {selector: {app: action-executor}, ports: [{name: http, port: 8020, targetPort: http}]}\n---\n"
+                "apiVersion: v1\nkind: Service\nmetadata: {name: simulator, namespace: industrial-shadow}\nspec: {selector: {app: simulator}, ports: [{name: http, port: 8010, targetPort: http}, {name: opcua, port: 4840, targetPort: opcua}]}\n---\n"
+                "apiVersion: v1\nkind: Service\nmetadata: {name: web, namespace: industrial-shadow}\nspec: {selector: {app: web}, ports: [{name: http, port: 80, targetPort: http}]}\n"
+            )
+            storage_roles = {
+                "shadow-simulator-storage": "arn:aws:iam::123456789012:role/shadow-snapshot",
+                "shadow-backup-storage": "arn:aws:iam::123456789012:role/shadow-backup",
+            }
+
+            def service_account_manifest(name: str) -> str:
+                if name in storage_roles:
+                    metadata = (
+                        "metadata:\n"
+                        f"  name: {name}\n"
+                        "  namespace: industrial-shadow\n"
+                        "  annotations:\n"
+                        f"    eks.amazonaws.com/role-arn: {storage_roles[name]}\n"
+                    )
+                else:
+                    metadata = (
+                        f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
+                    )
+                token = name in {
+                    "shadow-simulator-storage",
+                    "shadow-backup-storage",
+                }
+                return (
+                    "apiVersion: v1\nkind: ServiceAccount\n"
+                    f"{metadata}"
+                    f"automountServiceAccountToken: {'true' if token else 'false'}\n"
+                )
+
+            service_accounts = "---\n".join(
+                service_account_manifest(name)
+                for name in (
+                    "shadow-control-api",
+                    "shadow-worker",
+                    "shadow-action-executor",
+                    "shadow-web",
+                    "shadow-migration",
+                    "shadow-real-ot-collector",
+                    "shadow-simulator-collector",
+                    "shadow-simulator-storage",
+                    "shadow-backup-storage",
+                )
+            )
+            policy_names = (
+                "default-deny",
+                "dns-egress",
+                "web-ingress-and-api",
+                "control-api-ingress",
+                "action-plane",
+                "simulator-plane",
+                "real-ot-collector-read-only-egress",
+                "simulator-collector-read-only-egress",
+                "data-jobs-egress",
+            )
+            policies = "---\n".join(
+                "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
+                f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
+                "spec: {podSelector: {}, policyTypes: [Ingress, Egress]}\n"
+                for name in policy_names
+            )
+
+            runtime_workloads = "---\n".join(
                 workload_manifest(
                     kind,
                     name,
@@ -900,10 +1496,34 @@ class ProductionClosureTests(unittest.TestCase):
                 )
                 for kind, name, container, image, _url in workload_values
             )
-            rollback = (
+            runtime = runtime_workloads + "---\n" + services
+            bootstrap = (
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: release, namespace: industrial-shadow}\n"
-                "data: {phase: prior}\n---\n"
+                "data: {phase: bootstrap}\n---\n"
+                "apiVersion: v1\nkind: ConfigMap\n"
+                "metadata: {name: shadow-runtime, namespace: industrial-shadow}\n"
+                "data: {SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots, SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups}\n---\n"
+                "apiVersion: v1\nkind: ConfigMap\n"
+                "metadata: {name: shadow-real-ot-collector-binding, namespace: industrial-shadow}\n"
+                "data:\n"
+                "  SHADOW_ENDPOINT_URI: opc.tcp://ot.test.internal:4840\n"
+                "  SHADOW_APPLICATION_URI: urn:industrial-shadow:test-server\n"
+                "  SHADOW_CLIENT_APPLICATION_URI: urn:industrial-shadow:test-client\n"
+                "  SHADOW_NAMESPACE_URI: urn:industrial-shadow:test-namespace\n"
+                f"  SHADOW_CERTIFICATE_FINGERPRINT: {'f' * 64}\n"
+                f"  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: {'1' * 64}\n"
+                f"  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: {'3' * 64}\n"
+                "  SHADOW_NODE_ALLOWLIST: '[{\"node_id\":\"ns=2;s=temperature\",\"signal_key\":\"temperature\",\"sample_period_ms\":500}]'\n"
+                "  SHADOW_MAXIMUM_NODES: '500'\n"
+                "  SHADOW_OPCUA_SECURITY_PROFILE: Basic256Sha256,SignAndEncrypt\n---\n"
+                + service_accounts
+                + "---\n"
+                + policies
+            )
+            rollback = (
+                bootstrap
+                + "---\n"
                 + "---\n".join(
                     workload_manifest(
                         kind,
@@ -913,13 +1533,11 @@ class ProductionClosureTests(unittest.TestCase):
                     )
                     for kind, name, container, image, _url in workload_values
                 )
+                + "---\n"
+                + services
             )
             contents = {
-                "bootstrap": (
-                    "apiVersion: v1\nkind: ConfigMap\n"
-                    "metadata: {name: release, namespace: industrial-shadow}\n"
-                    "data: {phase: bootstrap}\n"
-                ),
+                "bootstrap": bootstrap,
                 "migration": (
                     "apiVersion: batch/v1\nkind: Job\n"
                     "metadata: {name: shadow-migrate-release-20260809, namespace: industrial-shadow}\n"
@@ -927,12 +1545,23 @@ class ProductionClosureTests(unittest.TestCase):
                     "  template:\n"
                     "    spec:\n"
                     "      restartPolicy: Never\n"
+                    "      serviceAccountName: shadow-migration\n"
+                    "      automountServiceAccountToken: false\n"
                     "      securityContext:\n"
                     "        runAsNonRoot: true\n"
                     "        seccompProfile: {type: RuntimeDefault}\n"
                     "      containers:\n"
                     "        - name: migrate\n"
                     f"          image: {backend_image}\n"
+                    "          args: [python, -m, shadow_sandbox.operations.database_roles]\n"
+                    "          envFrom:\n"
+                    "            - configMapRef: {name: shadow-database-roles}\n"
+                    "          env:\n"
+                    "            - name: SHADOW_DATABASE_URL\n"
+                    "              valueFrom:\n"
+                    "                secretKeyRef:\n"
+                    "                  name: shadow-migration-secrets\n"
+                    "                  key: SHADOW_DATABASE_URL\n"
                     "          securityContext:\n"
                     "            allowPrivilegeEscalation: false\n"
                     "            readOnlyRootFilesystem: true\n"
@@ -978,6 +1607,66 @@ class ProductionClosureTests(unittest.TestCase):
                 candidate_image=backend_image,
                 expected_digest=str(plan_value["digest"]),
             )
+            self.assertEqual(
+                canonical_digest(["ns=2;s=temperature"]),
+                plan.real_ot_node_allowlist_digest,
+            )
+            self.assertEqual(
+                "industrial-shadow/production/snapshots",
+                plan.snapshot_object_storage_prefix,
+            )
+            self.assertEqual(
+                "industrial-shadow/production/backups",
+                plan.backup_object_storage_prefix,
+            )
+
+            def assert_invalid_runtime_secret_binding(
+                label: str, manifest: str
+            ) -> None:
+                invalid_manifest = root / f"{label}-runtime.yaml"
+                invalid_manifest.write_text(manifest, encoding="utf-8")
+                invalid_plan = json.loads(json.dumps(plan_value))
+                invalid_plan["runtime_manifest"] = {
+                    "path": str(invalid_manifest.relative_to(ROOT)),
+                    "sha256": hashlib.sha256(
+                        invalid_manifest.read_bytes()
+                    ).hexdigest(),
+                }
+                invalid_plan["digest"] = ""
+                invalid_plan["digest"] = canonical_digest(invalid_plan)
+                invalid_plan_path = root / f"{label}-deployment-plan.json"
+                invalid_plan_path.write_text(
+                    json.dumps(invalid_plan), encoding="utf-8"
+                )
+                with self.assertRaises(DomainError):
+                    ProductionDeploymentPlan.load(
+                        ROOT,
+                        invalid_plan_path,
+                        candidate_image=backend_image,
+                        expected_digest=str(invalid_plan["digest"]),
+                    )
+
+            assert_invalid_runtime_secret_binding(
+                "wrong-secret-reference",
+                runtime.replace(
+                    "name: shadow-api-secrets",
+                    "name: shadow-worker-secrets",
+                    1,
+                ),
+            )
+            assert_invalid_runtime_secret_binding(
+                "extra-secret-reference",
+                runtime.replace(
+                    "          securityContext:\n",
+                    "            - name: SHADOW_UNSEALED_OVERRIDE\n"
+                    "              valueFrom:\n"
+                    "                secretKeyRef:\n"
+                    "                  name: shadow-api-secrets\n"
+                    "                  key: SHADOW_UNSEALED_OVERRIDE\n"
+                    "          securityContext:\n",
+                    1,
+                ),
+            )
             unsafe_manifest = root / "unsafe-bootstrap.yaml"
             unsafe_manifest.write_text(
                 "apiVersion: rbac.authorization.k8s.io/v1\n"
@@ -1012,22 +1701,59 @@ class ProductionClosureTests(unittest.TestCase):
                 name: container
                 for _kind, name, container, _image, _url in workload_values
             }
+            workload_kinds = {
+                name: kind for kind, name, _container, _image, _url in workload_values
+            }
             observed_images_for_runner = dict(expected_images)
             applied: list[str] = []
+            api_ca = b"test-kubernetes-api-ca"
+            api_ca_digest = hashlib.sha256(api_ca).hexdigest()
+            cluster_uid_digest = canonical_digest(
+                {
+                    "api_server_ca_sha256": api_ca_digest,
+                    "kube_system_namespace_uid": "kube-system-test-uid",
+                }
+            )
+            rbac_payload = {
+                "resourceRules": [
+                    {
+                        "apiGroups": [group],
+                        "resources": [resource],
+                        "verbs": [verb],
+                        "resourceNames": [],
+                    }
+                    for group, resource, verb in sorted(PUBLISH_RBAC)
+                ],
+                "nonResourceRules": [],
+                "incomplete": False,
+                "evaluationError": "",
+            }
 
             def runner(command: Sequence[str], _timeout: int) -> str:
                 values = list(command)
+                if "config" in values and "view" in values:
+                    return json.dumps(
+                        {
+                            "clusters": [
+                                {
+                                    "cluster": {
+                                        "server": "https://kubernetes.test.internal",
+                                        "certificate-authority-data": base64.b64encode(
+                                            api_ca
+                                        ).decode(),
+                                    }
+                                }
+                            ]
+                        }
+                    )
+                if (
+                    "get" in values
+                    and "namespace" in values
+                    and "kube-system" in values
+                ):
+                    return json.dumps({"metadata": {"uid": "kube-system-test-uid"}})
                 if "auth" in values:
-                    index = values.index("can-i")
-                    forbidden = {
-                        "*",
-                        "secrets",
-                        "roles.rbac.authorization.k8s.io",
-                        "rolebindings.rbac.authorization.k8s.io",
-                        "serviceaccounts/token",
-                        "pods/exec",
-                    }
-                    return "no\n" if values[index + 2] in forbidden else "yes\n"
+                    return json.dumps(rbac_payload)
                 if "apply" in values and "--dry-run=server" not in values:
                     manifest_path = str(values[values.index("-f") + 1])
                     applied.append(manifest_path)
@@ -1038,9 +1764,82 @@ class ProductionClosureTests(unittest.TestCase):
                         {
                             "spec": {
                                 "template": {
-                                    "spec": {"containers": [{"image": backend_image}]}
+                                    "spec": {
+                                        "containers": [
+                                            {"name": "migrate", "image": backend_image}
+                                        ]
+                                    }
                                 }
-                            }
+                            },
+                            "status": {
+                                "succeeded": 1,
+                                "failed": 0,
+                                "conditions": [{"type": "Complete", "status": "True"}],
+                            },
+                        }
+                    )
+                if "get" in values and "pods" in values:
+                    selector = values[values.index("-l") + 1]
+                    if selector.startswith("job-name="):
+                        return json.dumps({"items": []})
+                    name = selector.removeprefix("app=")
+                    image = observed_images_for_runner[name]
+                    owner_uid = (
+                        name + "-rs-uid"
+                        if workload_kinds[name] == "deployment"
+                        else name + "-uid"
+                    )
+                    return json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "name": name + "-pod",
+                                        "uid": name + "-pod-uid",
+                                        "ownerReferences": [
+                                            {
+                                                "uid": owner_uid,
+                                                "controller": True,
+                                            }
+                                        ],
+                                    },
+                                    "status": {
+                                        "phase": "Running",
+                                        "conditions": [
+                                            {"type": "Ready", "status": "True"}
+                                        ],
+                                        "containerStatuses": [
+                                            {
+                                                "name": containers[name],
+                                                "ready": True,
+                                                "imageID": "docker-pullable://" + image,
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                if "get" in values and "replicasets" in values:
+                    selector = values[values.index("-l") + 1]
+                    name = selector.removeprefix("app=")
+                    return json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "uid": name + "-rs-uid",
+                                        "annotations": {
+                                            "deployment.kubernetes.io/revision": "1"
+                                        },
+                                        "ownerReferences": [
+                                            {"uid": name + "-uid", "controller": True}
+                                        ],
+                                    },
+                                    "spec": {"replicas": 1},
+                                    "status": {"readyReplicas": 1},
+                                }
+                            ]
                         }
                     )
                 if "get" in values:
@@ -1048,7 +1847,15 @@ class ProductionClosureTests(unittest.TestCase):
                     name = str(values[index + 2])
                     return json.dumps(
                         {
+                            "metadata": {
+                                "uid": name + "-uid",
+                                "generation": 1,
+                                "annotations": {
+                                    "deployment.kubernetes.io/revision": "1"
+                                },
+                            },
                             "spec": {
+                                "replicas": 1,
                                 "template": {
                                     "spec": {
                                         "containers": [
@@ -1060,8 +1867,18 @@ class ProductionClosureTests(unittest.TestCase):
                                             }
                                         ]
                                     }
-                                }
-                            }
+                                },
+                            },
+                            "status": {
+                                "observedGeneration": 1,
+                                "updatedReplicas": 1,
+                                "currentReplicas": 1,
+                                "readyReplicas": 1,
+                                "availableReplicas": 1,
+                                "unavailableReplicas": 0,
+                                "currentRevision": "revision-1",
+                                "updateRevision": "revision-1",
+                            },
                         }
                     )
                 return ""
@@ -1069,11 +1886,14 @@ class ProductionClosureTests(unittest.TestCase):
             evidence = KubernetesProductionPublisher(
                 plan,
                 confirmation="industrial-shadow:release-20260809:deploy",
+                context="production-test",
+                expected_cluster_uid_digest=cluster_uid_digest,
+                expected_kubernetes_api_ca_digest=api_ca_digest,
                 runner=runner,
                 readiness_probe=lambda _url: True,
             ).run()
             self.assertEqual("PASSED", evidence.status)
-            self.assertEqual(6, evidence.metrics["ready_workloads"])
+            self.assertEqual(7, evidence.metrics["ready_workloads"])
             self.assertNotEqual(str(plan.rollback_manifest.path), applied[-1])
             observed_images_for_runner["control-api"] = (
                 "registry.test.internal/shadow@sha256:" + "b" * 64
@@ -1082,6 +1902,9 @@ class ProductionClosureTests(unittest.TestCase):
             failed = KubernetesProductionPublisher(
                 plan,
                 confirmation="industrial-shadow:release-20260809:deploy",
+                context="production-test",
+                expected_cluster_uid_digest=cluster_uid_digest,
+                expected_kubernetes_api_ca_digest=api_ca_digest,
                 runner=runner,
                 readiness_probe=lambda _url: True,
             ).run()
@@ -1112,6 +1935,9 @@ class ProductionClosureTests(unittest.TestCase):
                 KubernetesProductionPublisher(
                     plan,
                     confirmation="industrial-shadow:release-20260809:deploy",
+                    context="production-test",
+                    expected_cluster_uid_digest=cluster_uid_digest,
+                    expected_kubernetes_api_ca_digest=api_ca_digest,
                     runner=partial_bootstrap_failure,
                     readiness_probe=lambda _url: True,
                 ).run()
@@ -1170,6 +1996,17 @@ class ProductionClosureTests(unittest.TestCase):
                             web_scan_report.read_bytes()
                         ).hexdigest(),
                     }
+                elif gate in {"external_ca", "real_ot"}:
+                    metrics = {
+                        "server_certificate_fingerprint": "f" * 64,
+                        "client_certificate_fingerprint": "1" * 64,
+                        "next_client_certificate_fingerprint": "3" * 64,
+                        "client_application_uri": "urn:industrial-shadow:test-client",
+                        "security_policy": "Basic256Sha256",
+                    }
+                    if gate == "real_ot":
+                        metrics["node_allowlist_digest"] = "2" * 64
+                        metrics["runtime_binding_digest"] = "4" * 64
                 else:
                     metrics = {}
                 value = bind_to_acceptance_run(
@@ -1210,8 +2047,36 @@ class ProductionClosureTests(unittest.TestCase):
                     for identity, role, private in signer_material
                 ]
             )
+            attestations = []
+            for gate in ("security", "privacy", "accessibility", "benchmark_150"):
+                report = root / f"{gate}-report.json"
+                artifact = root / f"{gate}-artifact.json"
+                report.write_text('{"signed":"fixture"}\n', encoding="utf-8")
+                artifact.write_text('{"evidence":"fixture"}\n', encoding="utf-8")
+                attestations.append(
+                    {
+                        "gate": gate,
+                        "report_path": str(report.relative_to(ROOT)),
+                        "report_sha256": hashlib.sha256(
+                            report.read_bytes()
+                        ).hexdigest(),
+                        "report_digest": hashlib.sha256(
+                            (gate + "-report").encode()
+                        ).hexdigest(),
+                        "trust_store_digest": trust_store.digest,
+                        "artifacts": [
+                            {
+                                "path": str(artifact.relative_to(ROOT)),
+                                "sha256": hashlib.sha256(
+                                    artifact.read_bytes()
+                                ).hexdigest(),
+                            }
+                        ],
+                    }
+                )
             approval = approval_payload(
                 evidence,
+                attestations,
                 release_coordinates=release_coordinates,
                 trust_store=trust_store,
             )
@@ -1238,11 +2103,12 @@ class ProductionClosureTests(unittest.TestCase):
             closure = build_closure(
                 evidence,
                 signatories,
+                attestations=attestations,
                 release_coordinates=release_coordinates,
                 trust_store=trust_store,
             )
             self.assertEqual("verified", closure["status"])
-            self.assertEqual(15, len(closure["artifacts"]))
+            self.assertEqual(len(SOURCE_GATES), len(closure["artifacts"]))
             self.assertEqual(
                 {
                     "real_write_attempts": 0,
@@ -1309,9 +2175,34 @@ class ProductionClosureTests(unittest.TestCase):
                         "memory_bytes": 8 * 1024**3,
                         "orchestrator_version": "kubernetes-v1-test",
                         "cluster_uid_digest": "d" * 64,
+                        "kubernetes_api_ca_digest": "e" * 64,
+                        "aws_account_id": "123456789012",
+                        "aws_region": "us-east-1",
+                        "s3_bucket": "industrial-shadow-production",
+                        "s3_probe_prefix": "industrial-shadow/production-acceptance",
+                        "snapshot_object_storage_prefix": "industrial-shadow/snapshots",
+                        "backup_object_storage_prefix": "industrial-shadow/backups",
+                        "kms_key_id_digest": "1" * 64,
+                        "backup_restore_receipt_digest": "0" * 64,
+                        "backup_workload_identity_arn_digest": "2" * 64,
+                        "snapshot_workload_identity_arn_digest": "3" * 64,
+                        "oidc_issuer": "https://identity.internal/tenant",
+                        "oidc_audience_digest": "0" * 64,
+                        "oidc_human_client_id_digest": "1" * 64,
+                        "oidc_service_client_ids_digest": "2" * 64,
+                        "managed_postgresql_provider": "aws-rds",
+                        "managed_postgresql_source_resource_digest": "4" * 64,
+                        "managed_postgresql_restore_resource_digest": "5" * 64,
+                        "managed_postgresql_source_coordinate_digest": "6" * 64,
+                        "managed_postgresql_restore_coordinate_digest": "7" * 64,
+                        "managed_postgresql_source_kms_key_digest": "8" * 64,
+                        "managed_postgresql_restore_kms_key_digest": "9" * 64,
+                        "managed_postgresql_source_ca_identifier_digest": "a" * 64,
+                        "managed_postgresql_restore_ca_identifier_digest": "f" * 64,
                         "candidate_image": candidate,
                         "build_digest": "b" * 64,
                         "simulator_build_digest": "c" * 64,
+                        "deployment_plan_digest": "d" * 64,
                     }
                 ),
                 encoding="utf-8",
@@ -1369,6 +2260,7 @@ class ProductionClosureTests(unittest.TestCase):
                     [("independent-evaluator", ["formal_measurement"], public)]
                 ),
                 environment_digest=environment_digest,
+                deployment_plan_digest="d" * 64,
             )
             report: dict[str, object] = {
                 "schema_version": 1,
@@ -1379,6 +2271,7 @@ class ProductionClosureTests(unittest.TestCase):
                 "candidate_image": candidate,
                 "build_digest": "b" * 64,
                 "simulator_build_digest": "c" * 64,
+                "deployment_plan_digest": "d" * 64,
                 "suite_digest": importer.suite_digest,
                 "bundle_digest": importer.bundle_digest,
                 "result_digest": result_digest,
