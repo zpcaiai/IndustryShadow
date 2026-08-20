@@ -213,6 +213,10 @@ jobs:
           test "$(pg_restore --version | sed -E 's/.* ([0-9]+)\..*/\1/')" = 16
           kubectl version --client
           docker version
+      - name: Prepare the run-bound disposable source mutation confirmation
+        run: >-
+          python tools/validate_local_postgresql_restore.py
+          --prepare-source-confirmation-github-env "$GITHUB_ENV"
       - name: Build complete source-bound partial evidence
         run: python tools/build_evidence.py
       - name: Revalidate generated evidence and implementation contracts

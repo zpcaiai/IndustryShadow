@@ -110,20 +110,38 @@ empty target database name must contain `restore_drill`. Keep both URLs on loopb
 in explicitly:
 
 ```sh
-SHADOW_TEST_POSTGRESQL_URL='postgresql+psycopg://.../shadow_test?sslmode=disable' \
-SHADOW_TEST_RESTORE_POSTGRESQL_URL='postgresql+psycopg://.../shadow_restore_drill?sslmode=disable' \
+SHADOW_TEST_POSTGRESQL_URL='postgresql+psycopg://admin:...@127.0.0.1:5432/shadow_test?sslmode=disable' \
+SHADOW_TEST_RESTORE_POSTGRESQL_URL='postgresql+psycopg://admin:...@127.0.0.1:5433/shadow_restore_drill?sslmode=disable' \
+SHADOW_LOCAL_RESTORE_RUN_ID='replace-with-a-canonical-non-zero-uuid' \
+SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION='local-postgresql-source-acl-mutation/v1:RUN_UUID:shadow_test@SOURCE_SYSTEM_IDENTIFIER:shadow_restore_drill@TARGET_SYSTEM_IDENTIFIER' \
 SHADOW_ALLOW_LOCAL_RESTORE_DRILL=true make postgres-restore-test
 ```
 
+Before running it, obtain each `SYSTEM_IDENTIFIER` with the read-only
+`SELECT system_identifier::text FROM pg_control_system();` query against the corresponding
+URL, choose a fresh canonical UUID, and substitute the same UUID and exact numeric identifiers
+into the confirmation string. The confirmation is intentionally bound to that run, source
+database and cluster, and target database and cluster; copying it to another pair fails closed.
+Successful local evidence records digests of the run UUID and both observed cluster identifiers.
+The checked-in GitHub evidence-refresh job obtains the same values through
+`--prepare-source-confirmation-github-env "$GITHUB_ENV"`; that preparation mode performs only
+the two cluster-identity reads and safely appends a fresh one-run confirmation to GitHub's
+existing environment file before the separate evidence process starts.
+
 The command refuses non-loopback URLs, source and target databases on the same PostgreSQL
 cluster, a non-disposable source name, a non-empty or ambiguously named target, and
-invocations without the exact confirmation flag. Confirmation, cluster identity, and target
-emptiness are checked before any role, grant, backup, or restore mutation. It then creates
+invocations without both exact confirmations. The global `true` flag is checked before either
+database is opened. Both cluster identities and the independent run-bound source confirmation
+are then checked before any role, grant, backup, or restore mutation. It then creates
 matching disposable tenant, maintenance, and read-only `BYPASSRLS` backup roles in both
 local clusters, applies the exact runtime grant matrix, and runs the exported-snapshot dump
 through the backup role rather than either migration owner. The URLs must therefore identify
 disposable local administrators that may create and drop those temporary roles. Success and
-failure paths remove every temporary role and grant. The command then exercises the same
+failure paths remove every temporary role and its owned grants. The source is not read-only
+during this drill: its public/database/default ACLs are deliberately hardened before the backup,
+and PUBLIC/default-privilege changes are not restored. Never point the source URL at production,
+shared development, or any database that is not disposable. The command
+then exercises the same
 version-bound receipt, catalog, row, RLS, archive-size, RPO, and RTO restore path used by the
 production gate. Its process-local object backend explicitly simulates version IDs, KMS, and
 Object Lock and the result carries that limitation. It is local evidence only and does not

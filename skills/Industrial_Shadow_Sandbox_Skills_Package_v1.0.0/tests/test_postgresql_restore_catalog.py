@@ -70,8 +70,8 @@ class PostgreSqlRestoreCatalogTests(unittest.TestCase):
         self.assertEqual(forward_inventory, reverse_inventory)
         self.assertEqual(3, forward_inventory["events"]["count"])
         self.assertEqual(64, len(str(forward_inventory["events"]["sha256"])))
-        without_duplicate = _table_inventory(  # type: ignore[arg-type]
-            TableInventoryStore((one, two))
+        without_duplicate = _table_inventory(
+            TableInventoryStore((one, two))  # type: ignore[arg-type]
         )
         self.assertNotEqual(
             forward_inventory["events"]["sha256"],
@@ -101,11 +101,40 @@ class PostgreSqlRestoreCatalogTests(unittest.TestCase):
             }.issubset({*names, "sequence_runtime_state"})
         )
         baseline = _catalog_inventory(CatalogStore())  # type: ignore[arg-type]
-        changed = _catalog_inventory(  # type: ignore[arg-type]
-            CatalogStore({"triggers": "different-trigger-definition"})
+        changed = _catalog_inventory(
+            CatalogStore(  # type: ignore[arg-type]
+                {"triggers": "different-trigger-definition"}
+            )
         )
         self.assertNotEqual(baseline["sha256"], changed["sha256"])
         self.assertEqual(len(names) + 1, len(baseline["sections"]))  # type: ignore[arg-type]
+
+    def test_acl_catalog_ordering_uses_normalized_text_columns(self) -> None:
+        queries = dict(CATALOG_SECURITY_QUERIES)
+        object_privileges = queries["object_privileges"]
+        self.assertIn("grantor_role.rolname::text AS grantor", object_privileges)
+        self.assertIn("grantee_role.rolname::text END AS grantee", object_privileges)
+        self.assertIn(
+            'ORDER BY normalized_privileges.object_kind COLLATE \"C\"',
+            object_privileges,
+        )
+        self.assertIn(
+            'normalized_privileges.grantee COLLATE \"C\"', object_privileges
+        )
+        self.assertNotIn("LEFT JOIN pg_roles grantee ON", object_privileges)
+        self.assertNotIn("LEFT JOIN pg_roles grantor ON", object_privileges)
+        self.assertIn("CAST('s' AS \"char\")", object_privileges)
+        self.assertNotIn("CAST('S' AS \"char\")", object_privileges)
+
+        default_privileges = queries["default_privileges"]
+        self.assertIn("owner_role.rolname::text AS owner", default_privileges)
+        self.assertIn(
+            'ORDER BY normalized_defaults.owner COLLATE \"C\"',
+            default_privileges,
+        )
+        self.assertIn(
+            'normalized_defaults.grantee COLLATE \"C\"', default_privileges
+        )
 
     def test_streaming_store_uses_server_cursor_and_utc_rendering(self) -> None:
         source = inspect.getsource(SqlAlchemyStore.iterate)

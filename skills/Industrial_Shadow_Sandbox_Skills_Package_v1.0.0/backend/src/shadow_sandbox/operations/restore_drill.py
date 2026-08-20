@@ -876,7 +876,7 @@ CATALOG_SECURITY_QUERIES: tuple[tuple[str, str], ...] = (
                   UNION ALL
                   SELECT 'relation:' || relation.relkind::text, relation.relname,
                          relation.relowner, relation.relacl,
-                         CASE WHEN relation.relkind='S' THEN CAST('S' AS \"char\")
+                         CASE WHEN relation.relkind='S' THEN CAST('s' AS \"char\")
                               ELSE CAST('r' AS \"char\") END
                     FROM pg_class relation
                     JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
@@ -890,54 +890,83 @@ CATALOG_SECURITY_QUERIES: tuple[tuple[str, str], ...] = (
                     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
                    WHERE namespace.nspname='public'
              )
-           SELECT secured_objects.object_kind, secured_objects.object_identity,
-                  grantor.rolname AS grantor,
-                  CASE WHEN privilege.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END AS grantee,
-                  privilege.privilege_type, privilege.is_grantable
-             FROM secured_objects
-       CROSS JOIN LATERAL aclexplode(
-                  COALESCE(secured_objects.acl,
-                           acldefault(secured_objects.default_kind, secured_objects.owner_oid))
-             ) AS privilege
-        LEFT JOIN pg_roles grantor ON grantor.oid=privilege.grantor
-        LEFT JOIN pg_roles grantee ON grantee.oid=privilege.grantee
-         ORDER BY secured_objects.object_kind COLLATE \"C\",
-                  secured_objects.object_identity COLLATE \"C\",
-                  grantee COLLATE \"C\", privilege.privilege_type COLLATE \"C\",
-                  grantor COLLATE \"C\"""",
+           SELECT normalized_privileges.object_kind,
+                  normalized_privileges.object_identity,
+                  normalized_privileges.grantor,
+                  normalized_privileges.grantee,
+                  normalized_privileges.privilege_type,
+                  normalized_privileges.is_grantable
+             FROM (
+                   SELECT secured_objects.object_kind::text AS object_kind,
+                          secured_objects.object_identity::text AS object_identity,
+                          grantor_role.rolname::text AS grantor,
+                          CASE WHEN exploded_acl.grantee=0 THEN 'PUBLIC'
+                               ELSE grantee_role.rolname::text END AS grantee,
+                          exploded_acl.privilege_type::text AS privilege_type,
+                          exploded_acl.is_grantable
+                     FROM secured_objects
+               CROSS JOIN LATERAL aclexplode(
+                          COALESCE(
+                              secured_objects.acl,
+                              acldefault(
+                                  secured_objects.default_kind,
+                                  secured_objects.owner_oid
+                              )
+                          )
+                     ) AS exploded_acl
+                LEFT JOIN pg_roles grantor_role
+                       ON grantor_role.oid=exploded_acl.grantor
+                LEFT JOIN pg_roles grantee_role
+                       ON grantee_role.oid=exploded_acl.grantee
+                  ) AS normalized_privileges
+         ORDER BY normalized_privileges.object_kind COLLATE \"C\",
+                  normalized_privileges.object_identity COLLATE \"C\",
+                  normalized_privileges.grantee COLLATE \"C\",
+                  normalized_privileges.privilege_type COLLATE \"C\",
+                  normalized_privileges.grantor COLLATE \"C\"""",
     ),
     (
         "default_privileges",
         """SELECT owner, schema_name, object_kind, grantor, grantee,
                   privilege_type, is_grantable
              FROM (
-                   SELECT owner.rolname AS owner,
-                          COALESCE(namespace.nspname, '') AS schema_name,
+                   SELECT owner_role.rolname::text AS owner,
+                          COALESCE(namespace_object.nspname::text, '') AS schema_name,
                           defaults.defaclobjtype::text AS object_kind,
                           '<entry>' AS grantor, '<entry>' AS grantee,
                           '<entry>' AS privilege_type, false AS is_grantable
                      FROM pg_default_acl defaults
-                     JOIN pg_roles owner ON owner.oid=defaults.defaclrole
-                LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+                     JOIN pg_roles owner_role ON owner_role.oid=defaults.defaclrole
+                LEFT JOIN pg_namespace namespace_object
+                       ON namespace_object.oid=defaults.defaclnamespace
                    UNION ALL
-                   SELECT owner.rolname, COALESCE(namespace.nspname, ''),
+                   SELECT owner_role.rolname::text,
+                          COALESCE(namespace_object.nspname::text, ''),
                           defaults.defaclobjtype::text,
-                          grantor.rolname,
-                          CASE WHEN privilege.grantee=0 THEN 'PUBLIC' ELSE grantee.rolname END,
-                          privilege.privilege_type, privilege.is_grantable
+                          grantor_role.rolname::text,
+                          CASE WHEN exploded_acl.grantee=0 THEN 'PUBLIC'
+                               ELSE grantee_role.rolname::text END,
+                          exploded_acl.privilege_type::text,
+                          exploded_acl.is_grantable
                      FROM pg_default_acl defaults
-                     JOIN pg_roles owner ON owner.oid=defaults.defaclrole
-                LEFT JOIN pg_namespace namespace ON namespace.oid=defaults.defaclnamespace
+                     JOIN pg_roles owner_role ON owner_role.oid=defaults.defaclrole
+                LEFT JOIN pg_namespace namespace_object
+                       ON namespace_object.oid=defaults.defaclnamespace
                CROSS JOIN LATERAL aclexplode(
                           COALESCE(defaults.defaclacl, '{}'::aclitem[])
-                     ) AS privilege
-                LEFT JOIN pg_roles grantor ON grantor.oid=privilege.grantor
-                LEFT JOIN pg_roles grantee ON grantee.oid=privilege.grantee
+                     ) AS exploded_acl
+                LEFT JOIN pg_roles grantor_role
+                       ON grantor_role.oid=exploded_acl.grantor
+                LEFT JOIN pg_roles grantee_role
+                       ON grantee_role.oid=exploded_acl.grantee
                   ) AS normalized_defaults
-         ORDER BY owner COLLATE \"C\", schema_name COLLATE \"C\",
-                  object_kind COLLATE \"C\", grantor COLLATE \"C\",
-                  grantee COLLATE \"C\", privilege_type COLLATE \"C\",
-                  is_grantable""",
+         ORDER BY normalized_defaults.owner COLLATE \"C\",
+                  normalized_defaults.schema_name COLLATE \"C\",
+                  normalized_defaults.object_kind COLLATE \"C\",
+                  normalized_defaults.grantor COLLATE \"C\",
+                  normalized_defaults.grantee COLLATE \"C\",
+                  normalized_defaults.privilege_type COLLATE \"C\",
+                  normalized_defaults.is_grantable""",
     ),
 )
 

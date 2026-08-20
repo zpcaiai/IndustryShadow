@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from collections.abc import Sequence
+from pathlib import Path
 from unittest.mock import patch
 
 from shadow_sandbox.common import DomainError
@@ -15,9 +17,13 @@ from shadow_sandbox.operations.restore_drill import (
 
 from tools.postgresql_test_roles import temporary_postgresql_test_role
 from tools.validate_local_postgresql_restore import (
+    _append_github_environment,
     _cluster_identifier,
     _database_role_url,
+    _local_database_url,
     _require_disposable_database_names,
+    _require_source_mutation_confirmation,
+    _source_mutation_confirmation,
 )
 from tools.validate_local_postgresql_restore import main as local_restore_main
 
@@ -41,6 +47,29 @@ class _ClusterStore:
     ) -> list[dict[str, object]]:
         del sql, parameters
         return [{"identifier": self.identifier}]
+
+
+class _ReadOnlyClusterStore:
+    def __init__(self, identifier: str) -> None:
+        self.identifier = identifier
+        self.queries: list[str] = []
+        self.closed = False
+
+    def query(
+        self, sql: str, parameters: Sequence[object] = ()
+    ) -> list[dict[str, object]]:
+        del parameters
+        self.queries.append(sql)
+        if "pg_control_system()" not in sql:
+            raise AssertionError("query executed before source mutation confirmation")
+        return [{"identifier": self.identifier}]
+
+    def execute(self, sql: str, parameters: Sequence[object] = ()) -> object:
+        del sql, parameters
+        raise AssertionError("database mutated before source mutation confirmation")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class PostgreSqlValidatorCleanupTests(unittest.TestCase):
@@ -81,6 +110,150 @@ class PostgreSqlValidatorCleanupTests(unittest.TestCase):
             local_restore_main()
         constructor.assert_not_called()
 
+    def test_source_mutation_confirmation_is_run_and_cluster_bound(self) -> None:
+        run_id = "11111111-2222-4333-8444-555555555555"
+        source_url = "postgresql://admin@127.0.0.1:5432/shadow_test"
+        target_url = "postgresql://admin@127.0.0.1:5433/shadow_restore_drill"
+        expected = _source_mutation_confirmation(
+            run_id=run_id,
+            source_url=source_url,
+            source_cluster_identifier="123456789",
+            target_url=target_url,
+            target_cluster_identifier="987654321",
+        )
+        self.assertEqual(
+            "local-postgresql-source-acl-mutation/v1:"
+            f"{run_id}:shadow_test@123456789:shadow_restore_drill@987654321",
+            expected,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SHADOW_LOCAL_RESTORE_RUN_ID": run_id,
+                "SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION": expected,
+            },
+            clear=True,
+        ):
+            _require_source_mutation_confirmation(
+                source_url=source_url,
+                source_cluster_identifier="123456789",
+                target_url=target_url,
+                target_cluster_identifier="987654321",
+            )
+            with self.assertRaises(DomainError):
+                _require_source_mutation_confirmation(
+                    source_url=source_url,
+                    source_cluster_identifier="123456789",
+                    target_url=target_url,
+                    target_cluster_identifier="987654322",
+                )
+
+    def test_source_confirmation_precedes_role_acl_and_backup_mutation(self) -> None:
+        source = _ReadOnlyClusterStore("123456789")
+        target = _ReadOnlyClusterStore("987654321")
+        environment = {
+            "SHADOW_ALLOW_LOCAL_RESTORE_DRILL": "true",
+            "SHADOW_TEST_POSTGRESQL_URL": (
+                "postgresql+psycopg://admin@127.0.0.1:5432/shadow_test?sslmode=disable"
+            ),
+            "SHADOW_TEST_RESTORE_POSTGRESQL_URL": (
+                "postgresql+psycopg://admin@127.0.0.1:5433/"
+                "shadow_restore_drill?sslmode=disable"
+            ),
+            "SHADOW_LOCAL_RESTORE_RUN_ID": "11111111-2222-4333-8444-555555555555",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(sys, "argv", ["validate_local_postgresql_restore.py"]),
+            patch(
+                "tools.validate_local_postgresql_restore.SqlAlchemyStore",
+                side_effect=(source, target),
+            ),
+            self.assertRaises(DomainError) as raised,
+        ):
+            local_restore_main()
+        self.assertEqual(
+            "LOCAL_RESTORE_SOURCE_CONFIRMATION_REQUIRED", raised.exception.code
+        )
+        self.assertEqual(1, len(source.queries))
+        self.assertEqual(1, len(target.queries))
+        self.assertTrue(source.closed)
+        self.assertTrue(target.closed)
+
+    def test_prepare_mode_emits_exact_fresh_confirmation_without_mutation(self) -> None:
+        source = _ReadOnlyClusterStore("123456789")
+        target = _ReadOnlyClusterStore("987654321")
+        environment = {
+            "SHADOW_ALLOW_LOCAL_RESTORE_DRILL": "true",
+            "SHADOW_TEST_POSTGRESQL_URL": (
+                "postgresql+psycopg://admin@127.0.0.1:5432/shadow_test?sslmode=disable"
+            ),
+            "SHADOW_TEST_RESTORE_POSTGRESQL_URL": (
+                "postgresql+psycopg://admin@127.0.0.1:5433/"
+                "shadow_restore_drill?sslmode=disable"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            github_environment = Path(directory) / "github-env"
+            github_environment.write_text("EXISTING=value\n", encoding="utf-8")
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "validate_local_postgresql_restore.py",
+                        "--prepare-source-confirmation-github-env",
+                        str(github_environment),
+                    ],
+                ),
+                patch(
+                    "tools.validate_local_postgresql_restore.SqlAlchemyStore",
+                    side_effect=(source, target),
+                ),
+            ):
+                self.assertEqual(0, local_restore_main())
+            values = dict(
+                line.split("=", 1)
+                for line in github_environment.read_text(encoding="utf-8").splitlines()
+            )
+        run_id = values["SHADOW_LOCAL_RESTORE_RUN_ID"]
+        self.assertEqual(
+            _source_mutation_confirmation(
+                run_id=run_id,
+                source_url=environment["SHADOW_TEST_POSTGRESQL_URL"],
+                source_cluster_identifier="123456789",
+                target_url=environment["SHADOW_TEST_RESTORE_POSTGRESQL_URL"],
+                target_cluster_identifier="987654321",
+            ),
+            values["SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION"],
+        )
+        self.assertEqual(
+            [
+                "EXISTING",
+                "SHADOW_LOCAL_RESTORE_RUN_ID",
+                "SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION",
+            ],
+            list(values),
+        )
+        self.assertEqual(1, len(source.queries))
+        self.assertEqual(1, len(target.queries))
+        self.assertTrue(source.closed)
+        self.assertTrue(target.closed)
+
+    def test_confirmation_output_rejects_relative_and_symlink_paths(self) -> None:
+        values = {"SHADOW_LOCAL_RESTORE_RUN_ID": "11111111-2222-4333-8444-555555555555"}
+        with self.assertRaises(DomainError):
+            _append_github_environment(Path("relative-github-env"), values)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.write_text("preserve\n", encoding="utf-8")
+            link = Path(directory) / "github-env"
+            link.symlink_to(target)
+            with self.assertRaises(DomainError):
+                _append_github_environment(link, values)
+            self.assertEqual("preserve\n", target.read_text(encoding="utf-8"))
+
     def test_disposable_database_names_are_required_before_role_mutation(self) -> None:
         _require_disposable_database_names(
             "postgresql://admin@127.0.0.1/shadow_test",
@@ -95,6 +268,30 @@ class PostgreSqlValidatorCleanupTests(unittest.TestCase):
             _require_disposable_database_names(
                 "postgresql://admin@127.0.0.1/shadow_test",
                 "postgresql://admin@127.0.0.1/customer_data",
+            )
+        with self.assertRaises(DomainError):
+            _require_disposable_database_names(
+                "postgresql://admin@127.0.0.1/shadow_test%3Aunsafe",
+                "postgresql://admin@127.0.0.1/shadow_restore_drill",
+            )
+
+    def test_loopback_source_and_target_ports_remain_supported(self) -> None:
+        source = "postgresql+psycopg://admin@127.0.0.1:5432/shadow_test?sslmode=disable"
+        target = (
+            "postgresql+psycopg://admin@localhost:5433/"
+            "shadow_restore_drill?sslmode=disable"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SHADOW_TEST_POSTGRESQL_URL": source,
+                "SHADOW_TEST_RESTORE_POSTGRESQL_URL": target,
+            },
+            clear=True,
+        ):
+            self.assertEqual(source, _local_database_url("SHADOW_TEST_POSTGRESQL_URL"))
+            self.assertEqual(
+                target, _local_database_url("SHADOW_TEST_RESTORE_POSTGRESQL_URL")
             )
 
     def test_cluster_identifier_is_strict_and_canonical(self) -> None:

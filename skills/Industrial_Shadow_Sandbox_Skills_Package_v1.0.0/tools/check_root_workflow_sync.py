@@ -232,6 +232,8 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
                 "5433/shadow_restore_drill?sslmode=disable"
             ),
             'SHADOW_ALLOW_LOCAL_RESTORE_DRILL: "true"',
+            "Prepare the run-bound disposable source mutation confirmation",
+            '--prepare-source-confirmation-github-env "$GITHUB_ENV"',
             "azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d",
             "version: v1.32.2",
             "python tools/build_evidence.py",

@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import os
 import re
+import stat
 import tempfile
 import uuid
 from collections.abc import Sequence
@@ -163,6 +164,15 @@ def _required(name: str) -> str:
     return value
 
 
+def _require_local_restore_confirmation() -> None:
+    if os.environ.get("SHADOW_ALLOW_LOCAL_RESTORE_DRILL") != "true":
+        raise DomainError(
+            "RESTORE_CONFIRMATION_REQUIRED",
+            "explicit destructive local restore confirmation is required before any database "
+            "connection or mutation",
+        )
+
+
 def _local_database_url(name: str) -> str:
     value = _required(name)
     hostname = urlsplit(
@@ -190,7 +200,10 @@ def _database_name(database_url: str) -> str:
 def _require_disposable_database_names(source_url: str, target_url: str) -> None:
     source_database = _database_name(source_url)
     target_database = _database_name(target_url)
-    if re.search(r"(?:^|_)(?:test|fixture|smoke)(?:_|$)", source_database) is None:
+    if (
+        re.fullmatch(r"[a-zA-Z0-9_]+", source_database) is None
+        or re.search(r"(?:^|_)(?:test|fixture|smoke)(?:_|$)", source_database) is None
+    ):
         raise DomainError(
             "LOCAL_RESTORE_SOURCE_FORBIDDEN",
             "local restore source database must be explicitly named as test, fixture, or smoke",
@@ -205,10 +218,184 @@ def _require_disposable_database_names(source_url: str, target_url: str) -> None
         )
 
 
-def _cluster_identifier(store: _QueryStore) -> str:
-    rows = store.query(
-        "SELECT system_identifier::text AS identifier FROM pg_control_system()"
+def _source_mutation_confirmation(
+    *,
+    run_id: str,
+    source_url: str,
+    source_cluster_identifier: str,
+    target_url: str,
+    target_cluster_identifier: str,
+) -> str:
+    try:
+        parsed_run_id = uuid.UUID(run_id)
+    except (ValueError, AttributeError) as error:
+        raise DomainError(
+            "LOCAL_RESTORE_RUN_ID_INVALID",
+            "SHADOW_LOCAL_RESTORE_RUN_ID must be one canonical non-zero UUID",
+        ) from error
+    if str(parsed_run_id) != run_id or parsed_run_id.int == 0:
+        raise DomainError(
+            "LOCAL_RESTORE_RUN_ID_INVALID",
+            "SHADOW_LOCAL_RESTORE_RUN_ID must be one canonical non-zero UUID",
+        )
+    if (
+        re.fullmatch(r"[0-9]+", source_cluster_identifier) is None
+        or re.fullmatch(r"[0-9]+", target_cluster_identifier) is None
+        or source_cluster_identifier == target_cluster_identifier
+    ):
+        raise DomainError(
+            "LOCAL_RESTORE_CLUSTER_IDENTITY_INVALID",
+            "source confirmation requires two distinct canonical cluster identifiers",
+        )
+    return (
+        "local-postgresql-source-acl-mutation/v1:"
+        f"{run_id}:{_database_name(source_url)}@{source_cluster_identifier}:"
+        f"{_database_name(target_url)}@{target_cluster_identifier}"
     )
+
+
+def _require_source_mutation_confirmation(
+    *,
+    source_url: str,
+    source_cluster_identifier: str,
+    target_url: str,
+    target_cluster_identifier: str,
+) -> str:
+    run_id = os.environ.get("SHADOW_LOCAL_RESTORE_RUN_ID", "")
+    expected = _source_mutation_confirmation(
+        run_id=run_id,
+        source_url=source_url,
+        source_cluster_identifier=source_cluster_identifier,
+        target_url=target_url,
+        target_cluster_identifier=target_cluster_identifier,
+    )
+    if os.environ.get("SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION") != expected:
+        raise DomainError(
+            "LOCAL_RESTORE_SOURCE_CONFIRMATION_REQUIRED",
+            "source role and ACL mutation requires an exact run-bound source/target cluster "
+            "confirmation",
+        )
+    return run_id
+
+
+def _append_github_environment(path: Path, values: dict[str, str]) -> None:
+    if (
+        not path.is_absolute()
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_CLOEXEC")
+    ):
+        raise DomainError(
+            "LOCAL_RESTORE_CONFIRMATION_OUTPUT_INVALID",
+            "GitHub environment output requires a secure absolute file path",
+        )
+    payload = "".join(f"{name}={value}\n" for name, value in values.items()).encode(
+        "utf-8"
+    )
+    if (
+        not payload
+        or len(payload) > 4096
+        or any(
+            re.fullmatch(r"[A-Z][A-Z0-9_]+", name) is None
+            or not value
+            or any(character in value for character in "\r\n")
+            for name, value in values.items()
+        )
+    ):
+        raise DomainError(
+            "LOCAL_RESTORE_CONFIRMATION_OUTPUT_INVALID",
+            "GitHub environment confirmation payload is invalid",
+        )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_size + len(payload) > 1024 * 1024
+        ):
+            raise DomainError(
+                "LOCAL_RESTORE_CONFIRMATION_OUTPUT_INVALID",
+                "GitHub environment output file is unsafe",
+            )
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("short GitHub environment write")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    except DomainError:
+        raise
+    except OSError as error:
+        raise DomainError(
+            "LOCAL_RESTORE_CONFIRMATION_OUTPUT_INVALID",
+            "GitHub environment confirmation could not be written",
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _prepare_source_confirmation(
+    *, source_url: str, target_url: str, github_environment_path: Path
+) -> None:
+    with ExitStack() as stack:
+        source_admin = stack.enter_context(closing(SqlAlchemyStore(source_url)))
+        target_admin = stack.enter_context(closing(SqlAlchemyStore(target_url)))
+        source_cluster_identifier = _cluster_identifier(source_admin)
+        target_cluster_identifier = _cluster_identifier(target_admin)
+    if source_cluster_identifier == target_cluster_identifier:
+        raise DomainError(
+            "LOCAL_RESTORE_CLUSTER_COLLISION",
+            "source and restore target must use distinct disposable PostgreSQL clusters",
+        )
+    run_id = str(uuid.uuid4())
+    confirmation = _source_mutation_confirmation(
+        run_id=run_id,
+        source_url=source_url,
+        source_cluster_identifier=source_cluster_identifier,
+        target_url=target_url,
+        target_cluster_identifier=target_cluster_identifier,
+    )
+    _append_github_environment(
+        github_environment_path,
+        {
+            "SHADOW_LOCAL_RESTORE_RUN_ID": run_id,
+            "SHADOW_CONFIRM_LOCAL_RESTORE_SOURCE_MUTATION": confirmation,
+        },
+    )
+    print(
+        canonical_json(
+            {
+                "schema_version": 1,
+                "status": "prepared",
+                "run_id_digest": canonical_digest({"run_id": run_id}),
+                "source_cluster_identifier_digest": canonical_digest(
+                    {"system_identifier": source_cluster_identifier}
+                ),
+                "target_cluster_identifier_digest": canonical_digest(
+                    {"system_identifier": target_cluster_identifier}
+                ),
+            }
+        )
+    )
+
+
+def _cluster_identifier(store: _QueryStore) -> str:
+    try:
+        rows = store.query(
+            "SELECT system_identifier::text AS identifier FROM pg_control_system()"
+        )
+    except Exception as error:
+        raise DomainError(
+            "LOCAL_RESTORE_CLUSTER_IDENTITY_INVALID",
+            "local PostgreSQL cluster identity could not be verified",
+        ) from error
     if (
         len(rows) != 1
         or not isinstance(rows[0].get("identifier"), str)
@@ -279,15 +466,26 @@ def main() -> int:
         type=Path,
         default=Path("artifacts/local-postgresql-restore-evidence.json"),
     )
+    parser.add_argument(
+        "--prepare-source-confirmation-github-env",
+        type=Path,
+        help=(
+            "read both disposable cluster identities and append a fresh run-bound source "
+            "mutation confirmation to the existing GitHub environment file"
+        ),
+    )
     args = parser.parse_args()
+    _require_local_restore_confirmation()
     source_url = _local_database_url("SHADOW_TEST_POSTGRESQL_URL")
     target_url = _local_database_url("SHADOW_TEST_RESTORE_POSTGRESQL_URL")
-    if os.environ.get("SHADOW_ALLOW_LOCAL_RESTORE_DRILL") != "true":
-        raise DomainError(
-            "RESTORE_CONFIRMATION_REQUIRED",
-            "explicit destructive local restore confirmation is required before any mutation",
-        )
     _require_disposable_database_names(source_url, target_url)
+    if args.prepare_source_confirmation_github_env is not None:
+        _prepare_source_confirmation(
+            source_url=source_url,
+            target_url=target_url,
+            github_environment_path=args.prepare_source_confirmation_github_env,
+        )
+        return 0
     region_value = os.environ.get("SHADOW_OBJECT_STORAGE_REGION", "").strip()
     region = (
         region_value
@@ -306,22 +504,30 @@ def main() -> int:
         else "aws"
     )
     kms_key_id = f"arn:{partition}:kms:{region}:{account_id}:key/local-restore-smoke"
-    suffix = uuid.uuid4().hex
-    tenant_role = f"shadow_local_api_{suffix}"
-    maintenance_role = f"shadow_local_maintenance_{suffix}"
-    backup_role = f"shadow_local_backup_{suffix}"
-    tenant_password = uuid.uuid4().hex
-    maintenance_password = uuid.uuid4().hex
-    backup_password = uuid.uuid4().hex
     with ExitStack() as stack:
         source_admin = stack.enter_context(closing(SqlAlchemyStore(source_url)))
         target_admin = stack.enter_context(closing(SqlAlchemyStore(target_url)))
-        if _cluster_identifier(source_admin) == _cluster_identifier(target_admin):
+        source_cluster_identifier = _cluster_identifier(source_admin)
+        target_cluster_identifier = _cluster_identifier(target_admin)
+        if source_cluster_identifier == target_cluster_identifier:
             raise DomainError(
                 "LOCAL_RESTORE_CLUSTER_COLLISION",
                 "source and restore target must use distinct disposable PostgreSQL clusters",
             )
+        local_restore_run_id = _require_source_mutation_confirmation(
+            source_url=source_url,
+            source_cluster_identifier=source_cluster_identifier,
+            target_url=target_url,
+            target_cluster_identifier=target_cluster_identifier,
+        )
         _require_empty_restore_target(target_admin)
+        suffix = uuid.uuid4().hex
+        tenant_role = f"shadow_local_api_{suffix}"
+        maintenance_role = f"shadow_local_maintenance_{suffix}"
+        backup_role = f"shadow_local_backup_{suffix}"
+        tenant_password = uuid.uuid4().hex
+        maintenance_password = uuid.uuid4().hex
+        backup_password = uuid.uuid4().hex
         role_specs = (
             (tenant_role, tenant_password, False),
             (maintenance_role, maintenance_password, True),
@@ -401,6 +607,18 @@ def main() -> int:
             ).run()
     evidence = replace(
         evidence,
+        metrics={
+            **evidence.metrics,
+            "local_restore_run_id_digest": canonical_digest(
+                {"run_id": local_restore_run_id}
+            ),
+            "source_cluster_identifier_digest": canonical_digest(
+                {"system_identifier": source_cluster_identifier}
+            ),
+            "target_cluster_identifier_digest": canonical_digest(
+                {"system_identifier": target_cluster_identifier}
+            ),
+        },
         limitations=(
             *evidence.limitations,
             "local_smoke_simulates_versioning_kms_and_object_lock",
