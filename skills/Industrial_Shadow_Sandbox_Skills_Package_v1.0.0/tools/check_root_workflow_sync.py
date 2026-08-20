@@ -223,7 +223,14 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
             "workflow_dispatch:",
             "refresh_evidence:",
             "SHADOW_TEST_RESTORE_POSTGRESQL_URL:",
-            "postgresql+psycopg://shadow_test:shadow_restore_password@127.0.0.1:5433/shadow_restore_drill",
+            (
+                "postgresql+psycopg://shadow_test:shadow_test_password@127.0.0.1:"
+                "5432/shadow_test?sslmode=disable"
+            ),
+            (
+                "postgresql+psycopg://shadow_test:shadow_restore_password@127.0.0.1:"
+                "5433/shadow_restore_drill?sslmode=disable"
+            ),
             'SHADOW_ALLOW_LOCAL_RESTORE_DRILL: "true"',
             "azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d",
             "version: v1.32.2",

@@ -181,8 +181,8 @@ jobs:
     env:
       COVERAGE_CORE: sysmon
       PYTHONPATH: backend/src:services/simulator/src:services/collector/src:services/edge-gateway/src
-      SHADOW_TEST_POSTGRESQL_URL: postgresql+psycopg://shadow_test:shadow_test_password@127.0.0.1:5432/shadow_test
-      SHADOW_TEST_RESTORE_POSTGRESQL_URL: postgresql+psycopg://shadow_test:shadow_restore_password@127.0.0.1:5433/shadow_restore_drill
+      SHADOW_TEST_POSTGRESQL_URL: postgresql+psycopg://shadow_test:shadow_test_password@127.0.0.1:5432/shadow_test?sslmode=disable
+      SHADOW_TEST_RESTORE_POSTGRESQL_URL: postgresql+psycopg://shadow_test:shadow_restore_password@127.0.0.1:5433/shadow_restore_drill?sslmode=disable
       SHADOW_ALLOW_LOCAL_RESTORE_DRILL: "true"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
