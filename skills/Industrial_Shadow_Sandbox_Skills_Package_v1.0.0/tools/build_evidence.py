@@ -11,7 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from source_integrity import source_digest, source_manifest
+try:
+    from .source_integrity import source_digest, source_manifest
+except ImportError:  # pragma: no cover - direct script execution
+    from source_integrity import source_digest, source_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHONPATH = ":".join(
@@ -29,6 +32,28 @@ if os.environ.get("PYTHONPATH"):
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def redacted_diagnostic_tail(output: str, *, maximum_characters: int = 8_000) -> str:
+    redacted = output
+    sensitive_markers = ("CREDENTIAL", "KEY", "PASSWORD", "SECRET", "TOKEN", "URL")
+    for name, value in os.environ.items():
+        if (
+            value
+            and len(value) >= 4
+            and any(marker in name.upper() for marker in sensitive_markers)
+        ):
+            redacted = redacted.replace(value, "<redacted>")
+            for credential in re.findall(
+                r"[A-Za-z][A-Za-z0-9+.-]*://[^:/@\s]+:([^@\s]+)@", value
+            ):
+                redacted = redacted.replace(credential, "<redacted>")
+    redacted = re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://[^:/@\s]+:)[^@\s]+@",
+        r"\1<redacted>@",
+        redacted,
+    )
+    return redacted[-maximum_characters:]
 
 
 def run(command: list[str], timeout_seconds: int = 900) -> tuple[int, str]:
@@ -477,6 +502,7 @@ def main() -> int:
         for item in results:
             if item["exit_code"] != 0:
                 print(f"- {item['name']}: exit {item['exit_code']}")
+                print(redacted_diagnostic_tail(item["output"]))
     return overall_exit
 
 
