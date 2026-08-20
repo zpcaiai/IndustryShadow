@@ -3,7 +3,7 @@
   "$id": "urn:industrial-shadow:target-profile:v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "profile_id", "collected_at", "runner_os", "runner_architecture", "cpu_count", "memory_bytes", "orchestrator_version", "cluster_uid_digest", "kubernetes_api_ca_digest", "aws_account_id", "aws_region", "s3_bucket", "s3_probe_prefix", "snapshot_object_storage_prefix", "backup_object_storage_prefix", "kms_key_id_digest", "backup_restore_receipt_digest", "backup_workload_identity_arn_digest", "snapshot_workload_identity_arn_digest", "oidc_issuer", "oidc_audience_digest", "oidc_human_client_id_digest", "oidc_service_client_ids_digest", "managed_postgresql_provider", "managed_postgresql_source_resource_digest", "managed_postgresql_restore_resource_digest", "managed_postgresql_source_coordinate_digest", "managed_postgresql_restore_coordinate_digest", "managed_postgresql_source_kms_key_digest", "managed_postgresql_restore_kms_key_digest", "managed_postgresql_source_ca_identifier_digest", "managed_postgresql_restore_ca_identifier_digest", "candidate_image", "build_digest", "simulator_build_digest", "deployment_plan_digest"],
+  "required": ["schema_version", "profile_id", "collected_at", "runner_os", "runner_architecture", "cpu_count", "memory_bytes", "orchestrator_version", "cluster_uid_digest", "kubernetes_api_ca_digest", "aws_account_id", "aws_partition", "aws_region", "s3_bucket", "s3_probe_prefix", "snapshot_object_storage_prefix", "backup_object_storage_prefix", "kms_key_id_digest", "backup_restore_receipt_digest", "backup_workload_identity_arn_digest", "snapshot_workload_identity_arn_digest", "aws_irsa_oidc_provider_arn_digest", "aws_irsa_oidc_provider_configuration_digest", "s3_control_plane_caller_arn_digest", "s3_control_plane_caller_trust_contract", "s3_control_plane_caller_trust_contract_digest", "s3_control_plane_caller_iam_role_trust_policy_digest", "s3_control_plane_caller_iam_role_permissions_digest", "kms_admin_role_arn_digest", "kms_admin_iam_role_trust_policy_digest", "s3_bucket_controls_digest", "s3_bucket_policy_digest", "kms_key_policy_digest", "kms_grants_digest", "backup_iam_role_trust_policy_digest", "backup_iam_role_permissions_digest", "snapshot_iam_role_trust_policy_digest", "snapshot_iam_role_permissions_digest", "aws_storage_policy_bundle_digest", "oidc_issuer", "oidc_audience_digest", "oidc_human_client_id_digest", "oidc_service_client_ids_digest", "managed_postgresql_provider", "managed_postgresql_source_resource_digest", "managed_postgresql_restore_resource_digest", "managed_postgresql_source_coordinate_digest", "managed_postgresql_restore_coordinate_digest", "managed_postgresql_source_kms_key_digest", "managed_postgresql_restore_kms_key_digest", "managed_postgresql_source_ca_identifier_digest", "managed_postgresql_restore_ca_identifier_digest", "candidate_image", "build_digest", "simulator_build_digest", "deployment_plan_digest", "storage_egress_contract_digest"],
   "properties": {
     "schema_version": {"const": 1},
     "profile_id": {"type": "string", "minLength": 1},
@@ -16,6 +16,7 @@
     "cluster_uid_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "kubernetes_api_ca_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "aws_account_id": {"type": "string", "pattern": "^[0-9]{12}$"},
+    "aws_partition": {"enum": ["aws", "aws-cn", "aws-us-gov"]},
     "aws_region": {"type": "string", "pattern": "^[a-z]{2}(?:-gov)?-[a-z]+-[1-9][0-9]*$"},
     "s3_bucket": {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"},
     "s3_probe_prefix": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$"},
@@ -25,6 +26,40 @@
     "backup_restore_receipt_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "backup_workload_identity_arn_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "snapshot_workload_identity_arn_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "aws_irsa_oidc_provider_arn_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "aws_irsa_oidc_provider_configuration_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_control_plane_caller_arn_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_control_plane_caller_trust_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "provider_arn", "audience", "subject", "repository", "repository_owner_id", "repository_id", "ref", "environment", "workflow"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "provider_arn": {"type": "string", "pattern": "^arn:(aws|aws-cn|aws-us-gov):iam::[0-9]{12}:oidc-provider/token\\.actions\\.githubusercontent\\.com$"},
+        "audience": {"enum": ["sts.amazonaws.com", "sts.amazonaws.com.cn"]},
+        "subject": {"type": "string", "pattern": "^repo:[A-Za-z0-9_.-]+@[1-9][0-9]*/[A-Za-z0-9_.-]+@[1-9][0-9]*:environment:production-acceptance$"},
+        "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        "repository_owner_id": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "repository_id": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "ref": {"type": "string", "pattern": "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,253}$"},
+        "environment": {"const": "production-acceptance"},
+        "workflow": {"const": "production-acceptance"}
+      }
+    },
+    "s3_control_plane_caller_trust_contract_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_control_plane_caller_iam_role_trust_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_control_plane_caller_iam_role_permissions_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "kms_admin_role_arn_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "kms_admin_iam_role_trust_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_bucket_controls_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "s3_bucket_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "kms_key_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "kms_grants_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "backup_iam_role_trust_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "backup_iam_role_permissions_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "snapshot_iam_role_trust_policy_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "snapshot_iam_role_permissions_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "aws_storage_policy_bundle_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "oidc_issuer": {"type": "string", "format": "uri", "pattern": "^https://"},
     "oidc_audience_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "oidc_human_client_id_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
@@ -41,6 +76,7 @@
     "candidate_image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
     "build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "simulator_build_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
-    "deployment_plan_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+    "deployment_plan_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "storage_egress_contract_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
   }
 }

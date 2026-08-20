@@ -7,6 +7,7 @@ import re
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import asdict, fields
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,8 +21,30 @@ from shadow_sandbox.common.models import (
 from shadow_sandbox.common.object_storage import S3ObjectStorage, validate_object_key
 
 from .evidence import GateCheck, GateEvidence, complete, target_digest
-from .production_deployment import cluster_identity, validate_exact_rbac
+from .irsa_contract import (
+    IRSA_MOUNT_PATH,
+    IRSA_ROLE_ANNOTATION,
+    IRSA_TOKEN_DEFAULT_MODE,
+    IRSA_TOKEN_MOUNT,
+    IRSA_TOKEN_PATH,
+    IRSA_TOKEN_PROJECTION,
+    IRSA_VOLUME_NAME,
+)
+from .production_deployment import (
+    STORAGE_EGRESS_POD_LABEL_KEY,
+    STORAGE_EGRESS_POD_LABEL_VALUE,
+    cluster_identity,
+    validate_exact_rbac,
+)
 from .storage_probe import S3SentinelBinding, S3WorkloadIdentityProbe
+
+__all__ = (
+    "IRSA_MOUNT_PATH",
+    "IRSA_ROLE_ANNOTATION",
+    "IRSA_TOKEN_DEFAULT_MODE",
+    "IRSA_TOKEN_PATH",
+    "IRSA_VOLUME_NAME",
+)
 
 KubectlRunner = Callable[[Sequence[str], int, str | None], str]
 
@@ -30,10 +53,6 @@ SERVICE_ACCOUNTS = {
     "backup": "shadow-backup-storage",
     "snapshot": "shadow-simulator-storage",
 }
-IRSA_ROLE_ANNOTATION = "eks.amazonaws.com/role-arn"
-IRSA_VOLUME_NAME = "aws-iam-token"
-IRSA_MOUNT_PATH = "/var/run/secrets/eks.amazonaws.com/serviceaccount"
-IRSA_TOKEN_PATH = f"{IRSA_MOUNT_PATH}/token"
 DIGEST = re.compile(r"[a-f0-9]{64}")
 DIGEST_PINNED_IMAGE = re.compile(r"[^@\s]+@sha256:([a-f0-9]{64})")
 DNS_LABEL = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
@@ -89,8 +108,7 @@ def _run(command: Sequence[str], timeout: int, stdin: str | None = None) -> str:
         completed = subprocess.run(
             list(command),
             input=stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
@@ -190,7 +208,12 @@ def _validate_roles(value: Mapping[str, Any], *, account_id: str) -> dict[str, s
     partitions: set[str] = set()
     for identity in IDENTITIES:
         role = value.get(identity)
-        match = IAM_ROLE_ARN.fullmatch(role) if isinstance(role, str) else None
+        if not isinstance(role, str):
+            raise DomainError(
+                "KUBERNETES_STORAGE_PROBE_ROLE_INVALID",
+                "workload role ARN is invalid or belongs to another account",
+            )
+        match = IAM_ROLE_ARN.fullmatch(role)
         if match is None or match.group(2) != account_id:
             raise DomainError(
                 "KUBERNETES_STORAGE_PROBE_ROLE_INVALID",
@@ -564,6 +587,7 @@ def _job_manifest(
         )
     labels = {
         "app.kubernetes.io/name": "industrial-shadow-storage-probe",
+        STORAGE_EGRESS_POD_LABEL_KEY: STORAGE_EGRESS_POD_LABEL_VALUE,
         "shadow-sandbox.io/storage-probe-id": probe_id,
         "shadow-sandbox.io/storage-probe-identity": identity,
     }
@@ -623,23 +647,7 @@ def _job_manifest(
                         "fsGroup": 65532,
                         "seccompProfile": {"type": "RuntimeDefault"},
                     },
-                    "volumes": [
-                        {
-                            "name": IRSA_VOLUME_NAME,
-                            "projected": {
-                                "defaultMode": 420,
-                                "sources": [
-                                    {
-                                        "serviceAccountToken": {
-                                            "audience": "sts.amazonaws.com",
-                                            "expirationSeconds": 3600,
-                                            "path": "token",
-                                        }
-                                    }
-                                ],
-                            },
-                        }
-                    ],
+                    "volumes": [deepcopy(IRSA_TOKEN_PROJECTION)],
                     "containers": [
                         {
                             "name": "storage-identity-probe",
@@ -660,6 +668,11 @@ def _job_manifest(
                                 },
                                 {"name": "AWS_REGION", "value": region},
                                 {"name": "AWS_DEFAULT_REGION", "value": region},
+                                {"name": "AWS_CONFIG_FILE", "value": "/dev/null"},
+                                {
+                                    "name": "AWS_SHARED_CREDENTIALS_FILE",
+                                    "value": "/dev/null",
+                                },
                                 {
                                     "name": "AWS_STS_REGIONAL_ENDPOINTS",
                                     "value": "regional",
@@ -673,13 +686,7 @@ def _job_manifest(
                                     "value": "regional",
                                 },
                             ],
-                            "volumeMounts": [
-                                {
-                                    "name": IRSA_VOLUME_NAME,
-                                    "readOnly": True,
-                                    "mountPath": IRSA_MOUNT_PATH,
-                                }
-                            ],
+                            "volumeMounts": [dict(IRSA_TOKEN_MOUNT)],
                             "resources": {
                                 "requests": {"cpu": "25m", "memory": "64Mi"},
                                 "limits": {"cpu": "500m", "memory": "256Mi"},
@@ -756,29 +763,7 @@ def _validate_live_pod(
             "probe Pod is not uniquely owned or does not use the exact ServiceAccount",
         )
     volume = volumes[0]
-    projected = volume.get("projected", {}) if isinstance(volume, Mapping) else {}
-    sources = projected.get("sources", ()) if isinstance(projected, Mapping) else ()
-    token_projection = (
-        sources[0].get("serviceAccountToken", {})
-        if isinstance(sources, list) and len(sources) == 1 and isinstance(sources[0], Mapping)
-        else {}
-    )
-    expiration = (
-        token_projection.get("expirationSeconds") if isinstance(token_projection, Mapping) else None
-    )
-    if (
-        not isinstance(volume, Mapping)
-        or set(volume) != {"name", "projected"}
-        or volume.get("name") != IRSA_VOLUME_NAME
-        or not isinstance(projected, Mapping)
-        or not set(projected).issubset({"defaultMode", "sources"})
-        or projected.get("defaultMode", 420) != 420
-        or not isinstance(token_projection, Mapping)
-        or set(token_projection) != {"audience", "expirationSeconds", "path"}
-        or token_projection.get("audience") != "sts.amazonaws.com"
-        or token_projection.get("path") != "token"
-        or expiration != 3600
-    ):
+    if volume != IRSA_TOKEN_PROJECTION:
         raise DomainError(
             "KUBERNETES_STORAGE_PROBE_POD_INVALID",
             "probe Pod does not use the exact audience-bound IRSA token projection",
@@ -816,15 +801,7 @@ def _validate_live_pod(
             "probe Pod container contract was mutated",
         )
     volume_mounts = container.get("volumeMounts", ()) or ()
-    if (
-        not isinstance(volume_mounts, list)
-        or len(volume_mounts) != 1
-        or not isinstance(volume_mounts[0], Mapping)
-        or set(volume_mounts[0]) != {"mountPath", "name", "readOnly"}
-        or volume_mounts[0].get("name") != IRSA_VOLUME_NAME
-        or volume_mounts[0].get("mountPath") != IRSA_MOUNT_PATH
-        or volume_mounts[0].get("readOnly") is not True
-    ):
+    if volume_mounts != [IRSA_TOKEN_MOUNT]:
         raise DomainError(
             "KUBERNETES_STORAGE_PROBE_POD_INVALID",
             "probe Pod does not mount only the exact IRSA token projection",
@@ -835,6 +812,8 @@ def _validate_live_pod(
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_STS_REGIONAL_ENDPOINTS",
         "AWS_EC2_METADATA_DISABLED",
         "AWS_S3_US_EAST_1_REGIONAL_ENDPOINT",
@@ -859,6 +838,8 @@ def _validate_live_pod(
         or environment_map.get("AWS_WEB_IDENTITY_TOKEN_FILE") != IRSA_TOKEN_PATH
         or environment_map.get("AWS_REGION") != region
         or environment_map.get("AWS_DEFAULT_REGION") != region
+        or environment_map.get("AWS_CONFIG_FILE") != "/dev/null"
+        or environment_map.get("AWS_SHARED_CREDENTIALS_FILE") != "/dev/null"
         or environment_map.get("AWS_STS_REGIONAL_ENDPOINTS") != "regional"
         or environment_map.get("AWS_EC2_METADATA_DISABLED") != "true"
         or environment_map.get("AWS_S3_US_EAST_1_REGIONAL_ENDPOINT") != "regional"
@@ -1305,9 +1286,12 @@ def run_kubernetes_storage_identity_probe(
             "sentinel_contract_digest": canonical_digest(
                 {name: binding.binding_digest for name, binding in bindings.items()}
             ),
-            "workload_evidence_digests": {
-                identity: executions[identity][0].digest for identity in IDENTITIES
-            },
+            "workload_evidence_digest": canonical_digest(
+                {
+                    identity: executions[identity][0].digest
+                    for identity in IDENTITIES
+                }
+            ),
         },
         checks=checks,
         metrics={

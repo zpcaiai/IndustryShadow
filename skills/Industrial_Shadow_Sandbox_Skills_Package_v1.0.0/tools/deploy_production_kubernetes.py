@@ -9,15 +9,19 @@ import re
 import stat
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from shadow_sandbox.common.models import (
     DomainError,
     canonical_digest,
     canonical_json,
     utc_now,
+)
+from shadow_sandbox.evaluation.formal_benchmark import (
+    validate_production_storage_target,
 )
 from shadow_sandbox.operations.evidence import (
     GateCheck,
@@ -33,8 +37,12 @@ from shadow_sandbox.operations.production_deployment import (
     ProductionDeploymentPlan,
 )
 
-from tools.check_release_evidence import INPUT as CLOSURE_INPUT
-from tools.check_release_evidence import main as check_release_evidence
+if __package__:
+    from .check_release_evidence import INPUT as CLOSURE_INPUT
+    from .check_release_evidence import main as check_release_evidence
+else:
+    from check_release_evidence import INPUT as CLOSURE_INPUT
+    from check_release_evidence import main as check_release_evidence
 
 ROOT = Path(__file__).resolve().parents[1]
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -1478,6 +1486,7 @@ def _signed_target_cluster_digest(
         raise DomainError(
             "PRODUCTION_TARGET_PROFILE_INVALID", "target profile is invalid"
         )
+    validate_production_storage_target(target)
     if (
         target.get("candidate_image") != coordinates.get("candidate_image")
         or target.get("build_digest") != coordinates.get("build_digest")
@@ -1493,6 +1502,13 @@ def _signed_target_cluster_digest(
         != plan.snapshot_workload_identity_arn_digest
         or target.get("backup_workload_identity_arn_digest")
         != plan.backup_workload_identity_arn_digest
+        or target.get("aws_region")
+        != plan.object_storage_region
+        or target.get("aws_account_id") != plan.object_storage_account_id
+        or plan.object_storage_region != plan.storage_egress_contract.region
+        or target.get("aws_partition") != plan.storage_egress_contract.partition
+        or target.get("storage_egress_contract_digest")
+        != plan.storage_egress_contract.digest
         or not DIGEST.fullmatch(str(target.get("cluster_uid_digest", "")))
         or not DIGEST.fullmatch(str(target.get("kubernetes_api_ca_digest", "")))
     ):

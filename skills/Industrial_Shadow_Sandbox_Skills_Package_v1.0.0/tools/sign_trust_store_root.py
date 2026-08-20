@@ -10,7 +10,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from shadow_sandbox.common.models import DomainError, canonical_digest, canonical_json, utc_now
+from shadow_sandbox.common.models import (
+    DomainError,
+    canonical_digest,
+    canonical_json,
+    utc_now,
+)
 from shadow_sandbox.operations.trust_store import SignerTrustStore
 
 

@@ -19,9 +19,13 @@ from shadow_sandbox.common.models import DomainError, canonical_digest, canonica
 
 from .evidence import GateCheck, GateEvidence, complete
 from .production_deployment import (
+    HostResolver,
     ProductionDeploymentPlan,
+    StorageEgressContract,
     cluster_identity,
-    storage_probe_network_policy_exact,
+    legacy_storage_https_egress_absent,
+    resolve_storage_egress_contract,
+    resolve_storage_hostname,
     validate_exact_rbac,
 )
 
@@ -107,17 +111,45 @@ def validate_policy_contract(path: str | Path) -> tuple[GateCheck, ...]:
         for policy in policies
         if policy.get("metadata", {}).get("name") == "storage-identity-probe-egress"
     ]
+    storage_contract = (
+        StorageEgressContract.from_policy(storage_probe_policies[0])
+        if len(storage_probe_policies) == 1
+        else None
+    )
+    legacy_storage_policies = [
+        policy
+        for policy in policies
+        if policy.get("metadata", {}).get("name")
+        in {"simulator-plane", "data-jobs-egress"}
+    ]
     return (
         GateCheck("default_deny", "default-deny" in names),
         GateCheck("required_plane_policies", required.issubset(names)),
         GateCheck("no_world_cidrs", not broad, {"broad_cidrs": len(broad)}),
         GateCheck("valid_cidrs", not invalid_cidrs, {"invalid_cidrs": len(invalid_cidrs)}),
         GateCheck(
+            "legacy_storage_https_egress_removed",
+            len(legacy_storage_policies) == 2
+            and all(legacy_storage_https_egress_absent(policy) for policy in legacy_storage_policies),
+        ),
+        GateCheck(
             "storage_probe_https_egress_exact",
-            len(storage_probe_policies) == 1
-            and storage_probe_network_policy_exact(
-                storage_probe_policies[0].get("spec")
-            ),
+            storage_contract is not None,
+            {
+                "contract_digest": storage_contract.digest if storage_contract else "",
+                "s3_endpoint_digest": (
+                    hashlib.sha256(storage_contract.s3_endpoint.encode()).hexdigest()
+                    if storage_contract
+                    else ""
+                ),
+                "sts_endpoint_digest": (
+                    hashlib.sha256(storage_contract.sts_endpoint.encode()).hexdigest()
+                    if storage_contract
+                    else ""
+                ),
+                "s3_host_cidrs": len(storage_contract.s3_cidrs) if storage_contract else 0,
+                "sts_host_cidrs": len(storage_contract.sts_cidrs) if storage_contract else 0,
+            },
         ),
     )
 
@@ -128,11 +160,12 @@ def validate_live_policy_contract(
     *,
     context: str,
     runner: CommandRunner = _run,
+    resolver: HostResolver = resolve_storage_hostname,
 ) -> tuple[GateCheck, ...]:
     import yaml  # type: ignore[import-untyped]
 
     declared = {
-        str(item.get("metadata", {}).get("name")): item.get("spec", {})
+        str(item.get("metadata", {}).get("name")): item
         for item in yaml.safe_load_all(Path(path).read_text(encoding="utf-8"))
         if item and item.get("kind") == "NetworkPolicy"
     }
@@ -153,18 +186,56 @@ def validate_live_policy_contract(
         )
     )
     live = {
-        str(item.get("metadata", {}).get("name")): item.get("spec", {})
+        str(item.get("metadata", {}).get("name")): item
         for item in payload.get("items", ())
+        if isinstance(item, Mapping)
     }
+    storage_policy_name = "storage-identity-probe-egress"
+    declared_storage_contract = StorageEgressContract.from_policy(declared.get(storage_policy_name))
+    live_storage_contract = StorageEgressContract.from_policy(live.get(storage_policy_name))
+    resolution = None
+    resolution_error = ""
+    if declared_storage_contract is not None:
+        try:
+            resolution = resolve_storage_egress_contract(
+                declared_storage_contract, resolver=resolver
+            )
+        except DomainError as error:
+            resolution_error = error.code
     return (
         GateCheck("live_policy_set_exact", set(live) == set(declared)),
         GateCheck(
             "live_policy_specs_exact",
             set(live) == set(declared)
             and all(
-                canonical_digest(live[name]) == canonical_digest(spec)
-                for name, spec in declared.items()
+                canonical_digest(live[name].get("spec", {}))
+                == canonical_digest(policy.get("spec", {}))
+                for name, policy in declared.items()
             ),
+        ),
+        GateCheck(
+            "live_storage_probe_egress_contract_exact",
+            declared_storage_contract is not None
+            and live_storage_contract == declared_storage_contract,
+            {
+                "declared_contract_digest": (
+                    declared_storage_contract.digest if declared_storage_contract else ""
+                ),
+                "live_contract_digest": (
+                    live_storage_contract.digest if live_storage_contract else ""
+                ),
+            },
+        ),
+        GateCheck(
+            "live_storage_endpoint_dns_resolution_exact",
+            resolution is not None,
+            {
+                "contract_digest": (
+                    declared_storage_contract.digest if declared_storage_contract else ""
+                ),
+                "resolution_digest": resolution.digest if resolution else "",
+                "resolution_error": resolution_error,
+            },
         ),
     )
 
@@ -470,6 +541,7 @@ def run_kubernetes_policy_suite(
     expected_kubernetes_api_ca_digest: str,
     plan: ProductionDeploymentPlan,
     runner: CommandRunner = _run,
+    resolver: HostResolver = resolve_storage_hostname,
     timeout_seconds: int = 120,
 ) -> GateEvidence:
     started = utc_now()
@@ -519,9 +591,31 @@ def run_kubernetes_policy_suite(
             )
     checks = [
         *validate_policy_contract(policy_path),
-        *validate_live_policy_contract(namespace, policy_path, context=context, runner=runner),
+        *validate_live_policy_contract(
+            namespace,
+            policy_path,
+            context=context,
+            runner=runner,
+            resolver=resolver,
+        ),
         *validate_probe_rbac(namespace, context=context, runner=runner),
     ]
+    if not all(check.passed for check in checks):
+        return complete(
+            "network_policy",
+            started_at=started,
+            coordinates={
+                "namespace": namespace,
+                "planes": {},
+                "policy_digest": hashlib.sha256(Path(policy_path).read_bytes()).hexdigest(),
+                "plan_digest": plan.digest,
+                "storage_egress_contract_digest": plan.storage_egress_contract.digest,
+                "cluster_uid_digest": observed_cluster_uid_digest,
+                "kubernetes_api_ca_digest": api_ca_digest,
+            },
+            checks=checks,
+            metrics={"planes": 0, "cases": 0, "connected": 0, "blocked": 0},
+        )
     case_count = 0
     connected = 0
     blocked = 0
@@ -561,6 +655,7 @@ def run_kubernetes_policy_suite(
             "planes": plane_digests,
             "policy_digest": hashlib.sha256(Path(policy_path).read_bytes()).hexdigest(),
             "plan_digest": plan.digest,
+            "storage_egress_contract_digest": plan.storage_egress_contract.digest,
             "cluster_uid_digest": observed_cluster_uid_digest,
             "kubernetes_api_ca_digest": api_ca_digest,
         },

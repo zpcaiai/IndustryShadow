@@ -27,6 +27,7 @@ from shadow_sandbox.common.secure_files import read_private_json_object
 from shadow_sandbox.evaluation.formal_benchmark import (
     FormalBenchmarkImporter,
     production_storage_binding_digest,
+    validate_production_storage_target,
 )
 from shadow_sandbox.evaluation.measured_benchmark import MeasuredBenchmark
 from shadow_sandbox.operations.backup_job import database_coordinate_digest
@@ -65,7 +66,15 @@ from shadow_sandbox.operations.restore_drill import (
     BackupRestoreReceipt,
     PostgreSqlRestoreDrill,
 )
-from shadow_sandbox.operations.storage_probe import S3KmsProbe
+from shadow_sandbox.operations.storage_probe import (
+    AWS_STORAGE_POLICY_DIGEST_FIELDS,
+    IAM_OIDC_PROVIDER_ARN,
+    IAM_ROLE_ARN,
+    S3KmsProbe,
+    aws_partition_for_region,
+    github_actions_caller_trust_contract,
+    normalized_iam_role_arn,
+)
 from shadow_sandbox.operations.supply_chain import (
     ReleaseCandidate,
     SupplyChainAttestationProbe,
@@ -178,6 +187,15 @@ def _deployment_binding(
         != plan.snapshot_workload_identity_arn_digest
         or target.get("backup_workload_identity_arn_digest")
         != plan.backup_workload_identity_arn_digest
+        or target.get("aws_region")
+        != plan.object_storage_region
+        or target.get("aws_account_id")
+        != plan.object_storage_account_id
+        or plan.object_storage_region != plan.storage_egress_contract.region
+        or plan.storage_egress_contract.partition
+        != target.get("aws_partition")
+        or target.get("storage_egress_contract_digest")
+        != plan.storage_egress_contract.digest
     ):
         raise DomainError(
             "PRODUCTION_TARGET_PROFILE_INVALID",
@@ -269,6 +287,7 @@ def _service_client_ids() -> tuple[str, ...]:
 
 
 def _validate_signed_identity_and_storage(target: Mapping[str, Any]) -> None:
+    validate_production_storage_target(target)
     receipt = BackupRestoreReceipt.load(
         _required("SHADOW_BACKUP_RESTORE_RECEIPT"),
         expected_source_database_digest=database_coordinate_digest(
@@ -299,7 +318,70 @@ def _validate_signed_identity_and_storage(target: Mapping[str, Any]) -> None:
             "PRODUCTION_TARGET_PROFILE_INVALID",
             "storage prefixes must be canonical/non-nested and workload roles distinct",
         )
+    account_id = _required("SHADOW_AWS_ACCOUNT_ID")
+    region = _required("SHADOW_OBJECT_STORAGE_REGION")
+    partition = aws_partition_for_region(region)
+    caller_arn = _required("SHADOW_S3_CONTROL_PLANE_CALLER_ARN")
+    kms_admin_role_arn = _required("SHADOW_KMS_ADMIN_ROLE_ARN")
+    provider_arn = _required("SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN")
+    caller_match = IAM_ROLE_ARN.fullmatch(caller_arn)
+    kms_admin_match = IAM_ROLE_ARN.fullmatch(kms_admin_role_arn)
+    provider_match = IAM_OIDC_PROVIDER_ARN.fullmatch(provider_arn)
+    role_arns = tuple(
+        _required(name)
+        for name in (
+            "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN",
+            "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN",
+        )
+    )
+    role_matches = tuple(IAM_ROLE_ARN.fullmatch(role_arn) for role_arn in role_arns)
+    kms_match = re.fullmatch(
+        rf"arn:{re.escape(partition)}:kms:{re.escape(region)}:"
+        rf"{re.escape(account_id)}:key/[A-Za-z0-9-]+",
+        _required("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
+    )
+    if (
+        caller_match is None
+        or caller_match.group(1) != partition
+        or caller_match.group(2) != account_id
+        or normalized_iam_role_arn(caller_arn) != caller_arn
+        or kms_admin_match is None
+        or kms_admin_match.group(1) != partition
+        or kms_admin_match.group(2) != account_id
+        or provider_match is None
+        or provider_match.group(1) != partition
+        or provider_match.group(2) != account_id
+        or any(
+            match is None or match.group(1) != partition or match.group(2) != account_id
+            for match in role_matches
+        )
+        or len({caller_arn, kms_admin_role_arn, *role_arns}) != 4
+        or kms_match is None
+    ):
+        raise DomainError(
+            "PRODUCTION_TARGET_PROFILE_INVALID",
+            "AWS account, partition, caller, IRSA provider, role, or KMS binding is invalid",
+        )
+    caller_trust_contract = github_actions_caller_trust_contract(
+        account_id=account_id,
+        region=region,
+        repository=_required("SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY"),
+        repository_owner_id=_required(
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID"
+        ),
+        repository_id=_required(
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID"
+        ),
+        ref=_required("SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF"),
+        environment=_required(
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT"
+        ),
+        workflow=_required("SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW"),
+    )
     expected = {
+        "aws_account_id": account_id,
+        "aws_partition": partition,
+        "aws_region": region,
         "oidc_issuer": _required("SHADOW_OIDC_ISSUER").rstrip("/"),
         "oidc_audience_digest": canonical_digest(
             {"audience": _required("SHADOW_OIDC_AUDIENCE")}
@@ -331,6 +413,19 @@ def _validate_signed_identity_and_storage(target: Mapping[str, Any]) -> None:
                     "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"
                 )
             }
+        ),
+        "s3_control_plane_caller_arn_digest": canonical_digest(
+            {"caller_arn": caller_arn}
+        ),
+        "s3_control_plane_caller_trust_contract": caller_trust_contract,
+        "s3_control_plane_caller_trust_contract_digest": canonical_digest(
+            caller_trust_contract
+        ),
+        "kms_admin_role_arn_digest": canonical_digest(
+            {"role_arn": kms_admin_role_arn}
+        ),
+        "aws_irsa_oidc_provider_arn_digest": canonical_digest(
+            {"provider_arn": _required("SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN")}
         ),
     }
     if any(target.get(name) != value for name, value in expected.items()):
@@ -540,6 +635,11 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
             _deployment_binding("SHADOW_KUBERNETES_STORAGE_CONTEXT")
         )
         target_profile = _signed_target_profile()
+        _validate_signed_identity_and_storage(target_profile)
+        storage_binding_digest = production_storage_binding_digest(
+            target_profile,
+            plan,
+        )
         try:
             import boto3
         except ImportError as error:
@@ -573,12 +673,40 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
             expected_bucket_owner=account_id,
             production=True,
         )
+        expected_policy_digests = {
+            name: str(target_profile[name]) for name in AWS_STORAGE_POLICY_DIGEST_FIELDS
+        }
         control_probe = S3KmsProbe(
             storage,
             require_object_lock=require_object_lock,
             kms_client=boto3.client("kms", region_name=region),
             sts_client=boto3.client("sts", region_name=region),
+            iam_client=boto3.client("iam", region_name=region),
             expected_account_id=account_id,
+            expected_caller_arn=_required("SHADOW_S3_CONTROL_PLANE_CALLER_ARN"),
+            expected_caller_trust_contract=target_profile[
+                "s3_control_plane_caller_trust_contract"
+            ],
+            expected_kms_admin_role_arn=_required("SHADOW_KMS_ADMIN_ROLE_ARN"),
+            expected_irsa_oidc_provider_arn=_required(
+                "SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN"
+            ),
+            expected_role_arns={
+                "backup": _required("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"),
+                "snapshot": _required("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
+            },
+            expected_trust_subjects={
+                "backup": (
+                    f"system:serviceaccount:{plan.namespace}:shadow-backup-storage"
+                ),
+                "snapshot": (
+                    f"system:serviceaccount:{plan.namespace}:shadow-simulator-storage"
+                ),
+            },
+            expected_policy_digests=expected_policy_digests,
+            expected_policy_bundle_digest=str(
+                target_profile["aws_storage_policy_bundle_digest"]
+            ),
             require_cloud_control_plane=True,
             lifecycle_prefixes={
                 "acceptance": storage._key("production-probes").rstrip("/") + "/",
@@ -682,6 +810,9 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                     "snapshot_workload_identity_arn_digest": target_profile[
                         "snapshot_workload_identity_arn_digest"
                     ],
+                    "aws_storage_policy_bundle_digest": target_profile[
+                        "aws_storage_policy_bundle_digest"
+                    ],
                     "sentinel_binding_digest": canonical_digest(sentinel_digests),
                 },
                 checks=checks,
@@ -694,9 +825,7 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                         "pods", 0
                     ),
                     "sentinel_bindings_verified": len(control_probe.sentinel_bindings),
-                    "storage_binding_digest": production_storage_binding_digest(
-                        target_profile, plan
-                    ),
+                    "storage_binding_digest": storage_binding_digest,
                     "backup_sentinel_binding_digest": sentinel_digests["backup"],
                     "snapshot_sentinel_binding_digest": sentinel_digests["snapshot"],
                     "sentinel_binding_digest": canonical_digest(sentinel_digests),
@@ -865,6 +994,26 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
             require_immutable_backup=True,
         )
         restored = probe.run()
+        immutable_backup_digest_fields = (
+            "archive_version_digest",
+            "manifest_version_digest",
+            "sealed_receipt_version_digest",
+            "archive_retention_digest",
+            "manifest_retention_digest",
+            "sealed_receipt_retention_digest",
+        )
+        immutable_backup_bound = bool(
+            restored.status == "PASSED"
+            and not restored.limitations
+            and restored.metrics.get("object_lock_versions") == 3
+            and restored.metrics.get("backup_receipt_digest")
+            == target_profile["backup_restore_receipt_digest"]
+            and all(
+                isinstance(restored.metrics.get(name), str)
+                and re.fullmatch(r"[a-f0-9]{64}", str(restored.metrics[name]))
+                for name in immutable_backup_digest_fields
+            )
+        )
         checks = [
             GateCheck("managed_control_plane", control_plane.status == "PASSED"),
             *(
@@ -875,6 +1024,7 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                 "managed_signed_encryption_and_ca",
                 control_plane_bound,
             ),
+            GateCheck("restore_immutable_versions_bound", immutable_backup_bound),
             *(
                 GateCheck(f"restore_{check.name}", check.passed, check.details)
                 for check in restored.checks
@@ -896,6 +1046,14 @@ def run_gate(name: str) -> tuple[GateEvidence, Mapping[str, Any] | None]:
                     "managed_restore_resource_digest": target_profile[
                         "managed_postgresql_restore_resource_digest"
                     ],
+                    "backup_restore_receipt_digest": target_profile[
+                        "backup_restore_receipt_digest"
+                    ],
+                    **{
+                        name: restored.metrics[name]
+                        for name in immutable_backup_digest_fields
+                        if name in restored.metrics
+                    },
                 },
                 checks=checks,
                 metrics={

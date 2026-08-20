@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import hashlib
 import json
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,6 +30,25 @@ class ObjectRef:
     etag: str | None = None
     version_id: str | None = None
     encryption: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectRetention:
+    """Normalized Object Lock state for one exact object version."""
+
+    mode: str
+    retain_until: str
+
+    def active(self) -> bool:
+        try:
+            until = dt.datetime.fromisoformat(self.retain_until)
+        except ValueError:
+            return False
+        return (
+            self.mode in {"GOVERNANCE", "COMPLIANCE"}
+            and until.tzinfo is not None
+            and until > dt.datetime.now(dt.UTC)
+        )
 
 
 class ObjectStorage(Protocol):
@@ -55,6 +76,8 @@ class ObjectStorage(Protocol):
         expected_sha256: str | None = None,
         version_id: str | None = None,
     ) -> ObjectRef: ...
+
+    def get_version_retention(self, key: str, *, version_id: str) -> ObjectRetention: ...
 
     def delete(self, key: str) -> None: ...
 
@@ -207,6 +230,9 @@ class LocalObjectStorage:
                 pass
             raise
         return ObjectRef(key, copied, actual, "application/octet-stream", actual)
+
+    def get_version_retention(self, key: str, *, version_id: str) -> ObjectRetention:
+        raise DomainError("OBJECT_RETENTION_UNSUPPORTED", "local storage has no Object Lock")
 
     def delete(self, key: str) -> None:
         try:
@@ -659,6 +685,48 @@ class S3ObjectStorage:
             response.get("VersionId") or version_id,
             str(response.get("ServerSideEncryption", "")),
         )
+
+    def get_version_retention(self, key: str, *, version_id: str) -> ObjectRetention:
+        """Read and validate Object Lock retention for one exact S3 version."""
+
+        if not version_id or len(version_id) > 1024 or any(ord(value) < 0x20 for value in version_id):
+            raise DomainError("OBJECT_VERSION_INVALID", "an exact object version is required")
+        try:
+            response = self.client.get_object_retention(
+                **self.bucket_request(Key=self._key(key), VersionId=version_id)
+            )
+        except Exception as error:
+            raise DomainError(
+                "OBJECT_RETENTION_UNAVAILABLE",
+                "exact object-version retention could not be read",
+                status=503,
+            ) from error
+        retention = response.get("Retention", {}) if isinstance(response, Mapping) else {}
+        mode = retention.get("Mode") if isinstance(retention, Mapping) else None
+        raw_until = retention.get("RetainUntilDate") if isinstance(retention, Mapping) else None
+        if isinstance(raw_until, str):
+            try:
+                raw_until = dt.datetime.fromisoformat(raw_until)
+            except ValueError:
+                raw_until = None
+        if (
+            mode not in {"GOVERNANCE", "COMPLIANCE"}
+            or not isinstance(raw_until, dt.datetime)
+            or raw_until.tzinfo is None
+        ):
+            raise DomainError(
+                "OBJECT_RETENTION_INVALID",
+                "exact object version has no valid Object Lock retention",
+                status=503,
+            )
+        normalized = ObjectRetention(str(mode), raw_until.astimezone(dt.UTC).isoformat())
+        if not normalized.active():
+            raise DomainError(
+                "OBJECT_RETENTION_INVALID",
+                "exact object-version retention is not active",
+                status=503,
+            )
+        return normalized
 
     def delete(self, key: str) -> None:
         self.client.delete_object(**self.bucket_request(Key=self._key(key)))

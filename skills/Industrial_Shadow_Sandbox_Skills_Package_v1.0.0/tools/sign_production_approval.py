@@ -18,10 +18,16 @@ from shadow_sandbox.common.models import (
 )
 from shadow_sandbox.operations.trust_store import SignerTrustStore
 
-from tools.build_production_closure import (
-    REQUIRED_SIGNATORY_ROLES,
-    verify_signatories,
-)
+if __package__:
+    from .build_production_closure import (
+        REQUIRED_SIGNATORY_ROLES,
+        verify_signatories,
+    )
+else:
+    from build_production_closure import (
+        REQUIRED_SIGNATORY_ROLES,
+        verify_signatories,
+    )
 
 APPROVAL_KEYS = frozenset(
     {

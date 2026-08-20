@@ -18,19 +18,25 @@ from shadow_sandbox.common.models import (
     canonical_json,
     utc_now,
 )
-from shadow_sandbox.common.object_storage import ObjectRef, ObjectStorage
+from shadow_sandbox.common.object_storage import ObjectRef, ObjectRetention, ObjectStorage
+from shadow_sandbox.common.secure_files import read_private_file
 from shadow_sandbox.common.sqlalchemy_store import SqlAlchemyStore
 from shadow_sandbox.common.tenant_scope import workspace_scope
 
-from .backup_job import postgres_environment
+from .aws_resource_arns import AwsResourceArn, parse_kms_key_arn
 from .database_roles import (
     DatabaseRoleConfigurator,
     role_access_matrix,
     role_matrix_is_exact,
 )
 from .evidence import GateCheck, GateEvidence, complete
+from .postgres_coordinates import postgres_environment
 
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
+BACKUP_KEY = re.compile(
+    r"^postgres/\d{4}-\d{2}-\d{2}/[a-f0-9]{64}\.dump"
+    r"(?:\.manifest\.json|\.receipt\.json)?$"
+)
 MAXIMUM_MANIFEST_BYTES = 1024 * 1024
 
 
@@ -59,7 +65,7 @@ class BackupObjectVersion:
         encryption = value.get("encryption")
         if (
             not isinstance(key, str)
-            or not key.startswith("postgres/")
+            or BACKUP_KEY.fullmatch(key) is None
             or not isinstance(size, int)
             or isinstance(size, bool)
             or size < 1
@@ -67,7 +73,9 @@ class BackupObjectVersion:
             or not DIGEST.fullmatch(sha256)
             or not isinstance(version_id, str)
             or not version_id.strip()
+            or version_id != version_id.strip()
             or len(version_id) > 1024
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in version_id)
             or encryption != "aws:kms"
         ):
             raise DomainError(
@@ -93,27 +101,28 @@ class BackupRestoreReceipt:
     archive: BackupObjectVersion
     manifest: BackupObjectVersion
     manifest_digest: str
+    backup_snapshot_digest: str
+    kms_key_partition: str
+    sealed_receipt: BackupObjectVersion
+    sealed_receipt_digest: str
     receipt_digest: str
 
     @classmethod
     def load(
         cls, path_value: str | Path, *, expected_source_database_digest: str
     ) -> BackupRestoreReceipt:
-        path = Path(path_value)
+        encoded = read_private_file(
+            path_value,
+            maximum_bytes=MAXIMUM_MANIFEST_BYTES,
+            code="BACKUP_RECEIPT_INVALID",
+        )
         try:
-            if (
-                path.is_symlink()
-                or not path.is_file()
-                or path.stat().st_size > MAXIMUM_MANIFEST_BYTES
-            ):
-                raise DomainError(
-                    "BACKUP_RECEIPT_INVALID", "backup receipt must be a bounded regular file"
-                )
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise DomainError(
-                "BACKUP_RECEIPT_INVALID", "backup receipt could not be read"
-            ) from error
+            raw = json.loads(encoded)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise DomainError("BACKUP_RECEIPT_INVALID", "backup receipt JSON is invalid") from error
+        canonical = canonical_json(raw).encode("utf-8")
+        if encoded not in {canonical, canonical + b"\n"}:
+            raise DomainError("BACKUP_RECEIPT_INVALID", "backup receipt is not canonical JSON")
         if not isinstance(raw, Mapping) or set(raw) != {
             "schema_version",
             "created_at",
@@ -121,11 +130,15 @@ class BackupRestoreReceipt:
             "archive",
             "manifest",
             "manifest_digest",
+            "backup_snapshot_digest",
+            "kms_key_partition",
+            "sealed_receipt",
+            "sealed_receipt_digest",
             "receipt_digest",
         }:
             raise DomainError("BACKUP_RECEIPT_INVALID", "backup receipt fields are invalid")
         payload = {key: raw[key] for key in raw if key != "receipt_digest"}
-        if raw.get("schema_version") != 1 or raw.get("receipt_digest") != canonical_digest(payload):
+        if raw.get("schema_version") != 2 or raw.get("receipt_digest") != canonical_digest(payload):
             raise DomainError("BACKUP_RECEIPT_INVALID", "backup receipt digest is invalid")
         created_at = raw.get("created_at")
         try:
@@ -136,11 +149,19 @@ class BackupRestoreReceipt:
             raise DomainError("BACKUP_RECEIPT_INVALID", "backup timestamp must be UTC")
         source_digest = raw.get("source_database_digest")
         manifest_digest = raw.get("manifest_digest")
+        backup_snapshot_digest = raw.get("backup_snapshot_digest")
+        kms_key_partition = raw.get("kms_key_partition")
+        sealed_receipt_digest = raw.get("sealed_receipt_digest")
         receipt_digest = raw.get("receipt_digest")
         if (
             source_digest != expected_source_database_digest
             or not isinstance(manifest_digest, str)
             or not DIGEST.fullmatch(manifest_digest)
+            or not isinstance(backup_snapshot_digest, str)
+            or not DIGEST.fullmatch(backup_snapshot_digest)
+            or kms_key_partition not in {"aws", "aws-us-gov", "aws-cn"}
+            or not isinstance(sealed_receipt_digest, str)
+            or not DIGEST.fullmatch(sealed_receipt_digest)
             or not isinstance(receipt_digest, str)
             or not DIGEST.fullmatch(receipt_digest)
         ):
@@ -149,9 +170,26 @@ class BackupRestoreReceipt:
             )
         archive = BackupObjectVersion.parse(raw.get("archive"), field="archive")
         manifest = BackupObjectVersion.parse(raw.get("manifest"), field="manifest")
+        sealed_receipt = BackupObjectVersion.parse(
+            raw.get("sealed_receipt"), field="sealed_receipt"
+        )
+        archive_parts = archive.key.split("/")
+        archive_name_digest = archive_parts[-1].removesuffix(".dump")
+        if (
+            len(archive_parts) != 3
+            or archive_name_digest != archive.sha256
+        ):
+            raise DomainError(
+                "BACKUP_RECEIPT_INVALID",
+                "backup archive key is not bound to its checksum",
+            )
         if manifest.key != archive.key + ".manifest.json":
             raise DomainError(
                 "BACKUP_RECEIPT_INVALID", "backup manifest key is not bound to its archive"
+            )
+        if sealed_receipt.key != archive.key + ".receipt.json":
+            raise DomainError(
+                "BACKUP_RECEIPT_INVALID", "sealed receipt key is not bound to its archive"
             )
         return cls(
             str(created_at),
@@ -159,6 +197,10 @@ class BackupRestoreReceipt:
             archive,
             manifest,
             manifest_digest,
+            backup_snapshot_digest,
+            str(kms_key_partition),
+            sealed_receipt,
+            sealed_receipt_digest,
             receipt_digest,
         )
 
@@ -167,12 +209,216 @@ class BackupRestoreReceipt:
         return (dt.datetime.now(dt.UTC) - created).total_seconds()
 
 
+@dataclass(frozen=True, slots=True)
+class BackupSnapshotFingerprint:
+    tables: Mapping[str, Mapping[str, int | str]]
+    rls_policies: Mapping[str, int | str]
+    catalog: Mapping[str, object]
+    migration_versions: tuple[int, ...]
+    backup_role: Mapping[str, object]
+    snapshot_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class BackupObjectRetentions:
+    sealed_receipt: ObjectRetention
+    manifest: ObjectRetention
+    archive: ObjectRetention
+
+
+def _exact_version_retention(
+    storage: ObjectStorage,
+    reference: BackupObjectVersion,
+    *,
+    field: str,
+) -> ObjectRetention:
+    try:
+        retention = storage.get_version_retention(
+            reference.key,
+            version_id=reference.version_id,
+        )
+    except AttributeError as error:
+        raise DomainError(
+            "BACKUP_RETENTION_INVALID",
+            "object storage cannot prove exact-version Object Lock retention",
+            status=503,
+        ) from error
+    if not isinstance(retention, ObjectRetention) or not retention.active():
+        raise DomainError(
+            "BACKUP_RETENTION_INVALID",
+            f"{field} exact version is not protected by active Object Lock retention",
+            status=503,
+        )
+    return retention
+
+
+def _digest_entry(value: object, *, field: str) -> dict[str, int | str]:
+    if not isinstance(value, Mapping) or set(value) != {"count", "sha256"}:
+        raise DomainError("BACKUP_MANIFEST_INVALID", f"{field} fingerprint is invalid")
+    count = value.get("count")
+    sha256 = value.get("sha256")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        or not isinstance(sha256, str)
+        or DIGEST.fullmatch(sha256) is None
+    ):
+        raise DomainError("BACKUP_MANIFEST_INVALID", f"{field} fingerprint is invalid")
+    return {"count": count, "sha256": sha256}
+
+
+def _parse_backup_snapshot(value: object) -> BackupSnapshotFingerprint:
+    expected_fields = {
+        "schema_version",
+        "capture_method",
+        "tables",
+        "rls_policies",
+        "catalog",
+        "migration_versions",
+        "backup_role",
+        "snapshot_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup snapshot fields are invalid")
+    snapshot_payload = {key: value[key] for key in value if key != "snapshot_digest"}
+    snapshot_digest = value.get("snapshot_digest")
+    if (
+        value.get("schema_version") != 1
+        or value.get("capture_method") != "pg-export-snapshot-v1"
+        or not isinstance(snapshot_digest, str)
+        or DIGEST.fullmatch(snapshot_digest) is None
+        or snapshot_digest != canonical_digest(snapshot_payload)
+    ):
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup snapshot digest is invalid")
+    raw_tables = value.get("tables")
+    if not isinstance(raw_tables, Mapping) or not raw_tables:
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup table fingerprints are invalid")
+    tables: dict[str, Mapping[str, int | str]] = {}
+    for name, entry in raw_tables.items():
+        if not isinstance(name, str) or not name or "\x00" in name:
+            raise DomainError("BACKUP_MANIFEST_INVALID", "backup table name is invalid")
+        tables[name] = _digest_entry(entry, field=f"table {name}")
+    rls_policies = _digest_entry(value.get("rls_policies"), field="RLS policy")
+    raw_catalog = value.get("catalog")
+    if not isinstance(raw_catalog, Mapping) or set(raw_catalog) != {
+        "sha256",
+        "objects",
+        "sections",
+    }:
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup catalog fingerprint is invalid")
+    raw_sections = raw_catalog.get("sections")
+    expected_sections = {name for name, _sql in (*CATALOG_QUERIES, *CATALOG_SECURITY_QUERIES)} | {
+        "sequence_runtime_state"
+    }
+    if not isinstance(raw_sections, Mapping) or set(raw_sections) != expected_sections:
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup catalog sections are invalid")
+    sections = {
+        str(name): _digest_entry(entry, field=f"catalog {name}")
+        for name, entry in raw_sections.items()
+    }
+    catalog_sha256 = raw_catalog.get("sha256")
+    catalog_objects = raw_catalog.get("objects")
+    if (
+        not isinstance(catalog_sha256, str)
+        or DIGEST.fullmatch(catalog_sha256) is None
+        or catalog_sha256 != canonical_digest(sections)
+        or not isinstance(catalog_objects, int)
+        or isinstance(catalog_objects, bool)
+        or catalog_objects != sum(int(entry["count"]) for entry in sections.values())
+    ):
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup catalog digest is invalid")
+    catalog: Mapping[str, object] = {
+        "sha256": catalog_sha256,
+        "objects": catalog_objects,
+        "sections": sections,
+    }
+    raw_versions = value.get("migration_versions")
+    if (
+        not isinstance(raw_versions, list)
+        or not raw_versions
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in raw_versions)
+        or any(item < 1 or item > 1_000_000 for item in raw_versions)
+        or any(item != index for index, item in enumerate(raw_versions, start=1))
+    ):
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup migration history is invalid")
+    role = value.get("backup_role")
+    if not isinstance(role, Mapping) or set(role) != {
+        "name",
+        "bypass_rls",
+        "owns_tables",
+        "owns_routines",
+        "matrix_exact_read_only",
+    }:
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup role binding is invalid")
+    if (
+        not isinstance(role.get("name"), str)
+        or re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", str(role.get("name"))) is None
+        or role.get("bypass_rls") is not True
+        or role.get("owns_tables") is not False
+        or role.get("owns_routines") is not False
+        or role.get("matrix_exact_read_only") is not True
+    ):
+        raise DomainError("BACKUP_MANIFEST_INVALID", "backup role binding is invalid")
+    return BackupSnapshotFingerprint(
+        tables,
+        rls_policies,
+        catalog,
+        tuple(raw_versions),
+        dict(role),
+        snapshot_digest,
+    )
+
+
+def _load_immutable_sealed_receipt(path: Path, *, receipt: BackupRestoreReceipt) -> None:
+    try:
+        encoded = path.read_bytes()
+        value = json.loads(encoded)
+    except (OSError, json.JSONDecodeError, UnicodeError) as error:
+        raise DomainError(
+            "BACKUP_RECEIPT_INVALID", "sealed backup receipt is unreadable"
+        ) from error
+    expected = {
+        "schema_version": 1,
+        "created_at": receipt.created_at,
+        "source_database_digest": receipt.source_database_digest,
+        "archive": {
+            "key": receipt.archive.key,
+            "size": receipt.archive.size,
+            "sha256": receipt.archive.sha256,
+            "version_id": receipt.archive.version_id,
+            "encryption": receipt.archive.encryption,
+        },
+        "manifest": {
+            "key": receipt.manifest.key,
+            "size": receipt.manifest.size,
+            "sha256": receipt.manifest.sha256,
+            "version_id": receipt.manifest.version_id,
+            "encryption": receipt.manifest.encryption,
+        },
+        "manifest_digest": receipt.manifest_digest,
+        "backup_snapshot_digest": receipt.backup_snapshot_digest,
+        "kms_key_partition": receipt.kms_key_partition,
+    }
+    expected["sealed_receipt_digest"] = canonical_digest(expected)
+    if (
+        not isinstance(value, Mapping)
+        or canonical_json(value).encode("utf-8") != encoded
+        or value != expected
+        or value.get("sealed_receipt_digest") != receipt.sealed_receipt_digest
+    ):
+        raise DomainError(
+            "BACKUP_RECEIPT_INVALID", "sealed backup receipt does not match its pointer"
+        )
+
+
 def _load_immutable_manifest(
     path: Path,
     *,
     receipt: BackupRestoreReceipt,
     expected_kms_key_digest: str,
-) -> Mapping[str, object]:
+    expected_kms_partition: str,
+) -> BackupSnapshotFingerprint:
     try:
         encoded = path.read_bytes()
         value = json.loads(encoded)
@@ -184,8 +430,10 @@ def _load_immutable_manifest(
         "source_database_digest",
         "archive",
         "kms_key_id_digest",
+        "kms_key_partition",
         "format",
         "verified_by",
+        "backup_snapshot",
         "manifest_digest",
     }:
         raise DomainError("BACKUP_MANIFEST_INVALID", "backup manifest fields are invalid")
@@ -193,7 +441,7 @@ def _load_immutable_manifest(
         raise DomainError("BACKUP_MANIFEST_INVALID", "backup manifest is not canonical JSON")
     payload = {key: value[key] for key in value if key != "manifest_digest"}
     if (
-        value.get("schema_version") != 2
+        value.get("schema_version") != 3
         or value.get("manifest_digest") != canonical_digest(payload)
         or value.get("manifest_digest") != receipt.manifest_digest
         or value.get("created_at") != receipt.created_at
@@ -207,13 +455,20 @@ def _load_immutable_manifest(
             "encryption": receipt.archive.encryption,
         }
         or value.get("kms_key_id_digest") != expected_kms_key_digest
+        or value.get("kms_key_partition") != expected_kms_partition
+        or value.get("kms_key_partition") != receipt.kms_key_partition
         or value.get("format") != "postgresql-custom"
-        or value.get("verified_by") != "pg_restore --list"
+        or value.get("verified_by") != "pg_restore --list + exported snapshot fingerprints"
     ):
         raise DomainError(
             "BACKUP_MANIFEST_INVALID", "backup manifest does not match the restore receipt"
         )
-    return value
+    snapshot = _parse_backup_snapshot(value.get("backup_snapshot"))
+    if snapshot.snapshot_digest != receipt.backup_snapshot_digest:
+        raise DomainError(
+            "BACKUP_MANIFEST_INVALID", "backup snapshot is not bound to the restore receipt"
+        )
+    return snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +485,7 @@ class _DatabaseCoordinate:
 def _database_url_parts(url: str) -> tuple[_DatabaseCoordinate, str, Mapping[str, list[str]]]:
     try:
         parsed = urlsplit(url.replace("postgresql+psycopg://", "postgresql://", 1))
-        port = parsed.port or 5432
+        port = parsed.port if parsed.port is not None else 5432
     except ValueError as error:
         raise DomainError("DATABASE_URL_INVALID", "PostgreSQL URL is malformed") from error
     database = unquote(parsed.path.removeprefix("/"))
@@ -240,6 +495,7 @@ def _database_url_parts(url: str) -> tuple[_DatabaseCoordinate, str, Mapping[str
         or not database
         or "/" in database
         or parsed.fragment
+        or not 1 <= port <= 65535
     ):
         raise DomainError("DATABASE_URL_INVALID", "PostgreSQL URL coordinate is invalid")
     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -687,8 +943,8 @@ CATALOG_SECURITY_QUERIES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _sequence_runtime_state_inventory(store: SqlAlchemyStore) -> dict[str, int | str]:
-    names = [
+def _sequence_names(store: SqlAlchemyStore) -> tuple[str, ...]:
+    return tuple(
         str(row["sequence_name"])
         for row in store.query(
             """SELECT sequence.relname AS sequence_name
@@ -697,7 +953,11 @@ def _sequence_runtime_state_inventory(store: SqlAlchemyStore) -> dict[str, int |
                 WHERE namespace.nspname='public' AND sequence.relkind='S'
              ORDER BY sequence.relname COLLATE \"C\""""
         )
-    ]
+    )
+
+
+def _sequence_runtime_state_inventory(store: SqlAlchemyStore) -> dict[str, int | str]:
+    names = _sequence_names(store)
 
     def rows() -> Iterable[Mapping[str, object]]:
         for name in names:
@@ -726,6 +986,40 @@ def _catalog_inventory(store: SqlAlchemyStore) -> dict[str, object]:
             store.iterate(sql, batch_size=128), domain=f"catalog:{name}"
         )
     sections["sequence_runtime_state"] = _sequence_runtime_state_inventory(store)
+    return {
+        "sha256": canonical_digest(sections),
+        "objects": sum(int(section["count"]) for section in sections.values()),
+        "sections": sections,
+    }
+
+
+def _catalog_with_archive_sequence_states(
+    catalog: Mapping[str, object],
+    states: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Replace non-MVCC sequence values with the values serialized by pg_dump."""
+
+    raw_sections = catalog.get("sections")
+    if not isinstance(raw_sections, Mapping):
+        raise DomainError("DATABASE_BACKUP_SNAPSHOT_INVALID", "catalog sections are invalid")
+    sections = {str(name): value for name, value in raw_sections.items()}
+    sequence_rows = tuple(
+        {"sequence_name": row["sequence_name"], "last_value": row["last_value"]} for row in states
+    )
+    runtime_rows = tuple(
+        {
+            "sequence_name": row["sequence_name"],
+            "last_value": row["last_value"],
+            "is_called": row["is_called"],
+        }
+        for row in states
+    )
+    sections["sequence_state"] = _ordered_rows_digest(
+        sequence_rows, domain="catalog:sequence_state"
+    )
+    sections["sequence_runtime_state"] = _ordered_rows_digest(
+        runtime_rows, domain="catalog:sequence-runtime-state"
+    )
     return {
         "sha256": canonical_digest(sections),
         "objects": sum(int(section["count"]) for section in sections.values()),
@@ -793,15 +1087,28 @@ class PostgreSqlRestoreDrill:
         self.object_storage = object_storage
         self.backup_receipt_path = backup_receipt_path
         self.kms_key_id = kms_key_id
+        self.kms_coordinates: AwsResourceArn | None = None
+        if kms_key_id:
+            self.kms_coordinates = parse_kms_key_arn(kms_key_id, code="IMMUTABLE_BACKUP_REQUIRED")
+            storage_region = str(getattr(object_storage, "region", "") or "")
+            storage_owner = str(getattr(object_storage, "expected_bucket_owner", "") or "")
+            storage_kms_key = getattr(object_storage, "kms_key_id", None)
+            storage_exposes_kms_binding = hasattr(object_storage, "kms_key_id")
+            if (
+                (storage_region and storage_region != self.kms_coordinates.region)
+                or (storage_owner and storage_owner != self.kms_coordinates.account_id)
+                or (storage_exposes_kms_binding and storage_kms_key != kms_key_id)
+            ):
+                raise DomainError(
+                    "IMMUTABLE_BACKUP_REQUIRED",
+                    "restore KMS key does not match the S3 key, region, and bucket owner",
+                )
         self.maximum_rpo_seconds = maximum_rpo_seconds
         self.require_immutable_backup = require_immutable_backup
         if maximum_restore_seconds < 1 or maximum_archive_bytes < 1 or maximum_rpo_seconds < 1:
             raise DomainError("RESTORE_THRESHOLD_INVALID", "restore thresholds must be positive")
         if require_immutable_backup and (
-            object_storage is None
-            or backup_receipt_path is None
-            or not kms_key_id
-            or not kms_key_id.startswith("arn:aws:kms:")
+            object_storage is None or backup_receipt_path is None or self.kms_coordinates is None
         ):
             raise DomainError(
                 "IMMUTABLE_BACKUP_REQUIRED",
@@ -884,15 +1191,30 @@ class PostgreSqlRestoreDrill:
 
     @staticmethod
     def _run(command: list[str], environment: dict[str, str], timeout: int) -> None:
-        completed = subprocess.run(
-            command,
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DomainError(
+                "RESTORE_COMMAND_FAILED",
+                "PostgreSQL backup or restore command timed out",
+                {"command": command[0], "timeout_seconds": timeout},
+                status=503,
+            ) from error
+        except OSError as error:
+            raise DomainError(
+                "RESTORE_COMMAND_FAILED",
+                "PostgreSQL backup or restore command could not start",
+                {"command": command[0]},
+                status=503,
+            ) from error
         if completed.returncode:
             raise DomainError(
                 "RESTORE_COMMAND_FAILED",
@@ -907,11 +1229,39 @@ class PostgreSqlRestoreDrill:
         *,
         receipt: BackupRestoreReceipt,
         kms_key_digest: str,
-    ) -> tuple[Path, ObjectRef, ObjectRef, float]:
+        kms_key_partition: str,
+    ) -> tuple[
+        Path,
+        ObjectRef,
+        ObjectRef,
+        ObjectRef,
+        BackupSnapshotFingerprint,
+        BackupObjectRetentions,
+        float,
+    ]:
         if self.object_storage is None:
             raise DomainError("IMMUTABLE_BACKUP_REQUIRED", "object storage is required")
-        manifest_path = directory / "backup.manifest.json"
         fetch_started = time.monotonic()
+        sealed_receipt_path = directory / "backup.receipt.json"
+        sealed_receipt_reference = self.object_storage.get_file(
+            receipt.sealed_receipt.key,
+            sealed_receipt_path,
+            maximum_bytes=MAXIMUM_MANIFEST_BYTES,
+            expected_sha256=receipt.sealed_receipt.sha256,
+            version_id=receipt.sealed_receipt.version_id,
+        )
+        if not receipt.sealed_receipt.matches(sealed_receipt_reference):
+            raise DomainError(
+                "BACKUP_RECEIPT_INVALID",
+                "object storage returned a different sealed receipt version",
+            )
+        sealed_receipt_retention = _exact_version_retention(
+            self.object_storage,
+            receipt.sealed_receipt,
+            field="sealed receipt",
+        )
+        _load_immutable_sealed_receipt(sealed_receipt_path, receipt=receipt)
+        manifest_path = directory / "backup.manifest.json"
         manifest_reference = self.object_storage.get_file(
             receipt.manifest.key,
             manifest_path,
@@ -924,10 +1274,16 @@ class PostgreSqlRestoreDrill:
                 "BACKUP_MANIFEST_INVALID",
                 "object storage returned a different backup manifest version",
             )
-        _load_immutable_manifest(
+        manifest_retention = _exact_version_retention(
+            self.object_storage,
+            receipt.manifest,
+            field="manifest",
+        )
+        snapshot = _load_immutable_manifest(
             manifest_path,
             receipt=receipt,
             expected_kms_key_digest=kms_key_digest,
+            expected_kms_partition=kms_key_partition,
         )
         archive = directory / "database.dump"
         archive_reference = self.object_storage.get_file(
@@ -942,17 +1298,34 @@ class PostgreSqlRestoreDrill:
                 "BACKUP_ARCHIVE_INVALID",
                 "object storage returned a different backup archive version",
             )
+        archive_retention = _exact_version_retention(
+            self.object_storage,
+            receipt.archive,
+            field="archive",
+        )
         return (
             archive,
             manifest_reference,
             archive_reference,
+            sealed_receipt_reference,
+            snapshot,
+            BackupObjectRetentions(
+                sealed_receipt_retention,
+                manifest_retention,
+                archive_retention,
+            ),
             time.monotonic() - fetch_started,
         )
 
     def run(self) -> GateEvidence:
         started = utc_now()
         restore_started = time.monotonic()
-        if self.object_storage is None or self.backup_receipt_path is None or not self.kms_key_id:
+        if (
+            self.object_storage is None
+            or self.backup_receipt_path is None
+            or not self.kms_key_id
+            or self.kms_coordinates is None
+        ):
             raise DomainError(
                 "IMMUTABLE_BACKUP_REQUIRED",
                 "restore drills require an immutable version-bound backup receipt",
@@ -961,11 +1334,22 @@ class PostgreSqlRestoreDrill:
             self.backup_receipt_path,
             expected_source_database_digest=self.source_coordinate.digest,
         )
-        backup_age_seconds = receipt.age_seconds()
-        if backup_age_seconds < -300:
+        backup_age_at_start_seconds = receipt.age_seconds()
+        if backup_age_at_start_seconds < -300:
             raise DomainError("BACKUP_RECEIPT_INVALID", "backup timestamp is in the future")
+        if backup_age_at_start_seconds > self.maximum_rpo_seconds:
+            raise DomainError(
+                "BACKUP_RPO_EXCEEDED",
+                "backup was already older than the maximum RPO before restore started",
+                {"maximum_seconds": self.maximum_rpo_seconds},
+                status=503,
+            )
+        if receipt.kms_key_partition != self.kms_coordinates.partition:
+            raise DomainError(
+                "BACKUP_RECEIPT_INVALID",
+                "backup receipt AWS partition does not match the restore KMS key",
+            )
         kms_key_digest = canonical_digest({"kms_key_id": self.kms_key_id})
-        source = SqlAlchemyStore(self.source_url)
         target = SqlAlchemyStore(self.target_url)
         try:
             existing = target.query(
@@ -996,48 +1380,21 @@ class PostgreSqlRestoreDrill:
                     "RESTORE_TARGET_NOT_EMPTY",
                     "restore target public schema must contain no pre-existing objects",
                 )
-            source_inventory = _table_inventory(source)
-            source_policies = _rls_inventory(source)
-            source_catalog = _catalog_inventory(source)
-            source_role_valid = True
-            if self.backup_role:
-                source_role = source.query(
-                    """SELECT current_user AS role, roles.rolbypassrls AS bypass,
-                              EXISTS (
-                                SELECT 1 FROM pg_class relation
-                                JOIN pg_namespace namespace
-                                  ON namespace.oid=relation.relnamespace
-                                WHERE namespace.nspname='public'
-                                  AND relation.relowner=roles.oid
-                              ) AS owns_tables,
-                              EXISTS (
-                                SELECT 1 FROM pg_proc routine
-                                JOIN pg_namespace namespace
-                                  ON namespace.oid=routine.pronamespace
-                                WHERE namespace.nspname='public'
-                                  AND routine.proowner=roles.oid
-                              ) AS owns_routines
-                         FROM pg_roles roles WHERE roles.rolname=current_user"""
-                )[0]
-                source_matrix = role_access_matrix(source, self.backup_role)
-                source_role_valid = (
-                    source_role["role"] == self.backup_role
-                    and bool(source_role["bypass"])
-                    and not bool(source_role["owns_tables"])
-                    and not bool(source_role["owns_routines"])
-                    and role_matrix_is_exact(source_matrix, read_write=False)
-                )
             with tempfile.TemporaryDirectory(prefix="shadow-restore-drill-") as directory:
                 directory_path = Path(directory)
                 (
                     archive,
                     manifest_reference,
                     archive_reference,
+                    sealed_receipt_reference,
+                    backup_snapshot,
+                    backup_retentions,
                     object_fetch_seconds,
                 ) = self._fetch_immutable_backup(
                     directory_path,
                     receipt=receipt,
                     kms_key_digest=kms_key_digest,
+                    kms_key_partition=self.kms_coordinates.partition,
                 )
                 database_restore_started = time.monotonic()
                 self._run(
@@ -1063,6 +1420,15 @@ class PostgreSqlRestoreDrill:
                 archive_digest = archive_reference.sha256
                 archive_bytes = archive_reference.size
 
+            source_inventory = backup_snapshot.tables
+            source_policies = backup_snapshot.rls_policies
+            source_catalog = backup_snapshot.catalog
+            source_versions = backup_snapshot.migration_versions
+            source_head = source_versions[-1]
+            source_role_valid = self.backup_role is None or (
+                backup_snapshot.backup_role.get("name") == self.backup_role
+            )
+
             role_result: Mapping[str, object] = {}
             if self.application_target_url:
                 role_result = DatabaseRoleConfigurator(
@@ -1075,15 +1441,10 @@ class PostgreSqlRestoreDrill:
             target_inventory = _table_inventory(target)
             target_policies = _rls_inventory(target)
             target_catalog = _catalog_inventory(target)
-            source_versions = tuple(
-                int(item["version"])
-                for item in source.query("SELECT version FROM schema_migrations ORDER BY version")
-            )
             target_versions = tuple(
                 int(item["version"])
                 for item in target.query("SELECT version FROM schema_migrations ORDER BY version")
             )
-            source_head = source_versions[-1] if source_versions else 0
             target_integrity = target.query(
                 """SELECT NOT pg_is_in_recovery() AS writable,
                           current_database() AS database,
@@ -1096,12 +1457,27 @@ class PostgreSqlRestoreDrill:
             )[0]
             checks_list = [
                 GateCheck("immutable_backup_receipt", bool(receipt.receipt_digest)),
+                GateCheck(
+                    "sealed_receipt_version_bound",
+                    receipt.sealed_receipt.matches(sealed_receipt_reference),
+                ),
+                GateCheck(
+                    "sealed_receipt_version_retained",
+                    backup_retentions.sealed_receipt.active(),
+                ),
                 GateCheck("manifest_version_bound", receipt.manifest.matches(manifest_reference)),
+                GateCheck(
+                    "manifest_version_retained",
+                    backup_retentions.manifest.active(),
+                ),
                 GateCheck("archive_version_bound", receipt.archive.matches(archive_reference)),
                 GateCheck(
-                    "backup_rpo",
-                    0 <= backup_age_seconds <= self.maximum_rpo_seconds,
-                    {"maximum_seconds": self.maximum_rpo_seconds},
+                    "archive_version_retained",
+                    backup_retentions.archive.active(),
+                ),
+                GateCheck(
+                    "backup_snapshot_bound",
+                    backup_snapshot.snapshot_digest == receipt.backup_snapshot_digest,
                 ),
                 GateCheck("source_backup_role", source_role_valid),
                 GateCheck(
@@ -1118,11 +1494,7 @@ class PostgreSqlRestoreDrill:
                 GateCheck(
                     "catalog_equivalence",
                     source_catalog == target_catalog,
-                    {
-                        "catalog_sections": len(CATALOG_QUERIES)
-                        + len(CATALOG_SECURITY_QUERIES)
-                        + 1
-                    },
+                    {"catalog_sections": len(CATALOG_QUERIES) + len(CATALOG_SECURITY_QUERIES) + 1},
                 ),
                 GateCheck(
                     "restored_database_online",
@@ -1163,9 +1535,7 @@ class PostgreSqlRestoreDrill:
                                   ) AS owns_routines
                              FROM pg_roles roles WHERE roles.rolname=current_user"""
                     )[0]
-                    application_matrix = role_access_matrix(
-                        application, str(self.application_role)
-                    )
+                    application_matrix = role_access_matrix(application, str(self.application_role))
                     workspaces = target.query(
                         """SELECT workspace_id, COUNT(*) AS count FROM domain_resources
                              GROUP BY workspace_id ORDER BY workspace_id LIMIT 1"""
@@ -1187,9 +1557,7 @@ class PostgreSqlRestoreDrill:
                                 and not bool(role["bypass"])
                                 and not bool(role["owns_tables"])
                                 and not bool(role["owns_routines"])
-                                and role_matrix_is_exact(
-                                    application_matrix, read_write=True
-                                ),
+                                and role_matrix_is_exact(application_matrix, read_write=True),
                             ),
                             GateCheck(
                                 "restored_rls_unscoped_denial",
@@ -1250,11 +1618,19 @@ class PostgreSqlRestoreDrill:
                 finally:
                     backup.close()
             restore_seconds = time.monotonic() - restore_started
-            checks_list.append(
-                GateCheck(
-                    "restore_rto",
-                    restore_seconds <= self.maximum_restore_seconds,
-                    {"maximum_seconds": self.maximum_restore_seconds},
+            backup_age_seconds = receipt.age_seconds()
+            checks_list.extend(
+                (
+                    GateCheck(
+                        "backup_rpo",
+                        0 <= backup_age_seconds <= self.maximum_rpo_seconds,
+                        {"maximum_seconds": self.maximum_rpo_seconds},
+                    ),
+                    GateCheck(
+                        "restore_rto",
+                        restore_seconds <= self.maximum_restore_seconds,
+                        {"maximum_seconds": self.maximum_restore_seconds},
+                    ),
                 )
             )
             checks = tuple(checks_list)
@@ -1269,9 +1645,37 @@ class PostgreSqlRestoreDrill:
                         {"version_id": receipt.archive.version_id}
                     ),
                     "backup_manifest_digest": receipt.manifest_digest,
+                    "manifest_version_digest": canonical_digest(
+                        {"version_id": receipt.manifest.version_id}
+                    ),
                     "backup_receipt_digest": receipt.receipt_digest,
+                    "backup_snapshot_digest": receipt.backup_snapshot_digest,
+                    "sealed_receipt_version_digest": canonical_digest(
+                        {"version_id": receipt.sealed_receipt.version_id}
+                    ),
+                    "sealed_receipt_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.sealed_receipt.mode,
+                            "retain_until": backup_retentions.sealed_receipt.retain_until,
+                        }
+                    ),
+                    "manifest_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.manifest.mode,
+                            "retain_until": backup_retentions.manifest.retain_until,
+                        }
+                    ),
+                    "archive_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.archive.mode,
+                            "retain_until": backup_retentions.archive.retain_until,
+                        }
+                    ),
                     "restored_catalog_digest": str(target_catalog["sha256"]),
                     "kms_key_id_digest": kms_key_digest,
+                    "kms_key_partition_digest": canonical_digest(
+                        {"partition": receipt.kms_key_partition}
+                    ),
                     "managed_provider": self.managed_provider or "not-required",
                     "managed_instance_digest": self.managed_instance_digest or "not-required",
                 },
@@ -1283,6 +1687,35 @@ class PostgreSqlRestoreDrill:
                     "rls_policies": int(target_policies["count"]),
                     "catalog_objects": int(str(target_catalog["objects"])),
                     "archive_bytes": archive_bytes,
+                    "object_lock_versions": 3,
+                    "backup_receipt_digest": receipt.receipt_digest,
+                    "archive_version_digest": canonical_digest(
+                        {"version_id": receipt.archive.version_id}
+                    ),
+                    "manifest_version_digest": canonical_digest(
+                        {"version_id": receipt.manifest.version_id}
+                    ),
+                    "sealed_receipt_version_digest": canonical_digest(
+                        {"version_id": receipt.sealed_receipt.version_id}
+                    ),
+                    "archive_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.archive.mode,
+                            "retain_until": backup_retentions.archive.retain_until,
+                        }
+                    ),
+                    "manifest_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.manifest.mode,
+                            "retain_until": backup_retentions.manifest.retain_until,
+                        }
+                    ),
+                    "sealed_receipt_retention_digest": canonical_digest(
+                        {
+                            "mode": backup_retentions.sealed_receipt.mode,
+                            "retain_until": backup_retentions.sealed_receipt.retain_until,
+                        }
+                    ),
                     "backup_age_seconds": round(max(0.0, backup_age_seconds), 3),
                     "object_fetch_seconds": round(object_fetch_seconds, 3),
                     "database_restore_seconds": round(database_restore_seconds, 3),
@@ -1290,5 +1723,4 @@ class PostgreSqlRestoreDrill:
                 },
             )
         finally:
-            source.close()
             target.close()

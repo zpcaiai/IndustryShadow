@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fail closed when repository-visible workflows drift from package templates."""
 
 from __future__ import annotations
@@ -6,7 +5,6 @@ from __future__ import annotations
 import difflib
 import re
 from pathlib import Path
-
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PACKAGE_ROOT.parent.parent
@@ -49,24 +47,33 @@ ARTIFACT_BINDING_FRAGMENTS = {
         "immutable-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
     ),
     "production-acceptance.yml": (
-        "immutable-release-candidate-${{ inputs.release_run_id }}-"
-        "${{ steps.release-run.outputs.run_attempt }}",
+        (
+            "immutable-release-candidate-${{ inputs.release_run_id }}-"
+            "${{ steps.release-run.outputs.run_attempt }}"
+        ),
         "production-acceptance-evidence-${{ github.run_id }}-${{ github.run_attempt }}",
     ),
     "production-closure.yml": (
-        "production-acceptance-evidence-${{ inputs.acceptance_run_id }}-"
-        "${{ steps.acceptance-run.outputs.run_attempt }}",
+        (
+            "production-acceptance-evidence-${{ inputs.acceptance_run_id }}-"
+            "${{ steps.acceptance-run.outputs.run_attempt }}"
+        ),
         "production-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}",
     ),
     "production-deploy.yml": (
         'artifact_expected_name="production-closure-evidence-$CLOSURE_RUN_ID-$run_attempt"',
         "name: ${{ steps.closure-run.outputs.artifact_name }}",
         'artifact_name="production-deployment-evidence-$PRIOR_DEPLOYMENT_RUN_ID-$run_attempt"',
-        "name: production-deployment-evidence-${{ inputs.prior_deployment_run_id }}-"
-        "${{ steps.prior-run.outputs.run_attempt }}",
+        (
+            "name: production-deployment-evidence-"
+            "${{ inputs.prior_deployment_run_id }}-"
+            "${{ steps.prior-run.outputs.run_attempt }}"
+        ),
         'case "$conclusion" in failure|cancelled)',
-        "--recovery-envelope docs/evidence/batch-24/production-deployment/"
-        "deployment-recovery-envelope.json",
+        (
+            "--recovery-envelope docs/evidence/batch-24/production-deployment/"
+            "deployment-recovery-envelope.json"
+        ),
         "--same-run-rollback",
         "--prior-recovery-envelope",
         '--prior-conclusion "$PRIOR_CONCLUSION"',
@@ -218,14 +225,42 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
                 errors.append(f"ci.yml: missing root path contract {fragment}")
     if root_name == "production-acceptance.yml":
         required = (
-            "SHADOW_OIDC_BROWSER_JOURNEY: web/test-results/"
-            "production-oidc-journey-${{ github.run_id }}-${{ github.run_attempt }}.json",
+            (
+                "SHADOW_OIDC_BROWSER_JOURNEY: web/test-results/"
+                "production-oidc-journey-${{ github.run_id }}-"
+                "${{ github.run_attempt }}.json"
+            ),
             "SHADOW_PRODUCTION_S3_CONTROL_PLANE_CONFIRMATION:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_ARN:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT:",
+            "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW:",
+            "SHADOW_KMS_ADMIN_ROLE_ARN:",
+            "SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN:",
             "SHADOW_KUBERNETES_NETWORK_CONTEXT:",
             "SHADOW_KUBERNETES_STORAGE_CONTEXT:",
             "SHADOW_KUBERNETES_CHAOS_CONTEXT:",
             "SHADOW_KUBERNETES_ROLLBACK_CONTEXT:",
             "Prepare pristine run-bound OIDC browser journey target",
+            "Collect exact live AWS storage policy digests read-only",
+            "aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708",
+            'role-to-assume: ${{ env.SHADOW_S3_CONTROL_PLANE_CALLER_ARN }}',
+            "role-skip-session-tagging: true",
+            "unset-current-credentials: true",
+            'test "$GITHUB_REF" = refs/heads/main',
+            '--backup-sentinel-key "$SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY"',
+            '--snapshot-sentinel-key "$SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"',
+            '--caller-trust-repository "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY"',
+            (
+                '--caller-trust-repository-owner-id '
+                '"$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID"'
+            ),
+            '--caller-trust-repository-id "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID"',
+            '--caller-trust-ref "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF"',
+            "docs/evidence/batch-24/production/aws-storage-policy-target.json",
             "Verify fresh live OIDC journey and persona RBAC",
         )
         for fragment in required:
@@ -249,6 +284,19 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
         ):
             errors.append(
                 "production-acceptance.yml: OIDC/network/storage gate order is invalid"
+            )
+        aws_ordered = (
+            "Resolve the partition-exact AWS STS audience",
+            "aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708",
+            "Collect exact live AWS storage policy digests read-only",
+            "production_gate.py preflight",
+        )
+        aws_positions = [content.find(fragment) for fragment in aws_ordered]
+        if any(position < 0 for position in aws_positions) or aws_positions != sorted(
+            aws_positions
+        ):
+            errors.append(
+                "production-acceptance.yml: GitHub OIDC caller exchange order is invalid"
             )
     return errors
 

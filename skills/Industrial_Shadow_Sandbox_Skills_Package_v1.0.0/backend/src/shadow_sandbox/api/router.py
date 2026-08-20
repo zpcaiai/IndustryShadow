@@ -16,7 +16,6 @@ API_ROUTE_CONTRACT: tuple[tuple[str, str], ...] = (
     ("GET", "/api/v1/auth/config"),
     ("GET", "/api/v1/me"),
     ("GET", "/api/v1/permissions"),
-    ("GET", "/api/v1/authorization-probe/{capability}"),
     ("POST", "/api/v1/asset-models"),
     ("GET", "/api/v1/asset-models/{model_id}"),
     ("PATCH", "/api/v1/asset-models/{model_id}"),
@@ -239,6 +238,7 @@ def create_api_router(
         "/authorization-probe/{capability}",
         authorization_probe,
         tags=["identity"],
+        include_in_schema=False,
     )
 
     # Asset models

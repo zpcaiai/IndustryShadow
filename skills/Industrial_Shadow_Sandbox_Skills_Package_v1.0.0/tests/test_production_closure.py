@@ -51,7 +51,12 @@ from shadow_sandbox.operations.production_preflight import (
     validate_oidc_browser_journey_output_target,
 )
 from shadow_sandbox.operations.restore_drill import PostgreSqlRestoreDrill
-from shadow_sandbox.operations.storage_probe import S3KmsProbe
+from shadow_sandbox.operations.storage_probe import (
+    AWS_STORAGE_POLICY_DIGEST_FIELDS,
+    S3KmsProbe,
+    aws_storage_policy_bundle_digest,
+    github_actions_caller_trust_contract,
+)
 from shadow_sandbox.operations.trust_store import SignerTrustStore
 
 from tools.build_production_closure import (
@@ -232,6 +237,7 @@ class FakeS3:
             "SSEKMSKeyId": self.kms_key,
             "Metadata": {"sha256": hashlib.sha256(data).hexdigest()},
             "VersionId": "v1",
+            "ETag": '"etag"',
         }
 
     def get_object(self, **kwargs: object) -> dict[str, object]:
@@ -334,7 +340,7 @@ class FakeRoleStore:
         if ") AS owned" in sql:
             return [{"count": 0}]
         if "WITH requested(role_name)" in sql:
-            role = str(tuple(_parameters)[0])  # type: ignore[arg-type]
+            role = str(next(iter(_parameters)))  # type: ignore[arg-type]
             read_write = role != "shadow_backup"
             return [
                 {
@@ -700,7 +706,7 @@ class ProductionClosureTests(unittest.TestCase):
         self.assertTrue(result_checks["browser_journey_freshness"])
 
         wrong_run = {**journey, "acceptance_run_id": "unit-test-run-9999"}
-        wrong_run_checks = probe._browser_checks(  # noqa: SLF001
+        wrong_run_checks = probe._browser_checks(
             wrong_run,
             gate_started_at=utc_now(),
         )
@@ -716,7 +722,7 @@ class ProductionClosureTests(unittest.TestCase):
             "started_at": (now - dt.timedelta(minutes=12)).isoformat(),
             "completed_at": (now - dt.timedelta(minutes=11)).isoformat(),
         }
-        stale_checks = probe._browser_checks(  # noqa: SLF001
+        stale_checks = probe._browser_checks(
             stale,
             gate_started_at=now.isoformat(),
         )
@@ -731,7 +737,7 @@ class ProductionClosureTests(unittest.TestCase):
             "started_at": now.isoformat(),
             "completed_at": (now + dt.timedelta(seconds=1)).isoformat(),
         }
-        future_checks = probe._browser_checks(  # noqa: SLF001
+        future_checks = probe._browser_checks(
             future,
             gate_started_at=now.isoformat(),
         )
@@ -1376,6 +1382,10 @@ class ProductionClosureTests(unittest.TestCase):
                 ),
                 ("deployment", "web", "web", "web", "https://shadow.test.internal/"),
             ]
+            storage_roles = {
+                "shadow-simulator-storage": "arn:aws:iam::123456789012:role/shadow-snapshot",
+                "shadow-backup-storage": "arn:aws:iam::123456789012:role/shadow-backup",
+            }
 
             def workload_manifest(
                 kind: str, name: str, container: str, image: str
@@ -1531,6 +1541,17 @@ class ProductionClosureTests(unittest.TestCase):
                 )
                 if name == "simulator":
                     env_entries += (
+                        "            - {name: AWS_ROLE_ARN, value: "
+                        + storage_roles["shadow-simulator-storage"]
+                        + "}\n"
+                        "            - {name: AWS_REGION, value: us-east-1}\n"
+                        "            - {name: AWS_DEFAULT_REGION, value: us-east-1}\n"
+                        "            - {name: AWS_S3_US_EAST_1_REGIONAL_ENDPOINT, value: regional}\n"
+                        "            - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token}\n"
+                        "            - {name: AWS_STS_REGIONAL_ENDPOINTS, value: regional}\n"
+                        "            - {name: AWS_EC2_METADATA_DISABLED, value: 'true'}\n"
+                        "            - {name: AWS_CONFIG_FILE, value: /dev/null}\n"
+                        "            - {name: AWS_SHARED_CREDENTIALS_FILE, value: /dev/null}\n"
                         "            - {name: SHADOW_DATABASE_PATH, value: /var/lib/shadow/simulator.db}\n"
                         "            - {name: SHADOW_OPCUA_CERTIFICATE_PATH, value: /var/run/shadow-pki/server.crt}\n"
                         "            - {name: SHADOW_OPCUA_PRIVATE_KEY_PATH, value: /var/run/shadow-pki/server.key}\n"
@@ -1539,11 +1560,19 @@ class ProductionClosureTests(unittest.TestCase):
                     f"        - name: secret-{index}\n          secret: {{secretName: {secret}}}\n"
                     for index, secret in enumerate(secret_names.get(name, []))
                 )
+                if name == "simulator":
+                    secret_volumes += (
+                        "        - name: aws-iam-token\n"
+                        "          projected:\n"
+                        "            defaultMode: 0400\n"
+                        "            sources:\n"
+                        "              - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}\n"
+                    )
                 labels = {
                     "control-api": "{app: control-api, plane: control}",
                     "worker": "{app: worker, plane: data}",
                     "action-executor": "{app: action-executor, plane: action}",
-                    "simulator": "{app: simulator, plane: simulator}",
+                    "simulator": "{app: simulator, plane: simulator, shadow-sandbox.io/storage-egress: regional-s3-sts}",
                     "real-ot-collector": "{app: real-ot-collector, plane: collector, collector-target: real-ot}",
                     "simulator-collector": "{app: simulator-collector, plane: collector, collector-target: simulator}",
                     "web": "{app: web, plane: ingress}",
@@ -1558,7 +1587,7 @@ class ProductionClosureTests(unittest.TestCase):
                     f"    metadata: {{labels: {labels[name]}}}\n"
                     "    spec:\n"
                     f"      serviceAccountName: {accounts[name]}\n"
-                    f"      automountServiceAccountToken: {'true' if name == 'simulator' else 'false'}\n"
+                    "      automountServiceAccountToken: false\n"
                     "      securityContext:\n"
                     "        runAsNonRoot: true\n"
                     "        seccompProfile: {type: RuntimeDefault}\n"
@@ -1576,6 +1605,12 @@ class ProductionClosureTests(unittest.TestCase):
                     "            allowPrivilegeEscalation: false\n"
                     "            readOnlyRootFilesystem: true\n"
                     "            capabilities: {drop: [ALL]}\n"
+                    + (
+                        "          volumeMounts:\n"
+                        "            - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}\n"
+                        if name == "simulator"
+                        else ""
+                    )
                     + ("      volumes:\n" + secret_volumes if secret_volumes else "")
                 )
 
@@ -1585,10 +1620,6 @@ class ProductionClosureTests(unittest.TestCase):
                 "apiVersion: v1\nkind: Service\nmetadata: {name: simulator, namespace: industrial-shadow}\nspec: {selector: {app: simulator}, ports: [{name: http, port: 8010, targetPort: http}, {name: opcua, port: 4840, targetPort: opcua}]}\n---\n"
                 "apiVersion: v1\nkind: Service\nmetadata: {name: web, namespace: industrial-shadow}\nspec: {selector: {app: web}, ports: [{name: http, port: 80, targetPort: http}]}\n"
             )
-            storage_roles = {
-                "shadow-simulator-storage": "arn:aws:iam::123456789012:role/shadow-snapshot",
-                "shadow-backup-storage": "arn:aws:iam::123456789012:role/shadow-backup",
-            }
 
             def service_account_manifest(name: str) -> str:
                 if name in storage_roles:
@@ -1603,14 +1634,10 @@ class ProductionClosureTests(unittest.TestCase):
                     metadata = (
                         f"metadata: {{name: {name}, namespace: industrial-shadow}}\n"
                     )
-                token = name in {
-                    "shadow-simulator-storage",
-                    "shadow-backup-storage",
-                }
                 return (
                     "apiVersion: v1\nkind: ServiceAccount\n"
                     f"{metadata}"
-                    f"automountServiceAccountToken: {'true' if token else 'false'}\n"
+                    "automountServiceAccountToken: false\n"
                 )
 
             service_accounts = "---\n".join(
@@ -1645,15 +1672,24 @@ class ProductionClosureTests(unittest.TestCase):
                     return (
                         "apiVersion: networking.k8s.io/v1\n"
                         "kind: NetworkPolicy\n"
-                        "metadata: {name: storage-identity-probe-egress, "
-                        "namespace: industrial-shadow}\n"
+                        "metadata:\n"
+                        "  name: storage-identity-probe-egress\n"
+                        "  namespace: industrial-shadow\n"
+                        "  annotations:\n"
+                        "    industrial-shadow-storage-egress-contract: '"
+                        '{"partition":"aws","region":"us-east-1","s3_cidrs":["10.0.0.30/32"],"s3_endpoint":"s3.us-east-1.amazonaws.com","schema_version":1,"sts_cidrs":["10.0.0.31/32"],"sts_endpoint":"sts.us-east-1.amazonaws.com"}'
+                        "'\n"
+                        "    industrial-shadow-storage-egress-contract-sha256: "
+                        "2018f409e19190a9d7cb400f54bb10b761ff618974a50e39c904093d8262ebb4\n"
                         "spec:\n"
-                        "  podSelector: {matchLabels: {app.kubernetes.io/name: "
-                        "industrial-shadow-storage-probe}}\n"
+                        "  podSelector: {matchLabels: {shadow-sandbox.io/storage-egress: "
+                        "regional-s3-sts}}\n"
                         "  policyTypes: [Egress]\n"
                         "  egress:\n"
                         "    - to:\n"
                         "        - {ipBlock: {cidr: 10.0.0.30/32}}\n"
+                        "      ports: [{protocol: TCP, port: 443}]\n"
+                        "    - to:\n"
                         "        - {ipBlock: {cidr: 10.0.0.31/32}}\n"
                         "      ports: [{protocol: TCP, port: 443}]\n"
                     )
@@ -1665,6 +1701,66 @@ class ProductionClosureTests(unittest.TestCase):
 
             policies = "---\n".join(policy_manifest(name) for name in policy_names)
 
+            def backup_cronjob_manifest(image: str) -> str:
+                return (
+                    "apiVersion: batch/v1\n"
+                    "kind: CronJob\n"
+                    "metadata: {name: shadow-postgres-backup, namespace: industrial-shadow}\n"
+                    "spec:\n"
+                    "  schedule: '17 2 * * *'\n"
+                    "  jobTemplate:\n"
+                    "    spec:\n"
+                    "      template:\n"
+                    "        metadata:\n"
+                    "          labels: {app: backup, plane: data, shadow-sandbox.io/storage-egress: regional-s3-sts}\n"
+                    "        spec:\n"
+                    "          restartPolicy: Never\n"
+                    "          serviceAccountName: shadow-backup-storage\n"
+                    "          automountServiceAccountToken: false\n"
+                    "          securityContext:\n"
+                    "            runAsNonRoot: true\n"
+                    "            seccompProfile: {type: RuntimeDefault}\n"
+                    "          containers:\n"
+                    "            - name: backup\n"
+                    f"              image: {image}\n"
+                    "              args: [python, -m, shadow_sandbox.operations.backup_job]\n"
+                    "              env:\n"
+                    "                - {name: AWS_ROLE_ARN, value: "
+                    + storage_roles["shadow-backup-storage"]
+                    + "}\n"
+                    "                - {name: AWS_REGION, value: us-east-1}\n"
+                    "                - {name: AWS_DEFAULT_REGION, value: us-east-1}\n"
+                    "                - {name: AWS_S3_US_EAST_1_REGIONAL_ENDPOINT, value: regional}\n"
+                    "                - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token}\n"
+                    "                - {name: AWS_STS_REGIONAL_ENDPOINTS, value: regional}\n"
+                    "                - {name: AWS_EC2_METADATA_DISABLED, value: 'true'}\n"
+                    "                - {name: AWS_CONFIG_FILE, value: /dev/null}\n"
+                    "                - {name: AWS_SHARED_CREDENTIALS_FILE, value: /dev/null}\n"
+                    "                - {name: SHADOW_ENVIRONMENT, value: production}\n"
+                    "                - {name: SHADOW_AWS_ACCOUNT_ID, value: '123456789012'}\n"
+                    "                - {name: SHADOW_OBJECT_STORAGE_BACKEND, value: s3}\n"
+                    "                - {name: SHADOW_OBJECT_STORAGE_BUCKET, value: shadow-production-backups}\n"
+                    "                - {name: SHADOW_OBJECT_STORAGE_REGION, value: us-east-1}\n"
+                    "                - {name: SHADOW_OBJECT_STORAGE_KMS_KEY_ID, value: 'arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555'}\n"
+                    "                - {name: SHADOW_BACKUP_OBJECT_STORAGE_PREFIX, value: industrial-shadow/production/backups}\n"
+                    "                - {name: SHADOW_DATABASE_BACKUP_ROLE, value: shadow_backup}\n"
+                    "                - name: SHADOW_DATABASE_URL\n"
+                    "                  valueFrom:\n"
+                    "                    secretKeyRef: {name: shadow-backup-secrets, key: SHADOW_DATABASE_URL}\n"
+                    "              volumeMounts:\n"
+                    "                - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}\n"
+                    "              securityContext:\n"
+                    "                allowPrivilegeEscalation: false\n"
+                    "                readOnlyRootFilesystem: true\n"
+                    "                capabilities: {drop: [ALL]}\n"
+                    "          volumes:\n"
+                    "            - name: aws-iam-token\n"
+                    "              projected:\n"
+                    "                defaultMode: 0400\n"
+                    "                sources:\n"
+                    "                  - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}\n"
+                )
+
             runtime_workloads = "---\n".join(
                 workload_manifest(
                     kind,
@@ -1675,13 +1771,13 @@ class ProductionClosureTests(unittest.TestCase):
                 for kind, name, container, image, _url in workload_values
             )
             runtime = runtime_workloads + "---\n" + services
-            bootstrap = (
+            bootstrap_base = (
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: release, namespace: industrial-shadow}\n"
                 "data: {phase: bootstrap}\n---\n"
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: shadow-runtime, namespace: industrial-shadow}\n"
-                "data: {SHADOW_AUTO_MIGRATE: 'false', SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots, SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups}\n---\n"
+                "data: {SHADOW_ENVIRONMENT: production, SHADOW_AUTO_MIGRATE: 'false', SHADOW_OBJECT_STORAGE_BACKEND: s3, SHADOW_OBJECT_STORAGE_BUCKET: shadow-production-backups, SHADOW_OBJECT_STORAGE_REGION: us-east-1, SHADOW_OBJECT_STORAGE_KMS_KEY_ID: 'arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555', SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX: industrial-shadow/production/snapshots, SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: industrial-shadow/production/backups}\n---\n"
                 "apiVersion: v1\nkind: ConfigMap\n"
                 "metadata: {name: shadow-release-coordinates, namespace: industrial-shadow}\n"
                 f"data: {{SHADOW_BUILD_DIGEST: {'a' * 64}, SHADOW_SIMULATOR_BUILD_DIGEST: {'b' * 64}, SHADOW_SIMULATOR_DIGEST: {'c' * 64}}}\n---\n"
@@ -1694,8 +1790,8 @@ class ProductionClosureTests(unittest.TestCase):
                 "  SHADOW_CLIENT_APPLICATION_URI: urn:industrial-shadow:test-client\n"
                 "  SHADOW_NAMESPACE_URI: urn:industrial-shadow:test-namespace\n"
                 f"  SHADOW_CERTIFICATE_FINGERPRINT: {'f' * 64}\n"
-                f"  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: {'1' * 64}\n"
-                f"  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: {'3' * 64}\n"
+                f"  SHADOW_CLIENT_CERTIFICATE_FINGERPRINT: '{'1' * 64}'\n"
+                f"  SHADOW_NEXT_CLIENT_CERTIFICATE_FINGERPRINT: '{'3' * 64}'\n"
                 '  SHADOW_NODE_ALLOWLIST: \'[{"node_id":"ns=2;s=temperature","signal_key":"temperature","sample_period_ms":500}]\'\n'
                 "  SHADOW_MAXIMUM_NODES: '500'\n"
                 "  SHADOW_OPCUA_SECURITY_PROFILE: Basic256Sha256,SignAndEncrypt\n---\n"
@@ -1709,8 +1805,13 @@ class ProductionClosureTests(unittest.TestCase):
                 + "---\n"
                 + policies
             )
+            bootstrap = (
+                bootstrap_base + "---\n" + backup_cronjob_manifest(backend_image)
+            )
             rollback = (
-                bootstrap
+                bootstrap_base
+                + "---\n"
+                + backup_cronjob_manifest(prior_backend_image)
                 + "---\n"
                 + "---\n".join(
                     workload_manifest(
@@ -1807,6 +1908,14 @@ class ProductionClosureTests(unittest.TestCase):
                 "industrial-shadow/production/backups",
                 plan.backup_object_storage_prefix,
             )
+            self.assertEqual("us-east-1", plan.object_storage_region)
+            self.assertEqual("123456789012", plan.object_storage_account_id)
+            self.assertEqual(
+                "2018f409e19190a9d7cb400f54bb10b761ff618974a50e39c904093d8262ebb4",
+                plan.storage_egress_contract.digest,
+            )
+            self.assertEqual(("10.0.0.30/32",), plan.storage_egress_contract.s3_cidrs)
+            self.assertEqual(("10.0.0.31/32",), plan.storage_egress_contract.sts_cidrs)
 
             def assert_invalid_manifest_bindings(label: str, **manifests: str) -> None:
                 invalid_plan = json.loads(json.dumps(plan_value))
@@ -1860,6 +1969,10 @@ class ProductionClosureTests(unittest.TestCase):
                     1,
                 ),
             )
+            assert_invalid_manifest_bindings(
+                "storage-region-egress-drift",
+                bootstrap=bootstrap.replace("us-east-1", "eu-west-1", 1),
+            )
             nested_bootstrap = bootstrap.replace(
                 "industrial-shadow/production/backups",
                 "industrial-shadow/production/snapshots/archive",
@@ -1885,6 +1998,232 @@ class ProductionClosureTests(unittest.TestCase):
                 "shared-storage-role",
                 bootstrap=duplicate_role_bootstrap,
                 rollback=duplicate_role_rollback,
+            )
+            other_account_snapshot_role = storage_roles[
+                "shadow-simulator-storage"
+            ].replace("123456789012", "210987654321")
+            assert_invalid_manifest_bindings(
+                "cross-account-storage-roles",
+                bootstrap=bootstrap.replace(
+                    storage_roles["shadow-simulator-storage"],
+                    other_account_snapshot_role,
+                ),
+                runtime=runtime.replace(
+                    storage_roles["shadow-simulator-storage"],
+                    other_account_snapshot_role,
+                ),
+                rollback=rollback.replace(
+                    storage_roles["shadow-simulator-storage"],
+                    other_account_snapshot_role,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "ambient-snapshot-token",
+                runtime=runtime.replace(
+                    "serviceAccountName: shadow-simulator-storage\n"
+                    "      automountServiceAccountToken: false",
+                    "serviceAccountName: shadow-simulator-storage\n"
+                    "      automountServiceAccountToken: true",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "ambient-backup-token",
+                bootstrap=bootstrap.replace(
+                    "serviceAccountName: shadow-backup-storage\n"
+                    "          automountServiceAccountToken: false",
+                    "serviceAccountName: shadow-backup-storage\n"
+                    "          automountServiceAccountToken: true",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-env-from-forbidden",
+                bootstrap=bootstrap.replace(
+                    "              env:\n",
+                    "              envFrom:\n"
+                    "                - configMapRef: {name: shadow-runtime}\n"
+                    "              env:\n",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-production-environment-drift",
+                bootstrap=bootstrap.replace(
+                    "- {name: SHADOW_ENVIRONMENT, value: production}",
+                    "- {name: SHADOW_ENVIRONMENT, value: staging}",
+                    1,
+                ),
+            )
+            for name in ("PYTHONPATH", "AWS_ENDPOINT_URL"):
+                assert_invalid_manifest_bindings(
+                    f"backup-extra-{name.lower()}",
+                    bootstrap=bootstrap.replace(
+                        "                - name: SHADOW_DATABASE_URL\n",
+                        f"                - {{name: {name}, value: unsafe}}\n"
+                        "                - name: SHADOW_DATABASE_URL\n",
+                        1,
+                    ),
+                )
+            assert_invalid_manifest_bindings(
+                "backup-config-map-key-reference-forbidden",
+                bootstrap=bootstrap.replace(
+                    "                - {name: SHADOW_ENVIRONMENT, value: production}\n",
+                    "                - name: SHADOW_ENVIRONMENT\n"
+                    "                  valueFrom:\n"
+                    "                    configMapKeyRef: {name: shadow-runtime, key: SHADOW_ENVIRONMENT}\n",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-runtime-data-drift",
+                bootstrap=bootstrap.replace(
+                    "SHADOW_OBJECT_STORAGE_BUCKET: shadow-production-backups",
+                    "SHADOW_OBJECT_STORAGE_BUCKET: shadow-production-backups-drift",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-storage-egress-label-missing",
+                runtime=runtime.replace(
+                    ", shadow-sandbox.io/storage-egress: regional-s3-sts", "", 1
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-storage-egress-label-missing",
+                bootstrap=bootstrap.replace(
+                    ", shadow-sandbox.io/storage-egress: regional-s3-sts", "", 1
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "non-storage-workload-egress-opt-in",
+                runtime=runtime.replace(
+                    "{app: control-api, plane: control}",
+                    "{app: control-api, plane: control, "
+                    "shadow-sandbox.io/storage-egress: regional-s3-sts}",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-candidate-image-role-drift",
+                bootstrap=bootstrap.replace(backend_image, web_image, 1),
+            )
+            assert_invalid_manifest_bindings(
+                "backup-rollback-image-role-drift",
+                rollback=rollback.replace(
+                    prior_backend_image,
+                    "registry.test.internal/shadow@sha256:" + "e" * 64,
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-token-audience-drift",
+                runtime=runtime.replace(
+                    "audience: sts.amazonaws.com", "audience: kubernetes", 1
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-token-writable",
+                runtime=runtime.replace(
+                    "mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true",
+                    "mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: false",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-duplicate-standard-token-mount",
+                runtime=runtime.replace(
+                    "            - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}\n",
+                    "            - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}\n"
+                    "            - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}\n",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-custom-token-path",
+                runtime=runtime.replace(
+                    "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+                    "/var/run/secrets/industrial-shadow/aws/token",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-alternate-csi-credential-volume",
+                runtime=runtime.replace(
+                    "      volumes:\n",
+                    "      volumes:\n"
+                    "        - {name: alternate-identity, csi: {driver: credential.csi.storage}}\n",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-role-drift",
+                runtime=runtime.replace(
+                    "role/shadow-snapshot", "role/shadow-snapshot-drift", 1
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "snapshot-sdk-region-drift",
+                runtime=runtime.replace(
+                    "AWS_DEFAULT_REGION, value: us-east-1",
+                    "AWS_DEFAULT_REGION, value: eu-west-1",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "extra-storage-egress-peer",
+                bootstrap=bootstrap.replace(
+                    "        - {ipBlock: {cidr: 10.0.0.30/32}}\n",
+                    "        - {ipBlock: {cidr: 10.0.0.30/32}}\n"
+                    "        - {ipBlock: {cidr: 10.0.0.32/32}}\n",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "extra-storage-egress-port",
+                bootstrap=bootstrap.replace(
+                    "ports: [{protocol: TCP, port: 443}]",
+                    "ports: [{protocol: TCP, port: 443}, {protocol: TCP, port: 444}]",
+                    1,
+                ),
+            )
+            assert_invalid_manifest_bindings(
+                "storage-egress-selector-drift",
+                bootstrap=bootstrap.replace(
+                    "shadow-sandbox.io/storage-egress: regional-s3-sts",
+                    "app.kubernetes.io/name: industrial-shadow-storage-probe",
+                    1,
+                ),
+            )
+            for legacy_policy in ("simulator-plane", "data-jobs-egress"):
+                original = (
+                    "metadata: {name: "
+                    + legacy_policy
+                    + ", namespace: industrial-shadow}\n"
+                    "spec: {podSelector: {}, policyTypes: [Ingress, Egress]}\n"
+                )
+                with_https = (
+                    "metadata: {name: "
+                    + legacy_policy
+                    + ", namespace: industrial-shadow}\n"
+                    "spec:\n"
+                    "  podSelector: {}\n"
+                    "  policyTypes: [Ingress, Egress]\n"
+                    "  egress:\n"
+                    "    - to: [{ipBlock: {cidr: 10.0.0.30/32}}]\n"
+                    "      ports: [{protocol: TCP, port: 443}]\n"
+                )
+                assert_invalid_manifest_bindings(
+                    f"legacy-{legacy_policy}-storage-https",
+                    bootstrap=bootstrap.replace(original, with_https, 1),
+                )
+            assert_invalid_manifest_bindings(
+                "storage-egress-contract-digest-drift",
+                bootstrap=bootstrap.replace(
+                    "2018f409e19190a9d7cb400f54bb10b761ff618974a50e39c904093d8262ebb4",
+                    "0" * 64,
+                    1,
+                ),
             )
             assert_invalid_manifest_bindings(
                 "rollback-ot-endpoint-drift",
@@ -1934,15 +2273,15 @@ class ProductionClosureTests(unittest.TestCase):
                 ),
             )
             acceptance_prefix_bootstrap = bootstrap.replace(
-                "data: {SHADOW_AUTO_MIGRATE: 'false',",
+                "data: {SHADOW_ENVIRONMENT: production,",
                 "data: {SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/acceptance, "
-                "SHADOW_AUTO_MIGRATE: 'false',",
+                "SHADOW_ENVIRONMENT: production,",
                 1,
             )
             acceptance_prefix_rollback = rollback.replace(
-                "data: {SHADOW_AUTO_MIGRATE: 'false',",
+                "data: {SHADOW_ENVIRONMENT: production,",
                 "data: {SHADOW_OBJECT_STORAGE_PREFIX: industrial-shadow/acceptance, "
-                "SHADOW_AUTO_MIGRATE: 'false',",
+                "SHADOW_ENVIRONMENT: production,",
                 1,
             )
             assert_invalid_manifest_bindings(
@@ -2166,6 +2505,24 @@ class ProductionClosureTests(unittest.TestCase):
                     )
                 return ""
 
+            with self.assertRaises(DomainError) as dns_drift:
+                KubernetesProductionPublisher(
+                    plan,
+                    confirmation="industrial-shadow:release-20260809:deploy",
+                    context="production-test",
+                    expected_cluster_uid_digest=cluster_uid_digest,
+                    expected_kubernetes_api_ca_digest=api_ca_digest,
+                    runner=runner,
+                    readiness_probe=lambda _url: True,
+                    storage_endpoint_resolver=lambda hostname: (
+                        ("10.0.0.99",) if hostname.startswith("s3.") else ("10.0.0.31",)
+                    ),
+                ).run()
+            self.assertEqual(
+                "STORAGE_EGRESS_DNS_CONTRACT_MISMATCH", dns_drift.exception.code
+            )
+            self.assertFalse(applied)
+
             evidence = KubernetesProductionPublisher(
                 plan,
                 confirmation="industrial-shadow:release-20260809:deploy",
@@ -2174,6 +2531,9 @@ class ProductionClosureTests(unittest.TestCase):
                 expected_kubernetes_api_ca_digest=api_ca_digest,
                 runner=runner,
                 readiness_probe=lambda _url: True,
+                storage_endpoint_resolver=lambda hostname: (
+                    ("10.0.0.30",) if hostname.startswith("s3.") else ("10.0.0.31",)
+                ),
             ).run()
             self.assertEqual("PASSED", evidence.status)
             self.assertEqual(7, evidence.metrics["ready_workloads"])
@@ -2190,6 +2550,9 @@ class ProductionClosureTests(unittest.TestCase):
                 expected_kubernetes_api_ca_digest=api_ca_digest,
                 runner=runner,
                 readiness_probe=lambda _url: True,
+                storage_endpoint_resolver=lambda hostname: (
+                    ("10.0.0.30",) if hostname.startswith("s3.") else ("10.0.0.31",)
+                ),
             ).run()
             self.assertEqual("FAILED", failed.status)
             self.assertEqual(str(plan.rollback_manifest.path), applied[-1])
@@ -2223,6 +2586,9 @@ class ProductionClosureTests(unittest.TestCase):
                     expected_kubernetes_api_ca_digest=api_ca_digest,
                     runner=partial_bootstrap_failure,
                     readiness_probe=lambda _url: True,
+                    storage_endpoint_resolver=lambda hostname: (
+                        ("10.0.0.30",) if hostname.startswith("s3.") else ("10.0.0.31",)
+                    ),
                 ).run()
             self.assertEqual(str(plan.rollback_manifest.path), applied[-1])
             plan.runtime_manifest.path.write_text("tampered: true\n", encoding="utf-8")
@@ -2445,6 +2811,23 @@ class ProductionClosureTests(unittest.TestCase):
             results = root / "episodes.json"
             measurement = root / "measurement.log"
             profile = root / "target-profile.json"
+            aws_policy_digests = {
+                name: canonical_digest({"test_policy": name})
+                for name in AWS_STORAGE_POLICY_DIGEST_FIELDS
+            }
+            caller_trust_contract = github_actions_caller_trust_contract(
+                account_id="123456789012",
+                region="us-east-1",
+                repository="industrial-shadow/industry-shadow",
+                repository_owner_id="214596190",
+                repository_id="24681012",
+                ref="refs/heads/main",
+                environment="production-acceptance",
+                workflow="production-acceptance",
+            )
+            aws_policy_digests["s3_control_plane_caller_trust_contract_digest"] = (
+                canonical_digest(caller_trust_contract)
+            )
             results.write_text(json.dumps({"episodes": records}), encoding="utf-8")
             profile.write_text(
                 json.dumps(
@@ -2460,15 +2843,23 @@ class ProductionClosureTests(unittest.TestCase):
                         "cluster_uid_digest": "d" * 64,
                         "kubernetes_api_ca_digest": "e" * 64,
                         "aws_account_id": "123456789012",
+                        "aws_partition": "aws",
                         "aws_region": "us-east-1",
                         "s3_bucket": "industrial-shadow-production",
                         "s3_probe_prefix": "industrial-shadow/production-acceptance",
+                        "s3_control_plane_caller_trust_contract": (
+                            caller_trust_contract
+                        ),
                         "snapshot_object_storage_prefix": "industrial-shadow/snapshots",
                         "backup_object_storage_prefix": "industrial-shadow/backups",
                         "kms_key_id_digest": "1" * 64,
                         "backup_restore_receipt_digest": "0" * 64,
                         "backup_workload_identity_arn_digest": "2" * 64,
                         "snapshot_workload_identity_arn_digest": "3" * 64,
+                        **aws_policy_digests,
+                        "aws_storage_policy_bundle_digest": (
+                            aws_storage_policy_bundle_digest(aws_policy_digests)
+                        ),
                         "oidc_issuer": "https://identity.internal/tenant",
                         "oidc_audience_digest": "0" * 64,
                         "oidc_human_client_id_digest": "1" * 64,
@@ -2486,6 +2877,7 @@ class ProductionClosureTests(unittest.TestCase):
                         "build_digest": "b" * 64,
                         "simulator_build_digest": "c" * 64,
                         "deployment_plan_digest": "d" * 64,
+                        "storage_egress_contract_digest": "e" * 64,
                     }
                 ),
                 encoding="utf-8",

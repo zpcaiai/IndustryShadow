@@ -24,7 +24,11 @@ from shadow_sandbox.runtime import RunOrchestrator
 from shadow_sandbox.worker import MaintenanceWorker
 from test_foundation import actor, manifest, store
 
-from tools.validate_local_postgresql_restore import _local_database_url, _positive_int
+from tools.validate_local_postgresql_restore import (
+    _local_database_url,
+    _LocalImmutableTestStorage,
+    _positive_int,
+)
 
 
 class EntrypointAndEdgeTests(unittest.IsolatedAsyncioTestCase):
@@ -53,6 +57,41 @@ class EntrypointAndEdgeTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(DomainError, "positive"):
                 _positive_int("SHADOW_LOCAL_RESTORE_MAXIMUM_SECONDS", 300)
+
+    def test_local_restore_storage_is_version_bound_and_explicitly_simulated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = _LocalImmutableTestStorage(
+                Path(directory),
+                kms_key_id="arn:aws:kms:us-east-1:000000000000:key/local-smoke",
+                region="us-east-1",
+                account_id="000000000000",
+            )
+            reference = storage.put_bytes(
+                "postgres/fixture.bin",
+                b"immutable-local-smoke",
+                content_type="application/octet-stream",
+            )
+            self.assertEqual("aws:kms", reference.encryption)
+            self.assertTrue(reference.version_id)
+            self.assertEqual(
+                b"immutable-local-smoke",
+                storage.get_version_bytes(
+                    reference.key,
+                    version_id=str(reference.version_id),
+                    expected_sha256=reference.sha256,
+                ),
+            )
+            self.assertTrue(
+                storage.get_version_retention(
+                    reference.key,
+                    version_id=str(reference.version_id),
+                ).active()
+            )
+            with self.assertRaises(DomainError):
+                storage.get_version_bytes(
+                    reference.key,
+                    version_id="different-version",
+                )
 
     def test_cli_schema_generation_matches_route_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

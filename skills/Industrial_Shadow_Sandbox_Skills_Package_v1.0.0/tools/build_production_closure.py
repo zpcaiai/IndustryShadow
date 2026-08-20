@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
-
 from shadow_sandbox.common.models import DomainError, canonical_digest, canonical_json
 from shadow_sandbox.evaluation.formal_benchmark import (
     FormalBenchmarkImporter,

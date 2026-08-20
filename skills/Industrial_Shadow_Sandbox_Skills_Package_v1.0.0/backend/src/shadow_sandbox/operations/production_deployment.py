@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,7 +17,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import yaml  # pyright: ignore[reportMissingModuleSource]
 
-from shadow_sandbox.common.models import DomainError, canonical_digest, utc_now
+from shadow_sandbox.common.models import (
+    DomainError,
+    canonical_digest,
+    canonical_json,
+    utc_now,
+)
 from shadow_sandbox.common.opcua_readonly import (
     opcua_node_allowlist_digest,
     opcua_runtime_binding_digest,
@@ -24,6 +30,14 @@ from shadow_sandbox.common.opcua_readonly import (
 )
 
 from .evidence import GateCheck, GateEvidence, complete
+from .irsa_contract import (
+    IRSA_MOUNT_PATH,
+    IRSA_ROLE_ANNOTATION,
+    IRSA_TOKEN_MOUNT,
+    IRSA_TOKEN_PATH,
+    IRSA_TOKEN_PROJECTION,
+    IRSA_VOLUME_NAME,
+)
 
 IMAGE_DIGEST = re.compile(r"^[^@\s]+@sha256:[a-f0-9]{64}$")
 DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -35,7 +49,22 @@ PLACEHOLDER = re.compile(
 )
 OBJECT_STORAGE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
 CONFIG_MAP_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+AWS_ACCOUNT_ID = re.compile(r"^\d{12}$")
+S3_BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 FORBIDDEN_RUNTIME_CONFIG_KEYS = frozenset({"SHADOW_OBJECT_STORAGE_PREFIX"})
+FORBIDDEN_STORAGE_IMPORTED_ENVIRONMENT = frozenset(
+    {
+        "ALL_PROXY",
+        "BOTO_CONFIG",
+        "CURL_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    }
+)
 PLAN_KEYS = frozenset(
     {
         "schema_version",
@@ -96,13 +125,25 @@ EXPECTED_SERVICE_ACCOUNTS = {
     "shadow-migrate": "shadow-migration",
     "shadow-postgres-backup": "shadow-backup-storage",
 }
-TOKEN_SERVICE_ACCOUNTS = frozenset({"shadow-simulator-storage", "shadow-backup-storage"})
 STORAGE_SERVICE_ACCOUNTS = {
     "snapshot": "shadow-simulator-storage",
     "backup": "shadow-backup-storage",
 }
-WORKLOAD_IDENTITY_ANNOTATION = "eks.amazonaws.com/role-arn"
+STORAGE_WORKLOAD_IDENTITIES = {
+    "simulator": "snapshot",
+    "shadow-postgres-backup": "backup",
+}
+WORKLOAD_IDENTITY_ANNOTATION = IRSA_ROLE_ANNOTATION
 IAM_ROLE_ARN = re.compile(r"^arn:(?:aws|aws-us-gov|aws-cn):iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
+AWS_WEB_IDENTITY_VOLUME = IRSA_VOLUME_NAME
+AWS_WEB_IDENTITY_MOUNT = IRSA_MOUNT_PATH
+AWS_WEB_IDENTITY_TOKEN_FILE = IRSA_TOKEN_PATH
+AWS_WEB_IDENTITY_PROJECTION = IRSA_TOKEN_PROJECTION
+AWS_WEB_IDENTITY_MOUNT_CONTRACT = IRSA_TOKEN_MOUNT
+STORAGE_EGRESS_CONTRACT_ANNOTATION = "industrial-shadow-storage-egress-contract"
+STORAGE_EGRESS_CONTRACT_DIGEST_ANNOTATION = "industrial-shadow-storage-egress-contract-sha256"
+STORAGE_EGRESS_POD_LABEL_KEY = "shadow-sandbox.io/storage-egress"
+STORAGE_EGRESS_POD_LABEL_VALUE = "regional-s3-sts"
 EXPECTED_ARGS: dict[str, tuple[str, ...]] = {
     "control-api": (
         "uvicorn",
@@ -176,7 +217,7 @@ EXPECTED_ENV_FROM: dict[str, frozenset[tuple[str, str]]] = {
     ),
     "web": frozenset(),
     "shadow-migrate": frozenset({("configMapRef", "shadow-database-roles")}),
-    "shadow-postgres-backup": frozenset({("configMapRef", "shadow-runtime")}),
+    "shadow-postgres-backup": frozenset(),
 }
 EXPECTED_SECRET_VOLUMES: dict[str, frozenset[str]] = {
     "control-api": frozenset(),
@@ -196,11 +237,37 @@ EXPECTED_SECRET_VOLUMES: dict[str, frozenset[str]] = {
 EXPECTED_LITERAL_ENV: dict[str, Mapping[str, str]] = {
     **{name: {} for name in EXPECTED_ARGS},
     "simulator": {
+        "AWS_CONFIG_FILE": "/dev/null",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_S3_US_EAST_1_REGIONAL_ENDPOINT": "regional",
+        "AWS_STS_REGIONAL_ENDPOINTS": "regional",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_WEB_IDENTITY_TOKEN_FILE": AWS_WEB_IDENTITY_TOKEN_FILE,
         "SHADOW_DATABASE_PATH": "/var/lib/shadow/simulator.db",
         "SHADOW_OPCUA_CERTIFICATE_PATH": "/var/run/shadow-pki/server.crt",
         "SHADOW_OPCUA_PRIVATE_KEY_PATH": "/var/run/shadow-pki/server.key",
     },
+    "shadow-postgres-backup": {
+        "AWS_CONFIG_FILE": "/dev/null",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_S3_US_EAST_1_REGIONAL_ENDPOINT": "regional",
+        "AWS_STS_REGIONAL_ENDPOINTS": "regional",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+        "AWS_WEB_IDENTITY_TOKEN_FILE": AWS_WEB_IDENTITY_TOKEN_FILE,
+    },
 }
+BACKUP_SEALED_LITERAL_ENV = frozenset(
+    {
+        "SHADOW_AWS_ACCOUNT_ID",
+        "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX",
+        "SHADOW_DATABASE_BACKUP_ROLE",
+        "SHADOW_ENVIRONMENT",
+        "SHADOW_OBJECT_STORAGE_BACKEND",
+        "SHADOW_OBJECT_STORAGE_BUCKET",
+        "SHADOW_OBJECT_STORAGE_KMS_KEY_ID",
+        "SHADOW_OBJECT_STORAGE_REGION",
+    }
+)
 EXPECTED_SECRET_ENV: dict[str, Mapping[str, tuple[str, str]]] = {
     "control-api": {
         "SHADOW_DATABASE_URL": ("shadow-api-secrets", "SHADOW_DATABASE_URL"),
@@ -255,7 +322,11 @@ EXPECTED_WORKLOAD_LABELS: dict[str, Mapping[str, str]] = {
     "control-api": {"app": "control-api", "plane": "control"},
     "worker": {"app": "worker", "plane": "data"},
     "action-executor": {"app": "action-executor", "plane": "action"},
-    "simulator": {"app": "simulator", "plane": "simulator"},
+    "simulator": {
+        "app": "simulator",
+        "plane": "simulator",
+        STORAGE_EGRESS_POD_LABEL_KEY: STORAGE_EGRESS_POD_LABEL_VALUE,
+    },
     "real-ot-collector": {
         "app": "real-ot-collector",
         "plane": "collector",
@@ -267,6 +338,14 @@ EXPECTED_WORKLOAD_LABELS: dict[str, Mapping[str, str]] = {
         "collector-target": "simulator",
     },
     "web": {"app": "web", "plane": "ingress"},
+}
+EXPECTED_STORAGE_WORKLOAD_LABELS: dict[str, Mapping[str, str]] = {
+    "simulator": EXPECTED_WORKLOAD_LABELS["simulator"],
+    "shadow-postgres-backup": {
+        "app": "backup",
+        "plane": "data",
+        STORAGE_EGRESS_POD_LABEL_KEY: STORAGE_EGRESS_POD_LABEL_VALUE,
+    },
 }
 EXPECTED_NETWORK_POLICIES = frozenset(
     {
@@ -301,6 +380,7 @@ PUBLISH_RBAC = frozenset(
 
 CommandRunner = Callable[[Sequence[str], int], str]
 ReadinessProbe = Callable[[str], bool]
+HostResolver = Callable[[str], Sequence[str]]
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -474,6 +554,24 @@ def _pod_spec(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return template_spec if isinstance(template_spec, Mapping) else None
 
 
+def _pod_labels(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    kind = value.get("kind")
+    spec = value.get("spec")
+    if not isinstance(spec, Mapping):
+        return None
+    if kind in {"Deployment", "StatefulSet", "Job"}:
+        template = spec.get("template")
+    elif kind == "CronJob":
+        job_template = spec.get("jobTemplate")
+        job_spec = job_template.get("spec") if isinstance(job_template, Mapping) else None
+        template = job_spec.get("template") if isinstance(job_spec, Mapping) else None
+    else:
+        return None
+    metadata = template.get("metadata") if isinstance(template, Mapping) else None
+    labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+    return labels if isinstance(labels, Mapping) else None
+
+
 def _pod_name(value: Mapping[str, Any]) -> str:
     metadata = value.get("metadata")
     return str(metadata.get("name", "")) if isinstance(metadata, Mapping) else ""
@@ -594,6 +692,19 @@ def _validate_config_map_consumers(
                 f"{phase} explicit environment variables override sealed ConfigMap keys: "
                 + ", ".join(sorted(overlap)),
             )
+        if _pod_name(value) in STORAGE_WORKLOAD_IDENTITIES:
+            credential_overrides = sorted(
+                key
+                for key in imported
+                if key.upper().startswith(("AWS_", "BOTO_"))
+                or key.upper() in FORBIDDEN_STORAGE_IMPORTED_ENVIRONMENT
+            )
+            if credential_overrides:
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    f"{phase} storage workload ConfigMaps cannot inject AWS credentials, "
+                    "endpoint overrides, profiles, or proxies: " + ", ".join(credential_overrides),
+                )
 
 
 def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[str] | None) -> None:
@@ -608,11 +719,10 @@ def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[s
             "DEPLOYMENT_ARTIFACT_UNSAFE",
             "every workload must use its exact dedicated ServiceAccount",
         )
-    expected_token = expected_account in TOKEN_SERVICE_ACCOUNTS
-    if pod_spec.get("automountServiceAccountToken") is not expected_token:
+    if pod_spec.get("automountServiceAccountToken") is not False:
         raise DomainError(
             "DEPLOYMENT_ARTIFACT_UNSAFE",
-            "ServiceAccount token automount must match the sealed workload identity contract",
+            "ambient ServiceAccount token automount is forbidden for every workload",
         )
     if any(pod_spec.get(name) is True for name in ("hostNetwork", "hostPID", "hostIPC")):
         raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "host namespace access is forbidden")
@@ -641,6 +751,44 @@ def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[s
     if secret_volumes != EXPECTED_SECRET_VOLUMES[contract_name]:
         raise DomainError(
             "DEPLOYMENT_ARTIFACT_UNSAFE", "workload Secret volume references are not exact"
+        )
+    storage_identity = STORAGE_WORKLOAD_IDENTITIES.get(contract_name)
+    pod_labels = _pod_labels(value)
+    if storage_identity is not None:
+        if pod_labels != EXPECTED_STORAGE_WORKLOAD_LABELS[contract_name]:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "storage workloads must carry the exact shared S3/STS egress label",
+            )
+    elif isinstance(pod_labels, Mapping) and STORAGE_EGRESS_POD_LABEL_KEY in pod_labels:
+        raise DomainError(
+            "DEPLOYMENT_ARTIFACT_UNSAFE",
+            "non-storage workloads cannot opt into the regional S3/STS egress policy",
+        )
+    projected_volumes = [
+        volume for volume in volumes if isinstance(volume, Mapping) and "projected" in volume
+    ]
+    if storage_identity is not None:
+        if projected_volumes != [AWS_WEB_IDENTITY_PROJECTION]:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "storage workloads require one exact audience-bound IRSA token projection",
+            )
+        if any(
+            not isinstance(volume, Mapping)
+            or not isinstance(volume.get("name"), str)
+            or len(set(volume) - {"name"}) != 1
+            or not (set(volume) - {"name"}).issubset({"projected", "secret", "emptyDir"})
+            for volume in volumes
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "storage workloads forbid alternate credential-providing volume sources",
+            )
+    elif projected_volumes:
+        raise DomainError(
+            "DEPLOYMENT_ARTIFACT_UNSAFE",
+            "projected ServiceAccount identity volumes are forbidden for this workload",
         )
     containers: list[Any] = []
     for field in ("initContainers", "containers"):
@@ -720,6 +868,55 @@ def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[s
                     "Secret environment references must bind one exact required key",
                 )
             secret_environment[name] = (secret_key_ref["name"], secret_key_ref["key"])
+        if storage_identity is not None:
+            role_arn = literal_environment.pop("AWS_ROLE_ARN", "")
+            aws_region = literal_environment.pop("AWS_REGION", "")
+            aws_default_region = literal_environment.pop("AWS_DEFAULT_REGION", "")
+            if (
+                not IAM_ROLE_ARN.fullmatch(role_arn)
+                or aws_region != aws_default_region
+                or not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d+", aws_region)
+            ):
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    "storage workload role and regional AWS SDK coordinates must be exact",
+                )
+        if contract_name == "shadow-postgres-backup":
+            sealed_backup_environment = {
+                name: literal_environment.pop(name, "") for name in BACKUP_SEALED_LITERAL_ENV
+            }
+            account_id = sealed_backup_environment["SHADOW_AWS_ACCOUNT_ID"]
+            bucket = sealed_backup_environment["SHADOW_OBJECT_STORAGE_BUCKET"]
+            kms_key_id = sealed_backup_environment["SHADOW_OBJECT_STORAGE_KMS_KEY_ID"]
+            prefix = sealed_backup_environment["SHADOW_BACKUP_OBJECT_STORAGE_PREFIX"]
+            backup_role = sealed_backup_environment["SHADOW_DATABASE_BACKUP_ROLE"]
+            role_coordinates = role_arn.split(":", 5)
+            if (
+                sealed_backup_environment["SHADOW_ENVIRONMENT"] != "production"
+                or sealed_backup_environment["SHADOW_OBJECT_STORAGE_BACKEND"] != "s3"
+                or sealed_backup_environment["SHADOW_OBJECT_STORAGE_REGION"] != aws_region
+                or AWS_ACCOUNT_ID.fullmatch(account_id) is None
+                or len(role_coordinates) != 6
+                or role_coordinates[4] != account_id
+                or S3_BUCKET_NAME.fullmatch(bucket) is None
+                or ".." in bucket
+                or re.fullmatch(r"\d+\.\d+\.\d+\.\d+", bucket) is not None
+                or OBJECT_STORAGE_PREFIX.fullmatch(prefix) is None
+                or prefix != prefix.strip("/")
+                or "//" in prefix
+                or any(segment in {".", ".."} for segment in prefix.split("/"))
+                or re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", backup_role) is None
+                or re.fullmatch(
+                    rf"arn:{re.escape(role_coordinates[1])}:kms:"
+                    rf"{re.escape(aws_region)}:{re.escape(account_id)}:key/[A-Za-z0-9-]+",
+                    kms_key_id,
+                )
+                is None
+            ):
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    "backup runtime coordinates must be exact sealed production literals",
+                )
         if literal_environment != EXPECTED_LITERAL_ENV[contract_name]:
             raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "literal environment is not exact")
         if secret_environment != EXPECTED_SECRET_ENV[contract_name]:
@@ -731,6 +928,29 @@ def _validate_pod_security(value: Mapping[str, Any], allowed_images: frozenset[s
             isinstance(port, Mapping) and "hostPort" in port for port in ports
         ):
             raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "host ports are forbidden")
+        volume_mounts = container.get("volumeMounts", [])
+        if not isinstance(volume_mounts, list):
+            raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "volume mounts must be a list")
+        identity_mounts = [
+            mount
+            for mount in volume_mounts
+            if isinstance(mount, Mapping)
+            and (
+                mount.get("name") == AWS_WEB_IDENTITY_VOLUME
+                or mount.get("mountPath") == AWS_WEB_IDENTITY_MOUNT
+            )
+        ]
+        if storage_identity is not None:
+            if identity_mounts != [AWS_WEB_IDENTITY_MOUNT_CONTRACT]:
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    "storage workload IRSA token mount must be exact and read-only",
+                )
+        elif identity_mounts:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "IRSA token mounts are forbidden for this workload",
+            )
         container_security = container.get("securityContext")
         capabilities = (
             container_security.get("capabilities")
@@ -794,11 +1014,245 @@ def _validate_service(value: Mapping[str, Any]) -> None:
         raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "Service ports are not exact")
 
 
-def _validate_network_policies(values: Sequence[Mapping[str, Any]]) -> None:
+@dataclass(frozen=True, slots=True)
+class StorageEgressContract:
+    partition: str
+    region: str
+    s3_endpoint: str
+    s3_cidrs: tuple[str, ...]
+    sts_endpoint: str
+    sts_cidrs: tuple[str, ...]
+    digest: str
+
+    @classmethod
+    def from_policy(cls, policy: object) -> StorageEgressContract | None:
+        """Parse an exact, plan-sealed regional S3/STS NetworkPolicy contract."""
+        if not isinstance(policy, Mapping):
+            return None
+        if (
+            policy.get("apiVersion") != "networking.k8s.io/v1"
+            or policy.get("kind") != "NetworkPolicy"
+        ):
+            return None
+        metadata = policy.get("metadata")
+        spec = policy.get("spec")
+        if not isinstance(metadata, Mapping) or not isinstance(spec, Mapping):
+            return None
+        annotations = metadata.get("annotations")
+        if metadata.get("name") != "storage-identity-probe-egress" or not isinstance(
+            annotations, Mapping
+        ):
+            return None
+        if set(annotations) != {
+            STORAGE_EGRESS_CONTRACT_ANNOTATION,
+            STORAGE_EGRESS_CONTRACT_DIGEST_ANNOTATION,
+        }:
+            return None
+        raw_contract = annotations.get(STORAGE_EGRESS_CONTRACT_ANNOTATION)
+        claimed_digest = annotations.get(STORAGE_EGRESS_CONTRACT_DIGEST_ANNOTATION)
+        if not isinstance(raw_contract, str) or not isinstance(claimed_digest, str):
+            return None
+        try:
+            payload = json.loads(raw_contract)
+        except json.JSONDecodeError:
+            return None
+        required = {
+            "schema_version",
+            "partition",
+            "region",
+            "s3_endpoint",
+            "s3_cidrs",
+            "sts_endpoint",
+            "sts_cidrs",
+        }
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != required
+            or payload.get("schema_version") != 1
+            or canonical_json(payload) != raw_contract
+            or canonical_digest(payload) != claimed_digest
+        ):
+            return None
+        partition = str(payload.get("partition", ""))
+        region = str(payload.get("region", ""))
+        if partition not in {"aws", "aws-cn", "aws-us-gov"} or not re.fullmatch(
+            r"[a-z]{2}(?:-gov)?-[a-z]+-\d+", region
+        ):
+            return None
+        if (partition == "aws-cn") != region.startswith("cn-") or (
+            partition == "aws-us-gov"
+        ) != region.startswith("us-gov-"):
+            return None
+        dns_suffix = "amazonaws.com.cn" if partition == "aws-cn" else "amazonaws.com"
+        s3_endpoint = str(payload.get("s3_endpoint", ""))
+        sts_endpoint = str(payload.get("sts_endpoint", ""))
+        if s3_endpoint != f"s3.{region}.{dns_suffix}" or sts_endpoint != (
+            f"sts.{region}.{dns_suffix}"
+        ):
+            return None
+
+        def host_cidrs(value: object) -> tuple[str, ...] | None:
+            if not isinstance(value, list) or not 1 <= len(value) <= 64:
+                return None
+            result: list[str] = []
+            for cidr in value:
+                if not isinstance(cidr, str):
+                    return None
+                try:
+                    network = ipaddress.ip_network(cidr, strict=True)
+                except ValueError:
+                    return None
+                if network.prefixlen != network.max_prefixlen or str(network) != cidr:
+                    return None
+                result.append(cidr)
+            if result != sorted(set(result)):
+                return None
+            return tuple(result)
+
+        s3_cidrs = host_cidrs(payload.get("s3_cidrs"))
+        sts_cidrs = host_cidrs(payload.get("sts_cidrs"))
+        if s3_cidrs is None or sts_cidrs is None or set(s3_cidrs) & set(sts_cidrs):
+            return None
+        expected_spec = {
+            "podSelector": {
+                "matchLabels": {STORAGE_EGRESS_POD_LABEL_KEY: STORAGE_EGRESS_POD_LABEL_VALUE}
+            },
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [{"ipBlock": {"cidr": cidr}} for cidr in s3_cidrs],
+                    "ports": [{"protocol": "TCP", "port": 443}],
+                },
+                {
+                    "to": [{"ipBlock": {"cidr": cidr}} for cidr in sts_cidrs],
+                    "ports": [{"protocol": "TCP", "port": 443}],
+                },
+            ],
+        }
+        if spec != expected_spec:
+            return None
+        return cls(
+            partition,
+            region,
+            s3_endpoint,
+            s3_cidrs,
+            sts_endpoint,
+            sts_cidrs,
+            claimed_digest,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StorageEgressResolution:
+    s3_cidrs: tuple[str, ...]
+    sts_cidrs: tuple[str, ...]
+    digest: str
+
+
+def resolve_storage_hostname(hostname: str) -> tuple[str, ...]:
+    """Resolve only the canonical hostname itself; no URL or redirect is followed."""
+    try:
+        records = socket.getaddrinfo(
+            hostname,
+            443,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except OSError as error:
+        raise DomainError(
+            "STORAGE_EGRESS_DNS_RESOLUTION_FAILED",
+            "regional storage endpoint DNS resolution failed closed",
+            {"hostname_digest": hashlib.sha256(hostname.encode()).hexdigest()},
+            status=503,
+        ) from error
+    return tuple(str(record[4][0]) for record in records)
+
+
+def resolve_storage_egress_contract(
+    contract: StorageEgressContract,
+    *,
+    resolver: HostResolver = resolve_storage_hostname,
+) -> StorageEgressResolution:
+    """Require DNS A/AAAA results to exactly equal the plan-sealed host CIDRs."""
+
+    def resolved_host_cidrs(hostname: str) -> tuple[str, ...]:
+        try:
+            values = resolver(hostname)
+        except DomainError:
+            raise
+        except Exception as error:
+            raise DomainError(
+                "STORAGE_EGRESS_DNS_RESOLUTION_FAILED",
+                "regional storage endpoint DNS resolution failed closed",
+                {"hostname_digest": hashlib.sha256(hostname.encode()).hexdigest()},
+                status=503,
+            ) from error
+        if isinstance(values, (str, bytes)):
+            raise DomainError(
+                "STORAGE_EGRESS_DNS_RESOLUTION_INVALID",
+                "regional storage endpoint DNS result is malformed",
+                status=503,
+            )
+        addresses: set[str] = set()
+        for value in values:
+            try:
+                address = ipaddress.ip_address(str(value))
+            except ValueError as error:
+                raise DomainError(
+                    "STORAGE_EGRESS_DNS_RESOLUTION_INVALID",
+                    "regional storage endpoint DNS returned a non-address value",
+                    status=503,
+                ) from error
+            addresses.add(f"{address}/{address.max_prefixlen}")
+        if not 1 <= len(addresses) <= 64:
+            raise DomainError(
+                "STORAGE_EGRESS_DNS_RESOLUTION_INVALID",
+                "regional storage endpoint DNS answer count is outside the sealed bound",
+                status=503,
+            )
+        return tuple(sorted(addresses))
+
+    s3_cidrs = resolved_host_cidrs(contract.s3_endpoint)
+    sts_cidrs = resolved_host_cidrs(contract.sts_endpoint)
+    if (
+        s3_cidrs != contract.s3_cidrs
+        or sts_cidrs != contract.sts_cidrs
+        or set(s3_cidrs) & set(sts_cidrs)
+    ):
+        raise DomainError(
+            "STORAGE_EGRESS_DNS_CONTRACT_MISMATCH",
+            "resolved regional S3/STS host CIDRs differ from the sealed policy contract",
+            {
+                "contract_digest": contract.digest,
+                "resolved_s3_digest": canonical_digest(s3_cidrs),
+                "resolved_sts_digest": canonical_digest(sts_cidrs),
+            },
+            status=503,
+        )
+    return StorageEgressResolution(
+        s3_cidrs,
+        sts_cidrs,
+        canonical_digest(
+            {
+                "contract_digest": contract.digest,
+                "s3_endpoint": contract.s3_endpoint,
+                "s3_cidrs": s3_cidrs,
+                "sts_endpoint": contract.sts_endpoint,
+                "sts_cidrs": sts_cidrs,
+            }
+        ),
+    )
+
+
+def _validate_network_policies(
+    values: Sequence[Mapping[str, Any]],
+) -> StorageEgressContract:
     policies = [value for value in values if value.get("kind") == "NetworkPolicy"]
     names = {_pod_name(value) for value in policies}
     if names != EXPECTED_NETWORK_POLICIES or len(names) != len(policies):
         raise DomainError("DEPLOYMENT_ARTIFACT_UNSAFE", "NetworkPolicy inventory is not exact")
+    storage_contract: StorageEgressContract | None = None
     for policy in policies:
         spec = policy.get("spec")
         if not isinstance(spec, Mapping) or not isinstance(spec.get("podSelector"), Mapping):
@@ -834,53 +1288,62 @@ def _validate_network_policies(values: Sequence[Mapping[str, Any]]) -> None:
                             raise DomainError(
                                 "DEPLOYMENT_ARTIFACT_UNSAFE", "world CIDRs are forbidden"
                             )
-        if _pod_name(policy) == "storage-identity-probe-egress" and not (
-            storage_probe_network_policy_exact(spec)
+        if _pod_name(policy) in {"simulator-plane", "data-jobs-egress"} and not (
+            legacy_storage_https_egress_absent(policy)
         ):
             raise DomainError(
                 "DEPLOYMENT_ARTIFACT_UNSAFE",
-                "storage identity probes require exact host-only S3/STS HTTPS egress",
+                "legacy workload policies cannot duplicate unbound storage HTTPS egress",
             )
+        if _pod_name(policy) == "storage-identity-probe-egress":
+            storage_contract = StorageEgressContract.from_policy(policy)
+            if storage_contract is None:
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_UNSAFE",
+                    "storage identity probes require the exact sealed regional S3/STS "
+                    "endpoint CIDR contract",
+                )
+    if storage_contract is None:
+        raise DomainError(
+            "DEPLOYMENT_ARTIFACT_UNSAFE", "storage identity egress contract is missing"
+        )
+    return storage_contract
 
 
-def storage_probe_network_policy_exact(spec: object) -> bool:
-    """Validate the sealed, dedicated S3/STS egress shape for identity probe Jobs."""
-    if not isinstance(spec, Mapping) or set(spec) != {
-        "podSelector",
-        "policyTypes",
-        "egress",
-    }:
+def storage_probe_network_policy_exact(policy: object) -> bool:
+    """Return whether the full policy carries one exact sealed S3/STS contract."""
+    return StorageEgressContract.from_policy(policy) is not None
+
+
+def legacy_storage_https_egress_absent(policy: object) -> bool:
+    """Keep legacy workload policies from granting any alternate storage path."""
+    if not isinstance(policy, Mapping):
         return False
-    if spec.get("podSelector") != {
-        "matchLabels": {"app.kubernetes.io/name": "industrial-shadow-storage-probe"}
-    } or spec.get("policyTypes") != ["Egress"]:
+    spec = policy.get("spec")
+    if not isinstance(spec, Mapping):
         return False
-    egress = spec.get("egress")
-    if not isinstance(egress, list) or len(egress) != 1:
+    name = _pod_name(policy)
+    rules = spec.get("egress", [])
+    if not isinstance(rules, list):
         return False
-    rule = egress[0]
-    if not isinstance(rule, Mapping) or set(rule) != {"to", "ports"}:
+    if name == "simulator-plane":
+        return not rules
+    if name != "data-jobs-egress":
         return False
-    if rule.get("ports") != [{"protocol": "TCP", "port": 443}]:
-        return False
-    peers = rule.get("to")
-    if not isinstance(peers, list) or len(peers) < 2:
-        return False
-    networks: set[str] = set()
-    for peer in peers:
-        if not isinstance(peer, Mapping) or set(peer) != {"ipBlock"}:
+    for rule in rules:
+        if not isinstance(rule, Mapping):
             return False
-        block = peer.get("ipBlock")
-        if not isinstance(block, Mapping) or set(block) != {"cidr"}:
+        ports = rule.get("ports", [])
+        peers = rule.get("to", [])
+        if (
+            set(rule) != {"to", "ports"}
+            or not isinstance(ports, list)
+            or ports != [{"protocol": "TCP", "port": 5432}]
+            or not isinstance(peers, list)
+            or not peers
+        ):
             return False
-        try:
-            network = ipaddress.ip_network(str(block.get("cidr", "")), strict=True)
-        except ValueError:
-            return False
-        if network.prefixlen != network.max_prefixlen:
-            return False
-        networks.add(str(network))
-    return len(networks) == len(peers)
+    return True
 
 
 def _run(command: Sequence[str], timeout: int) -> str:
@@ -946,8 +1409,11 @@ class ProductionDeploymentPlan:
     rollback_images: tuple[str, ...]
     snapshot_object_storage_prefix: str
     backup_object_storage_prefix: str
+    object_storage_region: str
+    object_storage_account_id: str
     snapshot_workload_identity_arn_digest: str
     backup_workload_identity_arn_digest: str
+    storage_egress_contract: StorageEgressContract
     real_ot_runtime_binding_digest: str
     real_ot_node_allowlist_digest: str
     digest: str
@@ -1094,10 +1560,10 @@ class ProductionDeploymentPlan:
                         raise DomainError(
                             "DEPLOYMENT_ARTIFACT_UNSAFE", "undeclared ServiceAccount is forbidden"
                         )
-                    expected_token = name in TOKEN_SERVICE_ACCOUNTS
-                    if value.get("automountServiceAccountToken") is not expected_token:
+                    if value.get("automountServiceAccountToken") is not False:
                         raise DomainError(
-                            "DEPLOYMENT_ARTIFACT_UNSAFE", "ServiceAccount token policy is not exact"
+                            "DEPLOYMENT_ARTIFACT_UNSAFE",
+                            "ambient ServiceAccount token automount is forbidden",
                         )
             manifest_objects[phase] = objects
         candidate_config_map_keys = _config_map_key_sets(
@@ -1164,13 +1630,14 @@ class ProductionDeploymentPlan:
 
         def workload_identity_digests(
             objects: Sequence[Mapping[str, Any]], *, phase: str
-        ) -> dict[str, str]:
+        ) -> tuple[dict[str, str], dict[str, str]]:
             accounts = {
                 _pod_name(value): value
                 for value in objects
                 if value.get("kind") == "ServiceAccount"
             }
             result: dict[str, str] = {}
+            role_arns_by_identity: dict[str, str] = {}
             role_arns: set[str] = set()
             for identity, account_name in STORAGE_SERVICE_ACCOUNTS.items():
                 account = accounts.get(account_name)
@@ -1195,26 +1662,133 @@ class ProductionDeploymentPlan:
                         f"{phase} snapshot and backup ServiceAccounts must use distinct roles",
                     )
                 role_arns.add(role_arn)
+                role_arns_by_identity[identity] = role_arn
                 result[identity] = canonical_digest({"workload_identity_arn": role_arn})
-            return result
+            return result, role_arns_by_identity
 
-        workload_identity_bindings = workload_identity_digests(
+        workload_identity_bindings, workload_identity_arns = workload_identity_digests(
             manifest_objects["bootstrap_manifest"], phase="candidate"
         )
-        rollback_workload_identity_bindings = workload_identity_digests(
-            manifest_objects["rollback_manifest"], phase="rollback"
-        )
-        if rollback_workload_identity_bindings != workload_identity_bindings:
+        (
+            rollback_workload_identity_bindings,
+            rollback_workload_identity_arns,
+        ) = workload_identity_digests(manifest_objects["rollback_manifest"], phase="rollback")
+        if (
+            rollback_workload_identity_bindings != workload_identity_bindings
+            or rollback_workload_identity_arns != workload_identity_arns
+        ):
             raise DomainError(
                 "DEPLOYMENT_ARTIFACT_UNSAFE",
                 "rollback ServiceAccount workload identities differ from the candidate bundle",
             )
-        _validate_network_policies(manifest_objects["bootstrap_manifest"])
-        _validate_network_policies(manifest_objects["rollback_manifest"])
+
+        storage_egress_contract = _validate_network_policies(manifest_objects["bootstrap_manifest"])
+        rollback_storage_egress_contract = _validate_network_policies(
+            manifest_objects["rollback_manifest"]
+        )
+        if rollback_storage_egress_contract != storage_egress_contract:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "rollback storage egress contract differs from the candidate bundle",
+            )
+
+        def storage_workload_role_arns(
+            objects: Sequence[Mapping[str, Any]], *, phase: str
+        ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+            result: dict[str, str] = {}
+            regions: dict[str, str] = {}
+            images: dict[str, str] = {}
+            for value in objects:
+                identity = STORAGE_WORKLOAD_IDENTITIES.get(_pod_name(value))
+                if identity is None or value.get("kind") not in POD_KINDS:
+                    continue
+                pod_spec = _pod_spec(value)
+                containers = pod_spec.get("containers") if isinstance(pod_spec, Mapping) else None
+                if not isinstance(containers, list) or len(containers) != 1:
+                    raise DomainError(
+                        "DEPLOYMENT_ARTIFACT_UNSAFE",
+                        f"{phase} {identity} storage workload container is not exact",
+                    )
+                environment = containers[0].get("env")
+                if not isinstance(environment, list):
+                    raise DomainError(
+                        "DEPLOYMENT_ARTIFACT_UNSAFE",
+                        f"{phase} {identity} storage workload environment is missing",
+                    )
+                role_values = [
+                    str(item.get("value", ""))
+                    for item in environment
+                    if isinstance(item, Mapping) and item.get("name") == "AWS_ROLE_ARN"
+                ]
+                region_values = [
+                    str(item.get("value", ""))
+                    for item in environment
+                    if isinstance(item, Mapping) and item.get("name") == "AWS_REGION"
+                ]
+                default_region_values = [
+                    str(item.get("value", ""))
+                    for item in environment
+                    if isinstance(item, Mapping) and item.get("name") == "AWS_DEFAULT_REGION"
+                ]
+                if (
+                    len(role_values) != 1
+                    or len(region_values) != 1
+                    or default_region_values != region_values
+                    or identity in result
+                ):
+                    raise DomainError(
+                        "DEPLOYMENT_ARTIFACT_UNSAFE",
+                        f"{phase} {identity} storage workload role binding is not exact",
+                    )
+                result[identity] = role_values[0]
+                regions[identity] = region_values[0]
+                images[identity] = str(containers[0].get("image", ""))
+            if set(result) != set(STORAGE_SERVICE_ACCOUNTS):
+                raise DomainError(
+                    "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                    f"{phase} storage workload identities are incomplete",
+                )
+            return result, regions, images
+
+        (
+            candidate_storage_roles,
+            candidate_storage_regions,
+            candidate_storage_images,
+        ) = storage_workload_role_arns(
+            (
+                *manifest_objects["bootstrap_manifest"],
+                *manifest_objects["runtime_manifest"],
+            ),
+            phase="candidate",
+        )
+        (
+            rollback_storage_roles,
+            rollback_storage_regions,
+            rollback_storage_images,
+        ) = storage_workload_role_arns(manifest_objects["rollback_manifest"], phase="rollback")
+        if (
+            candidate_storage_roles != workload_identity_arns
+            or rollback_storage_roles != workload_identity_arns
+            or set(candidate_storage_regions.values()) != {storage_egress_contract.region}
+            or rollback_storage_regions != candidate_storage_regions
+            or set(candidate_storage_images.values()) != {backend_image}
+            or not all(IMAGE_DIGEST.fullmatch(image) for image in rollback_storage_images.values())
+            or {role_arn.split(":", 2)[1] for role_arn in workload_identity_arns.values()}
+            != {storage_egress_contract.partition}
+            or len({role_arn.split(":", 5)[4] for role_arn in workload_identity_arns.values()}) != 1
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "storage workload role bindings must exactly match candidate and rollback "
+                "ServiceAccount annotations",
+            )
+        object_storage_account_id = next(
+            iter({role_arn.split(":", 5)[4] for role_arn in workload_identity_arns.values()})
+        )
 
         def runtime_storage_prefixes(
             objects: Sequence[Mapping[str, Any]], *, phase: str
-        ) -> tuple[str, str]:
+        ) -> tuple[str, str, str]:
             configs = [
                 value
                 for value in objects
@@ -1234,6 +1808,7 @@ class ProductionDeploymentPlan:
                 str(runtime_data.get("SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX", "")),
                 str(runtime_data.get("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX", "")),
             )
+            region = str(runtime_data.get("SHADOW_OBJECT_STORAGE_REGION", ""))
             segments = tuple(tuple(value.split("/")) for value in values)
             if (
                 any(
@@ -1251,21 +1826,131 @@ class ProductionDeploymentPlan:
                     "DEPLOYMENT_ARTIFACT_INVALID",
                     "snapshot and backup object-storage prefixes must be canonical and non-nested",
                 )
-            return values
+            if region != storage_egress_contract.region:
+                raise DomainError(
+                    "DEPLOYMENT_ARTIFACT_INVALID",
+                    "runtime object-storage region must match the sealed S3/STS egress contract",
+                )
+            return (*values, region)
 
-        snapshot_object_storage_prefix, backup_object_storage_prefix = runtime_storage_prefixes(
-            manifest_objects["bootstrap_manifest"], phase="candidate"
-        )
+        (
+            snapshot_object_storage_prefix,
+            backup_object_storage_prefix,
+            object_storage_region,
+        ) = runtime_storage_prefixes(manifest_objects["bootstrap_manifest"], phase="candidate")
         rollback_storage_prefixes = runtime_storage_prefixes(
             manifest_objects["rollback_manifest"], phase="rollback"
         )
         if rollback_storage_prefixes != (
             snapshot_object_storage_prefix,
             backup_object_storage_prefix,
+            object_storage_region,
         ):
             raise DomainError(
                 "DEPLOYMENT_ARTIFACT_UNSAFE",
                 "rollback runtime object-storage prefixes differ from the candidate bundle",
+            )
+
+        def sealed_config_map_data(
+            objects: Sequence[Mapping[str, Any]], *, name: str, phase: str
+        ) -> Mapping[str, Any]:
+            configs = [
+                value
+                for value in objects
+                if value.get("kind") == "ConfigMap" and _pod_name(value) == name
+            ]
+            data = configs[0].get("data") if len(configs) == 1 else None
+            if not isinstance(data, Mapping):
+                raise DomainError(
+                    "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                    f"{phase} sealed ConfigMap {name!r} is required exactly once",
+                )
+            return data
+
+        def backup_literal_coordinates(
+            objects: Sequence[Mapping[str, Any]], *, phase: str
+        ) -> tuple[str, ...]:
+            backups = [
+                value
+                for value in objects
+                if value.get("kind") == "CronJob" and _pod_name(value) == "shadow-postgres-backup"
+            ]
+            pod_spec = _pod_spec(backups[0]) if len(backups) == 1 else None
+            containers = pod_spec.get("containers") if isinstance(pod_spec, Mapping) else None
+            container = (
+                containers[0] if isinstance(containers, list) and len(containers) == 1 else None
+            )
+            environment = container.get("env") if isinstance(container, Mapping) else None
+            if not isinstance(environment, list):
+                raise DomainError(
+                    "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                    f"{phase} sealed backup literal environment is missing",
+                )
+            literals = {
+                str(item["name"]): str(item["value"])
+                for item in environment
+                if isinstance(item, Mapping)
+                and set(item) == {"name", "value"}
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("value"), str)
+            }
+            if not BACKUP_SEALED_LITERAL_ENV.issubset(literals):
+                raise DomainError(
+                    "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
+                    f"{phase} sealed backup runtime coordinates are incomplete",
+                )
+            return tuple(literals[name] for name in sorted(BACKUP_SEALED_LITERAL_ENV))
+
+        def expected_backup_coordinates(
+            objects: Sequence[Mapping[str, Any]], *, phase: str
+        ) -> tuple[str, ...]:
+            runtime_data = sealed_config_map_data(objects, name="shadow-runtime", phase=phase)
+            database_roles = sealed_config_map_data(
+                objects, name="shadow-database-roles", phase=phase
+            )
+            values = {
+                "SHADOW_AWS_ACCOUNT_ID": object_storage_account_id,
+                "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX": str(
+                    runtime_data.get("SHADOW_BACKUP_OBJECT_STORAGE_PREFIX", "")
+                ),
+                "SHADOW_DATABASE_BACKUP_ROLE": str(
+                    database_roles.get("SHADOW_DATABASE_BACKUP_ROLE", "")
+                ),
+                "SHADOW_ENVIRONMENT": str(runtime_data.get("SHADOW_ENVIRONMENT", "")),
+                "SHADOW_OBJECT_STORAGE_BACKEND": str(
+                    runtime_data.get("SHADOW_OBJECT_STORAGE_BACKEND", "")
+                ),
+                "SHADOW_OBJECT_STORAGE_BUCKET": str(
+                    runtime_data.get("SHADOW_OBJECT_STORAGE_BUCKET", "")
+                ),
+                "SHADOW_OBJECT_STORAGE_KMS_KEY_ID": str(
+                    runtime_data.get("SHADOW_OBJECT_STORAGE_KMS_KEY_ID", "")
+                ),
+                "SHADOW_OBJECT_STORAGE_REGION": str(
+                    runtime_data.get("SHADOW_OBJECT_STORAGE_REGION", "")
+                ),
+            }
+            return tuple(values[name] for name in sorted(BACKUP_SEALED_LITERAL_ENV))
+
+        candidate_backup_coordinates = backup_literal_coordinates(
+            manifest_objects["bootstrap_manifest"], phase="candidate"
+        )
+        rollback_backup_coordinates = backup_literal_coordinates(
+            manifest_objects["rollback_manifest"], phase="rollback"
+        )
+        if (
+            candidate_backup_coordinates
+            != expected_backup_coordinates(
+                manifest_objects["bootstrap_manifest"], phase="candidate"
+            )
+            or rollback_backup_coordinates
+            != expected_backup_coordinates(manifest_objects["rollback_manifest"], phase="rollback")
+            or rollback_backup_coordinates != candidate_backup_coordinates
+        ):
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_UNSAFE",
+                "backup literal runtime coordinates must exactly match candidate and rollback "
+                "sealed configuration",
             )
 
         def real_ot_runtime_binding(
@@ -1494,6 +2179,11 @@ class ProductionDeploymentPlan:
                 "DEPLOYMENT_ARTIFACT_IMAGE_INVALID",
                 "rollback backend and Web workloads must each use one exact image",
             )
+        if set(rollback_storage_images.values()) != rollback_roles["backend"]:
+            raise DomainError(
+                "DEPLOYMENT_ARTIFACT_IMAGE_INVALID",
+                "rollback snapshot and backup workloads must use the exact prior backend image",
+            )
         if not all(item.readiness_url for item in workloads if item.name in {"control-api", "web"}):
             raise DomainError(
                 "DEPLOYMENT_PLAN_COVERAGE_INCOMPLETE",
@@ -1513,8 +2203,11 @@ class ProductionDeploymentPlan:
             tuple(rollback_images),
             snapshot_object_storage_prefix,
             backup_object_storage_prefix,
+            object_storage_region,
+            object_storage_account_id,
             workload_identity_bindings["snapshot"],
             workload_identity_bindings["backup"],
+            storage_egress_contract,
             real_ot_runtime_binding_digest,
             real_ot_node_allowlist_digest,
             claimed_digest,
@@ -1536,6 +2229,7 @@ class KubernetesProductionPublisher:
         journal_path: str | Path | None = None,
         runner: CommandRunner = _run,
         readiness_probe: ReadinessProbe = _ready,
+        storage_endpoint_resolver: HostResolver = resolve_storage_hostname,
     ) -> None:
         confirmation_suffix = {
             "deploy": "deploy",
@@ -1569,10 +2263,12 @@ class KubernetesProductionPublisher:
         self.expected_kubernetes_api_ca_digest = expected_kubernetes_api_ca_digest
         self.runner = runner
         self.readiness_probe = readiness_probe
+        self.storage_endpoint_resolver = storage_endpoint_resolver
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self._journal_entries: list[Mapping[str, Any]] = []
         self.cluster_uid_digest = ""
         self.kubernetes_api_ca_digest = ""
+        self.storage_egress_resolution_digest = ""
 
     def _kubectl(self, arguments: Sequence[str], timeout: int = 900) -> str:
         return self.runner(
@@ -1637,6 +2333,20 @@ class KubernetesProductionPublisher:
                 "deployment runner RBAC is not the exact release-publisher allowlist",
             )
         self._journal("rbac_verified", permission_count=len(PUBLISH_RBAC))
+
+    def _verify_storage_egress_resolution(self) -> None:
+        resolution = resolve_storage_egress_contract(
+            self.plan.storage_egress_contract,
+            resolver=self.storage_endpoint_resolver,
+        )
+        self.storage_egress_resolution_digest = resolution.digest
+        self._journal(
+            "storage_egress_dns_verified",
+            storage_egress_contract_digest=self.plan.storage_egress_contract.digest,
+            storage_egress_resolution_digest=resolution.digest,
+            resolved_s3_cidrs_digest=canonical_digest(resolution.s3_cidrs),
+            resolved_sts_cidrs_digest=canonical_digest(resolution.sts_cidrs),
+        )
 
     def _apply(self, artifact: DeploymentArtifact) -> None:
         self._kubectl(
@@ -1859,6 +2569,7 @@ class KubernetesProductionPublisher:
         started = utc_now()
         self._verify_cluster()
         self._verify_rbac()
+        self._verify_storage_egress_resolution()
         self._rollback()
         return complete(
             "production_rollback",
@@ -1868,6 +2579,7 @@ class KubernetesProductionPublisher:
                 "namespace": self.plan.namespace,
                 "cluster_uid_digest": self.cluster_uid_digest,
                 "kubernetes_api_ca_digest": self.kubernetes_api_ca_digest,
+                "storage_egress_resolution_digest": self.storage_egress_resolution_digest,
             },
             checks=(GateCheck("prior_bundle_restored", True),),
             metrics={"workloads": len(self.plan.workloads)},
@@ -1960,6 +2672,9 @@ class KubernetesProductionPublisher:
                 )
             )
         self._journal("server_dry_run_completed")
+        # Resolve after every read-only server dry-run so the sealed S3/STS
+        # address set is checked immediately before the first mutating apply.
+        self._verify_storage_egress_resolution()
         mutation_attempted = False
         rollback_completed = False
         try:
@@ -2008,6 +2723,7 @@ class KubernetesProductionPublisher:
                 GateCheck("exact_rbac", True),
                 GateCheck("signed_cluster_identity", True),
                 GateCheck("server_side_dry_run", True),
+                GateCheck("storage_egress_dns_resolution_exact", True),
                 GateCheck("candidate_migration_completed", True),
                 GateCheck(
                     "exact_workload_images",
@@ -2025,6 +2741,8 @@ class KubernetesProductionPublisher:
                     "web_image": self.plan.web_image,
                     "cluster_uid_digest": self.cluster_uid_digest,
                     "kubernetes_api_ca_digest": self.kubernetes_api_ca_digest,
+                    "storage_egress_contract_digest": self.plan.storage_egress_contract.digest,
+                    "storage_egress_resolution_digest": self.storage_egress_resolution_digest,
                     "revisions": revisions,
                 },
                 checks=checks,

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
-
 from shadow_sandbox.common.models import canonical_digest
 from shadow_sandbox.evaluation.formal_benchmark import (
     FormalBenchmarkImporter,
@@ -22,7 +21,11 @@ from shadow_sandbox.operations.external_assurance import ExternalAssuranceImport
 from shadow_sandbox.operations.production_deployment import ProductionDeploymentPlan
 from shadow_sandbox.operations.supply_chain import ReleaseCandidate
 from shadow_sandbox.operations.trust_store import SignerTrustStore
-from tools.source_integrity import source_digest
+
+if __package__:
+    from .source_integrity import source_digest
+else:
+    from source_integrity import source_digest
 
 ROOT = Path(__file__).resolve().parents[1]
 INPUT = ROOT / "docs/evidence/batch-24/production-closure-input.json"

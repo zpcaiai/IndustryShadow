@@ -129,10 +129,14 @@ spec:
   replicas: 1
   selector: {matchLabels: {app: simulator}}
   template:
-    metadata: {labels: {app: simulator, plane: simulator}}
+    metadata:
+      labels:
+        app: simulator
+        plane: simulator
+        shadow-sandbox.io/storage-egress: regional-s3-sts
     spec:
       serviceAccountName: shadow-simulator-storage
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: simulator
@@ -142,6 +146,15 @@ spec:
             - configMapRef: {name: shadow-runtime}
             - configMapRef: {name: shadow-release-coordinates}
           env:
+            - {name: AWS_ROLE_ARN, value: replace-with-approved-simulator-storage-role-arn}
+            - {name: AWS_REGION, value: replace-with-approved-region}
+            - {name: AWS_DEFAULT_REGION, value: replace-with-approved-region}
+            - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token}
+            - {name: AWS_STS_REGIONAL_ENDPOINTS, value: regional}
+            - {name: AWS_S3_US_EAST_1_REGIONAL_ENDPOINT, value: regional}
+            - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+            - {name: AWS_CONFIG_FILE, value: /dev/null}
+            - {name: AWS_SHARED_CREDENTIALS_FILE, value: /dev/null}
             - name: SHADOW_INTERNAL_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef: {name: shadow-simulator-secrets, key: SHADOW_INTERNAL_SERVICE_TOKEN}
@@ -158,10 +171,16 @@ spec:
             limits: {cpu: "2", memory: 2Gi}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           volumeMounts:
+            - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}
             - {name: simulator-state, mountPath: /var/lib/shadow}
             - {name: simulator-pki, mountPath: /var/run/shadow-pki, readOnly: true}
             - {name: tmp, mountPath: /tmp}
       volumes:
+        - name: aws-iam-token
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}
         - name: simulator-pki
           secret: {secretName: shadow-simulator-pki, defaultMode: 0400}
         - {name: tmp, emptyDir: {sizeLimit: 256Mi}}

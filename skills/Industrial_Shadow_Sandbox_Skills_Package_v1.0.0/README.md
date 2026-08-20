@@ -82,10 +82,12 @@ SHADOW_ALLOW_LOCAL_RESTORE_DRILL=true make postgres-restore-test
 ```
 
 The command refuses non-loopback URLs, a non-empty or ambiguously named target, a source
-equal to the target, and invocations without the exact confirmation flag. It verifies a
-custom-format dump, migration history, per-table row fingerprints, RLS policy inventory,
-catalog integrity, archive size, and restore RTO. It is local evidence only and does not
-substitute for the managed PostgreSQL production gate.
+equal to the target, and invocations without the exact confirmation flag. It first creates
+an exported-snapshot custom backup, then exercises the same version-bound receipt, catalog,
+row, RLS, archive-size, RPO, and RTO restore path used by the production gate. Its
+process-local object backend explicitly simulates version IDs, KMS, and Object Lock and the
+result carries that limitation. It is local evidence only and does not substitute for live
+S3/KMS/Object Lock or a managed PostgreSQL production gate.
 
 ## Deployment and release boundary
 
@@ -139,7 +141,9 @@ catalog/ownership/ACL/default-ACL/RLS state before reporting equivalence, then r
 checks the exact runtime and backup role privilege matrices.
 The S3 gate performs its workload-identity checks inside distinct target Kubernetes backup
 and snapshot Pods: exact RBAC and annotated service accounts, projected
-`sts.amazonaws.com` tokens, `AssumeRoleWithWebIdentity`, purpose-specific KMS encryption
+`sts.amazonaws.com` tokens under the single EKS-standard `aws-iam-token` volume and
+`/var/run/secrets/eks.amazonaws.com/serviceaccount` read-only mount,
+`AssumeRoleWithWebIdentity`, purpose-specific KMS encryption
 contexts, exact-version and listing denial across workload prefixes, and required
 version/Object Lock disposition are all evidence inputs. These are fail-closed executable contracts only; live-provider OIDC,
 managed PostgreSQL, and real S3/KMS target execution remain `NOT_RUN`.

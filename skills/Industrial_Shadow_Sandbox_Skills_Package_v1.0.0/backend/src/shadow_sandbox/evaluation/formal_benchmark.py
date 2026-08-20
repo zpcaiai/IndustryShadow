@@ -16,6 +16,12 @@ from shadow_sandbox.evaluation.metrics.entities import EpisodeEvaluationInput
 from shadow_sandbox.evaluation.metrics.evaluator import Evaluator
 from shadow_sandbox.evaluation.metrics.gate import ReleaseGate
 from shadow_sandbox.operations.evidence import GateCheck, GateEvidence, complete
+from shadow_sandbox.operations.storage_probe import (
+    AWS_STORAGE_POLICY_DIGEST_FIELDS,
+    aws_partition_for_region,
+    aws_storage_policy_bundle_digest,
+    github_actions_caller_trust_contract,
+)
 from shadow_sandbox.operations.trust_store import SignerTrustStore
 from shadow_sandbox.scenarios import expand_mvp_benchmark
 
@@ -86,15 +92,19 @@ TARGET_PROFILE_KEYS = frozenset(
         "cluster_uid_digest",
         "kubernetes_api_ca_digest",
         "aws_account_id",
+        "aws_partition",
         "aws_region",
         "s3_bucket",
         "s3_probe_prefix",
+        "s3_control_plane_caller_trust_contract",
         "snapshot_object_storage_prefix",
         "backup_object_storage_prefix",
         "kms_key_id_digest",
         "backup_restore_receipt_digest",
         "backup_workload_identity_arn_digest",
         "snapshot_workload_identity_arn_digest",
+        *AWS_STORAGE_POLICY_DIGEST_FIELDS,
+        "aws_storage_policy_bundle_digest",
         "oidc_issuer",
         "oidc_audience_digest",
         "oidc_human_client_id_digest",
@@ -112,6 +122,7 @@ TARGET_PROFILE_KEYS = frozenset(
         "build_digest",
         "simulator_build_digest",
         "deployment_plan_digest",
+        "storage_egress_contract_digest",
     }
 )
 
@@ -126,7 +137,10 @@ STORAGE_DIGEST_FIELDS = (
     "kms_key_id_digest",
     "backup_workload_identity_arn_digest",
     "snapshot_workload_identity_arn_digest",
+    *sorted(AWS_STORAGE_POLICY_DIGEST_FIELDS),
+    "aws_storage_policy_bundle_digest",
     "deployment_plan_digest",
+    "storage_egress_contract_digest",
 )
 S3_CLOSURE_REQUIRED_METRICS = {
     "cloud_control_plane_verified": 1,
@@ -135,6 +149,7 @@ S3_CLOSURE_REQUIRED_METRICS = {
     "workload_identities_verified": 2,
     "target_pod_identities_verified": 2,
     "sentinel_bindings_verified": 2,
+    "aws_policy_digests_verified": 1,
 }
 S3_CLOSURE_REQUIRED_CHECKS = frozenset(
     {
@@ -144,11 +159,27 @@ S3_CLOSURE_REQUIRED_CHECKS = frozenset(
         "control_bucket_versioning",
         "control_public_access_block",
         "control_default_kms_encryption",
+        "control_s3_bucket_controls_exact_and_signed",
         "control_bucket_policy_not_public",
         "control_bucket_policy_tls_only",
+        "control_bucket_policy_workload_bound",
         "control_kms_key_enabled_and_pinned",
         "control_kms_automatic_rotation",
+        "control_kms_key_policy_least_privilege",
+        "control_kms_admin_role_management_only",
+        "control_kms_admin_role_trust_signed",
+        "control_kms_grants_absent",
         "control_aws_account_identity",
+        "control_aws_workload_identity",
+        "control_aws_irsa_oidc_provider_exact",
+        "control_s3_control_plane_caller_trust_contract_exact",
+        "control_s3_control_plane_caller_iam_role_trust_policy_signed",
+        "control_s3_control_plane_caller_iam_role_permissions_least_privilege",
+        "control_backup_iam_role_trust_exact",
+        "control_backup_iam_role_permissions_least_privilege",
+        "control_snapshot_iam_role_trust_exact",
+        "control_snapshot_iam_role_permissions_least_privilege",
+        "control_aws_policy_digests_signed",
         "control_lifecycle_policy",
         "control_lifecycle_acceptance_prefix",
         "control_lifecycle_snapshot_prefix",
@@ -196,18 +227,49 @@ S3_CLOSURE_REQUIRED_CHECKS = frozenset(
 )
 
 
+class StorageEgressContract(Protocol):
+    @property
+    def partition(self) -> str: ...
+
+    @property
+    def region(self) -> str: ...
+
+    @property
+    def digest(self) -> str: ...
+
+
 class ProductionStorageDeploymentPlan(Protocol):
-    digest: str
-    backend_image: str
-    snapshot_object_storage_prefix: str
-    backup_object_storage_prefix: str
-    backup_workload_identity_arn_digest: str
-    snapshot_workload_identity_arn_digest: str
+    @property
+    def digest(self) -> str: ...
+
+    @property
+    def backend_image(self) -> str: ...
+
+    @property
+    def snapshot_object_storage_prefix(self) -> str: ...
+
+    @property
+    def backup_object_storage_prefix(self) -> str: ...
+
+    @property
+    def object_storage_region(self) -> str: ...
+
+    @property
+    def object_storage_account_id(self) -> str: ...
+
+    @property
+    def backup_workload_identity_arn_digest(self) -> str: ...
+
+    @property
+    def snapshot_workload_identity_arn_digest(self) -> str: ...
+
+    @property
+    def storage_egress_contract(self) -> StorageEgressContract: ...
 
 
 def validate_production_storage_target(
     profile: Mapping[str, Any],
-) -> dict[str, str | int]:
+) -> dict[str, Any]:
     """Return the canonical, non-secret storage coordinates from a target profile."""
     if profile.get("schema_version") != 1:
         raise DomainError(
@@ -238,8 +300,16 @@ def validate_production_storage_target(
                     "target object-storage prefixes must be pairwise non-nested",
                 )
 
-    digests = {name: str(profile.get(name, "")) for name in STORAGE_DIGEST_FIELDS}
-    if any(not DIGEST.fullmatch(value) for value in digests.values()) or (
+    raw_digests = {name: profile.get(name) for name in STORAGE_DIGEST_FIELDS}
+    if any(
+        not isinstance(value, str) or not DIGEST.fullmatch(value) for value in raw_digests.values()
+    ):
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "storage target digests must be lowercase SHA-256 strings",
+        )
+    digests = {name: value for name, value in raw_digests.items() if isinstance(value, str)}
+    if (
         digests["backup_workload_identity_arn_digest"]
         == digests["snapshot_workload_identity_arn_digest"]
     ):
@@ -247,13 +317,24 @@ def validate_production_storage_target(
             "PRODUCTION_STORAGE_TARGET_INVALID",
             "storage target digests or workload identity separation are invalid",
         )
+    policy_digests = {name: digests[name] for name in AWS_STORAGE_POLICY_DIGEST_FIELDS}
+    if (
+        aws_storage_policy_bundle_digest(policy_digests)
+        != digests["aws_storage_policy_bundle_digest"]
+    ):
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "signed AWS storage policy bundle digest is invalid",
+        )
     account_id = str(profile.get("aws_account_id", ""))
+    partition = str(profile.get("aws_partition", ""))
     region = str(profile.get("aws_region", ""))
     bucket = str(profile.get("s3_bucket", ""))
     candidate_image = str(profile.get("candidate_image", ""))
     if (
         not re.fullmatch(r"\d{12}", account_id)
         or not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-[1-9][0-9]*", region)
+        or partition != aws_partition_for_region(region)
         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket)
         or not re.fullmatch(r"[^@\s]+@sha256:[a-f0-9]{64}", candidate_image)
     ):
@@ -261,12 +342,66 @@ def validate_production_storage_target(
             "PRODUCTION_STORAGE_TARGET_INVALID",
             "storage target cloud coordinates are invalid",
         )
+    raw_caller_trust_contract = profile.get(
+        "s3_control_plane_caller_trust_contract"
+    )
+    try:
+        caller_trust_contract = github_actions_caller_trust_contract(
+            account_id=account_id,
+            region=region,
+            repository=str(
+                raw_caller_trust_contract.get("repository", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+            repository_owner_id=str(
+                raw_caller_trust_contract.get("repository_owner_id", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+            repository_id=str(
+                raw_caller_trust_contract.get("repository_id", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+            ref=str(
+                raw_caller_trust_contract.get("ref", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+            environment=str(
+                raw_caller_trust_contract.get("environment", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+            workflow=str(
+                raw_caller_trust_contract.get("workflow", "")
+                if isinstance(raw_caller_trust_contract, Mapping)
+                else ""
+            ),
+        )
+    except DomainError as error:
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "signed caller trust contract is invalid",
+        ) from error
+    if (
+        raw_caller_trust_contract != caller_trust_contract
+        or digests["s3_control_plane_caller_trust_contract_digest"]
+        != canonical_digest(caller_trust_contract)
+    ):
+        raise DomainError(
+            "PRODUCTION_STORAGE_TARGET_INVALID",
+            "signed caller trust contract digest is invalid",
+        )
     return {
         "schema_version": 1,
         "candidate_image": candidate_image,
         "aws_account_id": account_id,
+        "aws_partition": partition,
         "aws_region": region,
         "s3_bucket": bucket,
+        "s3_control_plane_caller_trust_contract": caller_trust_contract,
         **prefixes,
         **digests,
     }
@@ -283,15 +418,33 @@ def production_storage_binding_digest(
         "candidate_image": str(deployment_plan.backend_image),
         "snapshot_object_storage_prefix": str(deployment_plan.snapshot_object_storage_prefix),
         "backup_object_storage_prefix": str(deployment_plan.backup_object_storage_prefix),
+        "object_storage_region": str(deployment_plan.object_storage_region),
+        "object_storage_account_id": str(deployment_plan.object_storage_account_id),
         "backup_workload_identity_arn_digest": str(
             deployment_plan.backup_workload_identity_arn_digest
         ),
         "snapshot_workload_identity_arn_digest": str(
             deployment_plan.snapshot_workload_identity_arn_digest
         ),
+        "storage_egress_contract_digest": str(deployment_plan.storage_egress_contract.digest),
+        "storage_egress_region": str(deployment_plan.storage_egress_contract.region),
+        "storage_egress_partition": str(deployment_plan.storage_egress_contract.partition),
     }
-    for name, value in plan.items():
-        if target.get(name) != value:
+    target_plan_fields = {
+        "deployment_plan_digest": target["deployment_plan_digest"],
+        "candidate_image": target["candidate_image"],
+        "snapshot_object_storage_prefix": target["snapshot_object_storage_prefix"],
+        "backup_object_storage_prefix": target["backup_object_storage_prefix"],
+        "object_storage_region": target["aws_region"],
+        "object_storage_account_id": target["aws_account_id"],
+        "backup_workload_identity_arn_digest": target["backup_workload_identity_arn_digest"],
+        "snapshot_workload_identity_arn_digest": target["snapshot_workload_identity_arn_digest"],
+        "storage_egress_region": target["aws_region"],
+        "storage_egress_partition": target["aws_partition"],
+        "storage_egress_contract_digest": target["storage_egress_contract_digest"],
+    }
+    for name, value in target_plan_fields.items():
+        if plan.get(name) != value:
             raise DomainError(
                 "PRODUCTION_STORAGE_BINDING_MISMATCH",
                 "sealed deployment plan and signed target storage coordinates differ",
@@ -334,6 +487,32 @@ def validate_s3_closure_evidence(
         raise DomainError(
             "CLOSURE_S3_BINDING_MISMATCH",
             "S3 evidence is not bound to the signed target profile and deployment plan",
+        )
+    target = validate_production_storage_target(profile)
+    raw_policy_digests = {
+        name: evidence.metrics.get(name) for name in AWS_STORAGE_POLICY_DIGEST_FIELDS
+    }
+    if any(
+        not isinstance(value, str) or not DIGEST.fullmatch(value)
+        for value in raw_policy_digests.values()
+    ):
+        raise DomainError(
+            "CLOSURE_S3_POLICY_BINDING_MISMATCH",
+            "S3 evidence AWS policy and caller digests are invalid",
+        )
+    observed_policy_digests = {
+        name: value for name, value in raw_policy_digests.items() if isinstance(value, str)
+    }
+    if (
+        observed_policy_digests != {name: target[name] for name in AWS_STORAGE_POLICY_DIGEST_FIELDS}
+        or evidence.metrics.get("aws_storage_policy_bundle_digest")
+        != target["aws_storage_policy_bundle_digest"]
+        or aws_storage_policy_bundle_digest(observed_policy_digests)
+        != target["aws_storage_policy_bundle_digest"]
+    ):
+        raise DomainError(
+            "CLOSURE_S3_POLICY_BINDING_MISMATCH",
+            "S3 evidence AWS policy and caller digests do not match the signed target",
         )
     sentinel_digests = {
         identity: evidence.metrics.get(f"{identity}_sentinel_binding_digest")
@@ -578,6 +757,8 @@ class FormalBenchmarkImporter:
             or not DIGEST.fullmatch(str(profile.get("cluster_uid_digest", "")))
             or not DIGEST.fullmatch(str(profile.get("kubernetes_api_ca_digest", "")))
             or not re.fullmatch(r"\d{12}", str(profile.get("aws_account_id", "")))
+            or profile.get("aws_partition")
+            != aws_partition_for_region(str(profile.get("aws_region", "")))
             or not re.fullmatch(
                 r"[a-z]{2}(?:-gov)?-[a-z]+-[1-9][0-9]*",
                 str(profile.get("aws_region", "")),
@@ -594,6 +775,8 @@ class FormalBenchmarkImporter:
                     "backup_restore_receipt_digest",
                     "backup_workload_identity_arn_digest",
                     "snapshot_workload_identity_arn_digest",
+                    *sorted(AWS_STORAGE_POLICY_DIGEST_FIELDS),
+                    "aws_storage_policy_bundle_digest",
                     "oidc_audience_digest",
                     "oidc_human_client_id_digest",
                     "oidc_service_client_ids_digest",
@@ -606,6 +789,7 @@ class FormalBenchmarkImporter:
                     "managed_postgresql_source_ca_identifier_digest",
                     "managed_postgresql_restore_ca_identifier_digest",
                     "deployment_plan_digest",
+                    "storage_egress_contract_digest",
                 )
             )
             or profile.get("managed_postgresql_provider") != "aws-rds"

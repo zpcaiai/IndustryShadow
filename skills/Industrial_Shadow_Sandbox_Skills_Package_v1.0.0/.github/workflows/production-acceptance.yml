@@ -49,6 +49,15 @@ jobs:
       SHADOW_OBJECT_STORAGE_KMS_KEY_ID: ${{ vars.SHADOW_OBJECT_STORAGE_KMS_KEY_ID }}
       SHADOW_BACKUP_OBJECT_STORAGE_PREFIX: ${{ vars.SHADOW_BACKUP_OBJECT_STORAGE_PREFIX }}
       SHADOW_AWS_ACCOUNT_ID: ${{ vars.SHADOW_AWS_ACCOUNT_ID }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_ARN: ${{ vars.SHADOW_S3_CONTROL_PLANE_CALLER_ARN }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY: ${{ github.repository }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID: ${{ github.repository_id }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF: ${{ github.ref }}
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT: production-acceptance
+      SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW: ${{ github.workflow }}
+      SHADOW_KMS_ADMIN_ROLE_ARN: ${{ vars.SHADOW_KMS_ADMIN_ROLE_ARN }}
+      SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN: ${{ vars.SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN }}
       SHADOW_REQUIRE_OBJECT_LOCK: "true"
       SHADOW_RESTORE_SOURCE_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_SOURCE_DATABASE_URL }}
       SHADOW_RESTORE_TARGET_DATABASE_URL: ${{ secrets.SHADOW_RESTORE_TARGET_DATABASE_URL }}
@@ -57,7 +66,10 @@ jobs:
       SHADOW_RESTORE_MAXIMUM_SECONDS: ${{ vars.SHADOW_RESTORE_MAXIMUM_SECONDS }}
       SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES: ${{ vars.SHADOW_RESTORE_MAXIMUM_ARCHIVE_BYTES }}
       SHADOW_RESTORE_MAXIMUM_RPO_SECONDS: ${{ vars.SHADOW_RESTORE_MAXIMUM_RPO_SECONDS }}
-      SHADOW_BACKUP_RESTORE_RECEIPT: ${{ secrets.SHADOW_BACKUP_RESTORE_RECEIPT }}
+      SHADOW_BACKUP_RESTORE_RECEIPT: ${{ runner.temp }}/industrial-shadow-backup-receipt-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+      SHADOW_BACKUP_JOB_NAMESPACE: ${{ vars.SHADOW_BACKUP_JOB_NAMESPACE }}
+      SHADOW_BACKUP_JOB_NAME: ${{ vars.SHADOW_BACKUP_JOB_NAME }}
+      SHADOW_BACKUP_JOB_UID: ${{ vars.SHADOW_BACKUP_JOB_UID }}
       SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE: ${{ secrets.SHADOW_POSTGRESQL_MIGRATION_DATABASES_FILE }}
       SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS: ${{ vars.SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_SECONDS }}
       SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS: ${{ vars.SHADOW_POSTGRESQL_MIGRATION_MAXIMUM_ROWS }}
@@ -216,6 +228,28 @@ jobs:
           test -f "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE"
           test ! -L "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE"
           install -m 0444 "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY_SOURCE" "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY"
+      - name: Collect the signed immutable backup receipt from its exact completed Job
+        run: |
+          receipt_directory="${SHADOW_BACKUP_RESTORE_RECEIPT%/*}"
+          test ! -e "$receipt_directory"
+          install -d -m 0700 "$receipt_directory"
+          python tools/collect_production_backup_receipt.py \
+            --context "$SHADOW_KUBERNETES_STORAGE_CONTEXT" \
+            --namespace "$SHADOW_BACKUP_JOB_NAMESPACE" \
+            --job-name "$SHADOW_BACKUP_JOB_NAME" \
+            --job-uid "$SHADOW_BACKUP_JOB_UID" \
+            --candidate-image "$SHADOW_CANDIDATE_IMAGE" \
+            --build-digest "$SHADOW_BUILD_DIGEST" \
+            --simulator-build-digest "$SHADOW_SIMULATOR_BUILD_DIGEST" \
+            --environment-digest "$SHADOW_PRODUCTION_ENVIRONMENT_DIGEST" \
+            --deployment-plan-digest "$SHADOW_DEPLOYMENT_PLAN_DIGEST" \
+            --formal-report "$SHADOW_FORMAL_BENCHMARK_REPORT" \
+            --deployment-plan "$SHADOW_PRODUCTION_DEPLOYMENT_PLAN" \
+            --trust-store "$SHADOW_ASSESSOR_TRUST_STORE" \
+            --trust-root-attestation "$SHADOW_ASSESSOR_TRUST_ROOT_ATTESTATION" \
+            --trust-root-public-key "$SHADOW_ASSESSOR_TRUST_ROOT_PUBLIC_KEY" \
+            --trust-root-key-sha256 "$SHADOW_ASSESSOR_TRUST_ROOT_KEY_SHA256" \
+            --output "$SHADOW_BACKUP_RESTORE_RECEIPT"
       - name: Install locked browser-journey dependencies
         working-directory: web
         run: npm ci --ignore-scripts
@@ -261,6 +295,53 @@ jobs:
         run: python tools/production_gate.py supply_chain --output docs/evidence/batch-24/production/supply_chain.json
       - name: Independently recompute formal 150-Episode exact-bundle Gate
         run: python tools/production_gate.py benchmark_150 --output docs/evidence/batch-24/production/benchmark_150.json
+      - name: Resolve the partition-exact AWS STS audience
+        id: caller-sts
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          case "$SHADOW_OBJECT_STORAGE_REGION" in
+            cn-*) audience=sts.amazonaws.com.cn ;;
+            us-gov-*|*) audience=sts.amazonaws.com ;;
+          esac
+          echo "audience=$audience" >> "$GITHUB_OUTPUT"
+      - name: Assume the sealed AWS control-plane caller with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708
+        with:
+          aws-region: ${{ env.SHADOW_OBJECT_STORAGE_REGION }}
+          role-to-assume: ${{ env.SHADOW_S3_CONTROL_PLANE_CALLER_ARN }}
+          role-session-name: industrial-shadow-${{ github.run_id }}-${{ github.run_attempt }}
+          audience: ${{ steps.caller-sts.outputs.audience }}
+          role-skip-session-tagging: true
+          unset-current-credentials: true
+          mask-aws-account-id: true
+          allowed-account-ids: ${{ env.SHADOW_AWS_ACCOUNT_ID }}
+      - name: Collect exact live AWS storage policy digests read-only
+        run: |
+          fragment="$RUNNER_TEMP/aws-storage-policy-target-${SHADOW_ACCEPTANCE_RUN_ID}.json"
+          test ! -e "$fragment"
+          python tools/collect_aws_storage_policy_digests.py \
+            --bucket "$SHADOW_OBJECT_STORAGE_BUCKET" \
+            --region "$SHADOW_OBJECT_STORAGE_REGION" \
+            --account-id "$SHADOW_AWS_ACCOUNT_ID" \
+            --kms-key-arn "$SHADOW_OBJECT_STORAGE_KMS_KEY_ID" \
+            --control-plane-caller-arn "$SHADOW_S3_CONTROL_PLANE_CALLER_ARN" \
+            --kms-admin-role-arn "$SHADOW_KMS_ADMIN_ROLE_ARN" \
+            --oidc-provider-arn "$SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN" \
+            --acceptance-prefix "$SHADOW_OBJECT_STORAGE_PREFIX" \
+            --backup-prefix "$SHADOW_BACKUP_OBJECT_STORAGE_PREFIX" \
+            --snapshot-prefix "$SHADOW_SNAPSHOT_OBJECT_STORAGE_PREFIX" \
+            --backup-sentinel-key "$SHADOW_BACKUP_FORBIDDEN_SENTINEL_KEY" \
+            --snapshot-sentinel-key "$SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY" \
+            --caller-trust-repository "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY" \
+            --caller-trust-repository-owner-id "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID" \
+            --caller-trust-repository-id "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID" \
+            --caller-trust-ref "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF" \
+            --caller-trust-environment "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT" \
+            --caller-trust-workflow "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW" \
+            --backup-role-arn "$SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN" \
+            --snapshot-role-arn "$SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN" \
+            --namespace "$SHADOW_BACKUP_JOB_NAMESPACE" > "$fragment"
+          install -m 0444 "$fragment" docs/evidence/batch-24/production/aws-storage-policy-target.json
       - name: Fail-closed non-mutating production input preflight
         run: python tools/production_gate.py preflight --output docs/evidence/batch-24/production/preflight.json
       - name: Authorize all live production probes

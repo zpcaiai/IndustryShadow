@@ -31,10 +31,21 @@ API CA, context, or plan namespace mismatch fails before mutation, and each gate
 credential whose exact least-privilege RBAC set belongs to another gate.
 
 The NetworkPolicy suite first verifies the runner's narrow probe RBAC and exact live-vs-approved
-policy set/specification. It then launches short-lived, credential-free pods with the same `app`
+policy set/specification. The same parser used by deployment-plan loading checks the storage
+policy's canonical, digest-bound regional S3/STS endpoint and CIDR assignment. The live gate
+then independently resolves both canonical A/AAAA sets and requires exact equality with the
+two TCP/443 rules; it records the resolution-set digest and fails closed on DNS errors or
+drift. It then launches short-lived, credential-free pods with the same `app`
 labels as each production plane, verifies allowed and denied destinations, captures
 digest-bound results, and deletes each probe pod. The exact confirmation value must be
 `<namespace>:network-policy`.
+If either regional endpoint rotates, the operator must regenerate the exact sorted CIDR sets,
+canonical contract annotation, manifest digest, and deployment-plan digest and then obtain new
+target-profile/release signatures. Editing the live policy or reusing the old signed bundle is
+not an accepted recovery path.
+The storage selector is shared only by the simulator, backup CronJob, and the two bounded
+storage-identity Jobs. Candidate and rollback parsing rejects a missing label, opt-in by any
+other workload, or a second storage route in the legacy simulator/data-job policies.
 The suite has distinct `real-ot-collector` and `simulator-collector` probes. The former must
 reach only the reviewed OT host (plus PostgreSQL) and must not reach the simulator; the latter
 must reach the simulator and must not reach the real-OT host.
@@ -73,3 +84,14 @@ AWS endpoints with IMDS disabled, validates the candidate image ID and sealed ev
 foreground-deletes both Jobs and all owned Pods. Runner profiles and runner-side WebIdentity
 token files are not evidence. The two forbidden sentinel keys must already exist under the
 opposite workload prefix and must not be readable by the identity being tested.
+The long-running simulator snapshot and backup CronJob separately disable ambient
+ServiceAccount automount and use the same exact audience-bound projection shape. Each literal
+role ARN must match its sealed ServiceAccount annotation in both candidate and rollback
+bundles. Regional STS and the `us-east-1` regional S3 mode are mandatory; acceptance Jobs do
+not retroactively prove that long-running workload contract. All three workload classes pin
+shared AWS config/credential files to `/dev/null`; long-running ConfigMap imports cannot add
+AWS, Boto, proxy, or CA-bundle overrides.
+The shared shape is the EKS IAM webhook convention: volume `aws-iam-token`, read-only mount
+`/var/run/secrets/eks.amazonaws.com/serviceaccount`, token file `token`, audience
+`sts.amazonaws.com`, expiration 3600 seconds, and mode `0400`. Admission must recognise that
+existing projection and may not leave a second projected token volume or mount.

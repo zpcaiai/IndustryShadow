@@ -10,25 +10,52 @@ spec:
     spec:
       backoffLimit: 2
       template:
-        metadata: {labels: {app: backup, plane: data}}
+        metadata:
+          labels:
+            app: backup
+            plane: data
+            shadow-sandbox.io/storage-egress: regional-s3-sts
         spec:
           restartPolicy: Never
           serviceAccountName: shadow-backup-storage
-          automountServiceAccountToken: true
+          automountServiceAccountToken: false
           securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
           containers:
             - name: backup
               image: registry.example.invalid/industrial-shadow/backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
               args: ["python", "-m", "shadow_sandbox.operations.backup_job"]
-              envFrom:
-                - configMapRef: {name: shadow-runtime}
               env:
+                - {name: AWS_ROLE_ARN, value: replace-with-approved-backup-storage-role-arn}
+                - {name: AWS_REGION, value: replace-with-approved-region}
+                - {name: AWS_DEFAULT_REGION, value: replace-with-approved-region}
+                - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token}
+                - {name: AWS_STS_REGIONAL_ENDPOINTS, value: regional}
+                - {name: AWS_S3_US_EAST_1_REGIONAL_ENDPOINT, value: regional}
+                - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+                - {name: AWS_CONFIG_FILE, value: /dev/null}
+                - {name: AWS_SHARED_CREDENTIALS_FILE, value: /dev/null}
+                - {name: SHADOW_ENVIRONMENT, value: production}
+                - {name: SHADOW_AWS_ACCOUNT_ID, value: replace-with-approved-aws-account-id}
+                - {name: SHADOW_OBJECT_STORAGE_BACKEND, value: s3}
+                - {name: SHADOW_OBJECT_STORAGE_BUCKET, value: replace-with-approved-private-bucket}
+                - {name: SHADOW_OBJECT_STORAGE_REGION, value: replace-with-approved-region}
+                - {name: SHADOW_OBJECT_STORAGE_KMS_KEY_ID, value: replace-with-approved-kms-key-arn}
+                - {name: SHADOW_BACKUP_OBJECT_STORAGE_PREFIX, value: industrial-shadow/production/backups}
+                - {name: SHADOW_DATABASE_BACKUP_ROLE, value: shadow_backup}
                 - name: SHADOW_DATABASE_URL
                   valueFrom:
                     secretKeyRef: {name: shadow-backup-secrets, key: SHADOW_DATABASE_URL}
               securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-              volumeMounts: [{name: tmp, mountPath: /tmp}]
+              volumeMounts:
+                - {name: aws-iam-token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
               resources:
                 requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 110Gi}
                 limits: {cpu: "1", memory: 1Gi, ephemeral-storage: 120Gi}
-          volumes: [{name: tmp, emptyDir: {sizeLimit: 120Gi}}]
+          volumes:
+            - name: aws-iam-token
+              projected:
+                defaultMode: 0400
+                sources:
+                  - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}
+            - {name: tmp, emptyDir: {sizeLimit: 120Gi}}

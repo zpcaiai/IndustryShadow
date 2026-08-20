@@ -20,12 +20,22 @@ from shadow_sandbox.common.opcua_readonly import (
     opcua_runtime_binding_digest,
 )
 from shadow_sandbox.common.secure_files import read_private_file
+from shadow_sandbox.evaluation.formal_benchmark import validate_production_storage_target
 
 from .backup_job import database_coordinate_digest
 from .evidence import GateCheck, GateEvidence, complete
 from .production_deployment import ProductionDeploymentPlan
 from .restore_drill import BackupRestoreReceipt
-from .storage_probe import s3_control_plane_mutation_confirmation
+from .storage_probe import (
+    AWS_STORAGE_POLICY_DIGEST_FIELDS,
+    IAM_OIDC_PROVIDER_ARN,
+    IAM_ROLE_ARN,
+    aws_partition_for_region,
+    aws_storage_policy_bundle_digest,
+    github_actions_caller_trust_contract,
+    normalized_iam_role_arn,
+    s3_control_plane_mutation_confirmation,
+)
 from .supply_chain import ReleaseCandidate
 from .trust_store import SignerTrustStore
 
@@ -85,6 +95,15 @@ REQUIRED_ENV = (
     "SHADOW_OBJECT_STORAGE_KMS_KEY_ID",
     "SHADOW_BACKUP_OBJECT_STORAGE_PREFIX",
     "SHADOW_AWS_ACCOUNT_ID",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_ARN",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT",
+    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW",
+    "SHADOW_KMS_ADMIN_ROLE_ARN",
+    "SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN",
     "SHADOW_REQUIRE_OBJECT_LOCK",
     "SHADOW_RESTORE_SOURCE_DATABASE_URL",
     "SHADOW_RESTORE_TARGET_DATABASE_URL",
@@ -406,6 +425,7 @@ class ProductionPreflight:
                     "PREFLIGHT_TARGET_PROFILE_INVALID", "target profile digest mismatch"
                 )
             target_profile = _json_file(str(target_path))
+            validate_production_storage_target(target_profile)
         except Exception:  # noqa: BLE001 - target bindings must fail preflight closed
             target_profile = None
         try:
@@ -545,6 +565,102 @@ class ProductionPreflight:
                 for right in storage_segments[index + 1 :]
             )
         )
+        caller_arn = self._value("SHADOW_S3_CONTROL_PLANE_CALLER_ARN")
+        kms_admin_role_arn = self._value("SHADOW_KMS_ADMIN_ROLE_ARN")
+        provider_arn = self._value("SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN")
+        account_id = self._value("SHADOW_AWS_ACCOUNT_ID")
+        caller_match = IAM_ROLE_ARN.fullmatch(caller_arn)
+        kms_admin_match = IAM_ROLE_ARN.fullmatch(kms_admin_role_arn)
+        provider_match = IAM_OIDC_PROVIDER_ARN.fullmatch(provider_arn)
+        workload_role_matches = {
+            name: IAM_ROLE_ARN.fullmatch(self._value(name))
+            for name in (
+                "SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN",
+                "SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN",
+            )
+        }
+        try:
+            expected_partition = aws_partition_for_region(
+                self._value("SHADOW_OBJECT_STORAGE_REGION")
+            )
+            caller_direct = normalized_iam_role_arn(caller_arn) == caller_arn
+        except DomainError:
+            expected_partition = ""
+            caller_direct = False
+        aws_storage_identity_contract = bool(
+            caller_match is not None
+            and caller_match.group(2) == account_id
+            and caller_match.group(1) == expected_partition
+            and caller_direct
+            and kms_admin_match is not None
+            and kms_admin_match.group(2) == account_id
+            and kms_admin_match.group(1) == expected_partition
+            and provider_match is not None
+            and provider_match.group(2) == account_id
+            and provider_match.group(1) == expected_partition
+            and all(
+                match is not None
+                and match.group(2) == account_id
+                and match.group(1) == expected_partition
+                for match in workload_role_matches.values()
+            )
+            and len(
+                {
+                    caller_arn,
+                    kms_admin_role_arn,
+                    self._value("SHADOW_BACKUP_WORKLOAD_IDENTITY_ARN"),
+                    self._value("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
+                }
+            )
+            == 4
+        )
+        try:
+            if target_profile is None:
+                raise DomainError(
+                    "PREFLIGHT_TARGET_PROFILE_INVALID",
+                    "signed target profile is unavailable",
+                )
+            signed_policy_digests = {
+                name: str(target_profile[name]) for name in AWS_STORAGE_POLICY_DIGEST_FIELDS
+            }
+            caller_trust_contract = github_actions_caller_trust_contract(
+                account_id=account_id,
+                region=self._value("SHADOW_OBJECT_STORAGE_REGION"),
+                repository=self._value(
+                    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY"
+                ),
+                repository_owner_id=self._value(
+                    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID"
+                ),
+                repository_id=self._value(
+                    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID"
+                ),
+                ref=self._value("SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REF"),
+                environment=self._value(
+                    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_ENVIRONMENT"
+                ),
+                workflow=self._value(
+                    "SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_WORKFLOW"
+                ),
+            )
+            aws_storage_policy_binding = bool(
+                target_profile.get("s3_control_plane_caller_arn_digest")
+                == canonical_digest({"caller_arn": caller_arn})
+                and target_profile.get("kms_admin_role_arn_digest")
+                == canonical_digest({"role_arn": kms_admin_role_arn})
+                and target_profile.get("aws_irsa_oidc_provider_arn_digest")
+                == canonical_digest({"provider_arn": provider_arn})
+                and target_profile.get("s3_control_plane_caller_trust_contract")
+                == caller_trust_contract
+                and target_profile.get(
+                    "s3_control_plane_caller_trust_contract_digest"
+                )
+                == canonical_digest(caller_trust_contract)
+                and target_profile.get("aws_storage_policy_bundle_digest")
+                == aws_storage_policy_bundle_digest(signed_policy_digests)
+            )
+        except (DomainError, KeyError, TypeError):
+            aws_storage_policy_binding = False
         policy_path = Path(str(network.get("policy_path", "")))
         policy_ready = policy_path.is_file() and not PLACEHOLDER.search(
             policy_path.read_text(encoding="utf-8") if policy_path.is_file() else ""
@@ -562,6 +678,16 @@ class ProductionPreflight:
             == deployment_plan.snapshot_workload_identity_arn_digest
             and target_profile.get("backup_workload_identity_arn_digest")
             == deployment_plan.backup_workload_identity_arn_digest
+            and target_profile.get("aws_region")
+            == deployment_plan.object_storage_region
+            == deployment_plan.storage_egress_contract.region
+            and target_profile.get("aws_account_id")
+            == deployment_plan.object_storage_account_id
+            == account_id
+            and deployment_plan.storage_egress_contract.partition == expected_partition
+            and target_profile.get("aws_partition") == expected_partition
+            and target_profile.get("storage_egress_contract_digest")
+            == deployment_plan.storage_egress_contract.digest
             and real_ot_probe_binding_digest == deployment_plan.real_ot_runtime_binding_digest
         )
         checks = (
@@ -645,9 +771,9 @@ class ProductionPreflight:
                 bool(re.fullmatch(r"\d{12}", self._value("SHADOW_AWS_ACCOUNT_ID")))
                 and bool(
                     re.fullmatch(
-                        rf"arn:(?:aws|aws-us-gov|aws-cn):kms:"
+                        rf"arn:{re.escape(expected_partition)}:kms:"
                         rf"{re.escape(self._value('SHADOW_OBJECT_STORAGE_REGION'))}:"
-                        rf"{re.escape(self._value('SHADOW_AWS_ACCOUNT_ID'))}:key/[A-Za-z0-9/_-]+",
+                        rf"{re.escape(self._value('SHADOW_AWS_ACCOUNT_ID'))}:key/[A-Za-z0-9-]+",
                         self._value("SHADOW_OBJECT_STORAGE_KMS_KEY_ID"),
                     )
                 )
@@ -661,6 +787,14 @@ class ProductionPreflight:
                 != self._value("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN"),
             ),
             GateCheck(
+                "aws_storage_identity_contract",
+                aws_storage_identity_contract,
+            ),
+            GateCheck(
+                "aws_storage_policy_binding",
+                aws_storage_policy_binding,
+            ),
+            GateCheck(
                 "s3_control_plane_mutation_authorization",
                 s3_control_plane_mutation_authorized,
             ),
@@ -672,6 +806,7 @@ class ProductionPreflight:
                 and target_profile.get("simulator_build_digest") == simulator_digest
                 and target_profile.get("deployment_plan_digest") == deployment_plan_digest
                 and target_profile.get("aws_account_id") == self._value("SHADOW_AWS_ACCOUNT_ID")
+                and target_profile.get("aws_partition") == expected_partition
                 and target_profile.get("aws_region") == self._value("SHADOW_OBJECT_STORAGE_REGION")
                 and target_profile.get("s3_bucket") == self._value("SHADOW_OBJECT_STORAGE_BUCKET")
                 and target_profile.get("s3_probe_prefix")
@@ -690,6 +825,19 @@ class ProductionPreflight:
                 == canonical_digest(
                     {"workload_identity_arn": self._value("SHADOW_SNAPSHOT_WORKLOAD_IDENTITY_ARN")}
                 )
+                and target_profile.get("s3_control_plane_caller_arn_digest")
+                == canonical_digest(
+                    {"caller_arn": self._value("SHADOW_S3_CONTROL_PLANE_CALLER_ARN")}
+                )
+                and target_profile.get("kms_admin_role_arn_digest")
+                == canonical_digest(
+                    {"role_arn": self._value("SHADOW_KMS_ADMIN_ROLE_ARN")}
+                )
+                and target_profile.get("aws_irsa_oidc_provider_arn_digest")
+                == canonical_digest(
+                    {"provider_arn": self._value("SHADOW_AWS_IRSA_OIDC_PROVIDER_ARN")}
+                )
+                and aws_storage_policy_binding
                 and backup_receipt is not None
                 and target_profile.get("backup_restore_receipt_digest")
                 == backup_receipt.receipt_digest
@@ -803,9 +951,12 @@ class ProductionPreflight:
             started_at=started,
             coordinates={
                 "input_contract_digest": canonical_digest(sorted(REQUIRED_ENV)),
-                "config_digests": {
-                    name: canonical_digest(value) for name, value in sorted(configs.items())
-                },
+                "config_digest": canonical_digest(
+                    {
+                        name: canonical_digest(value)
+                        for name, value in sorted(configs.items())
+                    }
+                ),
                 "oidc_browser_journey_target_digest": canonical_digest(
                     {
                         "acceptance_run_id": self._value("SHADOW_ACCEPTANCE_RUN_ID"),

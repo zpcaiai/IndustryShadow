@@ -8,10 +8,10 @@ import json
 import os
 import re
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 from shadow_sandbox.common.db import open_store
@@ -37,6 +37,13 @@ class NetworkNotification:
     source_timestamp: str
     server_timestamp: str
     status_code: str
+
+
+class CollectorNodeConfig(TypedDict):
+    node_id: str
+    signal_key: str
+    data_type: NotRequired[str]
+    sample_period_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +225,36 @@ def _timestamp(value: dt.datetime | None) -> str:
     return current.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
+def _typed_collector_node_config(
+    value: Mapping[str, str | int],
+) -> CollectorNodeConfig:
+    """Preserve the validated allowlist while narrowing each field for consumers."""
+
+    node_id = value.get("node_id")
+    signal_key = value.get("signal_key")
+    sample_period_ms = value.get("sample_period_ms")
+    data_type = value.get("data_type")
+    if (
+        not isinstance(node_id, str)
+        or not isinstance(signal_key, str)
+        or isinstance(sample_period_ms, bool)
+        or not isinstance(sample_period_ms, int)
+        or (data_type is not None and not isinstance(data_type, str))
+    ):
+        raise DomainError(
+            "COLLECTOR_NODE_ALLOWLIST_INVALID",
+            "validated collector NodeId mapping has inconsistent field types",
+        )
+    config: CollectorNodeConfig = {
+        "node_id": node_id,
+        "signal_key": signal_key,
+        "sample_period_ms": sample_period_ms,
+    }
+    if data_type is not None:
+        config["data_type"] = data_type
+    return config
+
+
 async def collect() -> None:
     required = (
         "SHADOW_COLLECTOR_IDENTITY",
@@ -260,14 +297,15 @@ async def collect() -> None:
             "COLLECTOR_SITE_BINDING_REQUIRED",
             "supply JSON Node allowlist and trusted Run binding",
         ) from exc
-    mapping_list = list(
-        validate_collector_node_allowlist(
+    mapping_list = [
+        _typed_collector_node_config(item)
+        for item in validate_collector_node_allowlist(
             mapping_list,
             maximum_nodes=int(os.environ.get("SHADOW_MAXIMUM_NODES", "500")),
             code="COLLECTOR_NODE_ALLOWLIST_INVALID",
         )
-    )
-    node_ids = [str(item["node_id"]) for item in mapping_list]
+    ]
+    node_ids = [item["node_id"] for item in mapping_list]
     context_fields = {"tenant_id", "workspace_id", "run_id", "scenario_id", "endpoint_id"}
     if not isinstance(context, dict) or any(
         not isinstance(context.get(field), str) or not context[field] for field in context_fields

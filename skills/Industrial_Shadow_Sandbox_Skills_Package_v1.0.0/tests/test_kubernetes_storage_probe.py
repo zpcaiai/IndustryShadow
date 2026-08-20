@@ -15,6 +15,7 @@ from shadow_sandbox.common.models import DomainError, canonical_digest, canonica
 from shadow_sandbox.operations.evidence import GateCheck, complete
 from shadow_sandbox.operations.kubernetes_storage_probe import (
     IRSA_MOUNT_PATH,
+    IRSA_TOKEN_DEFAULT_MODE,
     IRSA_TOKEN_PATH,
     SERVICE_ACCOUNTS,
     STORAGE_PROBE_RBAC,
@@ -22,6 +23,10 @@ from shadow_sandbox.operations.kubernetes_storage_probe import (
     run_inside_pod,
     run_kubernetes_storage_identity_probe,
     workload_target_coordinates,
+)
+from shadow_sandbox.operations.production_deployment import (
+    STORAGE_EGRESS_POD_LABEL_KEY,
+    STORAGE_EGRESS_POD_LABEL_VALUE,
 )
 from shadow_sandbox.operations.storage_probe import S3SentinelBinding
 
@@ -37,6 +42,8 @@ class FakeKubectlRunner:
         cleanup_failure: bool = False,
         rbac_mismatch: bool = False,
         irsa_projection_mismatch: bool = False,
+        irsa_environment_mismatch: bool = False,
+        storage_egress_label_mismatch: bool = False,
     ) -> None:
         self.fixture = fixture
         self.service_account_mismatch = service_account_mismatch
@@ -45,6 +52,8 @@ class FakeKubectlRunner:
         self.cleanup_failure = cleanup_failure
         self.rbac_mismatch = rbac_mismatch
         self.irsa_projection_mismatch = irsa_projection_mismatch
+        self.irsa_environment_mismatch = irsa_environment_mismatch
+        self.storage_egress_label_mismatch = storage_egress_label_mismatch
         self.commands: list[tuple[str, ...]] = []
         self.created_manifests: list[dict[str, Any]] = []
         self.jobs: dict[str, dict[str, Any]] = {}
@@ -70,10 +79,16 @@ class FakeKubectlRunner:
             pod_spec["volumes"][0]["projected"]["sources"][0]["serviceAccountToken"][
                 "audience"
             ] = "forbidden.invalid"
+        if self.irsa_environment_mismatch and identity == "backup":
+            next(
+                item
+                for item in container["env"]
+                if item["name"] == "AWS_STS_REGIONAL_ENDPOINTS"
+            )["value"] = "legacy"
         image_digest = str(container["image"]).rsplit("sha256:", 1)[1]
         if self.wrong_image_id and identity == "backup":
             image_digest = "0" * 64
-        return {
+        pod = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
@@ -103,6 +118,9 @@ class FakeKubectlRunner:
                 ],
             },
         }
+        if self.storage_egress_label_mismatch and identity == "backup":
+            pod["metadata"]["labels"].pop(STORAGE_EGRESS_POD_LABEL_KEY)
+        return pod
 
     def _evidence(self, manifest: Mapping[str, Any]) -> str:
         identity = self._identity_for_manifest(manifest)
@@ -384,6 +402,16 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
             identity = manifest["metadata"]["labels"][
                 "shadow-sandbox.io/storage-probe-identity"
             ]
+            self.assertEqual(
+                STORAGE_EGRESS_POD_LABEL_VALUE,
+                manifest["metadata"]["labels"][STORAGE_EGRESS_POD_LABEL_KEY],
+            )
+            self.assertEqual(
+                STORAGE_EGRESS_POD_LABEL_VALUE,
+                manifest["spec"]["template"]["metadata"]["labels"][
+                    STORAGE_EGRESS_POD_LABEL_KEY
+                ],
+            )
             self.assertEqual("batch/v1", manifest["apiVersion"])
             self.assertEqual("Job", manifest["kind"])
             self.assertEqual(0, manifest["spec"]["backoffLimit"])
@@ -405,6 +433,8 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
                     "AWS_WEB_IDENTITY_TOKEN_FILE": IRSA_TOKEN_PATH,
                     "AWS_REGION": self.fixture["region"],
                     "AWS_DEFAULT_REGION": self.fixture["region"],
+                    "AWS_CONFIG_FILE": "/dev/null",
+                    "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
                     "AWS_STS_REGIONAL_ENDPOINTS": "regional",
                     "AWS_EC2_METADATA_DISABLED": "true",
                     "AWS_S3_US_EAST_1_REGIONAL_ENDPOINT": "regional",
@@ -426,7 +456,7 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
                 {
                     "name": "aws-iam-token",
                     "projected": {
-                        "defaultMode": 420,
+                        "defaultMode": IRSA_TOKEN_DEFAULT_MODE,
                         "sources": [
                             {
                                 "serviceAccountToken": {
@@ -516,7 +546,7 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
 
         class Boto3:
             @staticmethod
-            def Session(*, region_name: str) -> Session:  # noqa: N802
+            def Session(*, region_name: str) -> Session:
                 return Session(region_name=region_name)
 
         for identity in ("backup", "snapshot"):
@@ -601,6 +631,22 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
 
     def test_irsa_projection_admission_drift_fails_closed_and_cleans_up(self) -> None:
         runner = FakeKubectlRunner(self.fixture, irsa_projection_mismatch=True)
+        with self.assertRaises(DomainError) as raised:
+            self._run(runner)
+        self.assertEqual("KUBERNETES_STORAGE_PROBE_POD_INVALID", raised.exception.code)
+        self.assertTrue(runner.created_manifests)
+        self.assertTrue(runner.deleted_probe_ids)
+
+    def test_storage_egress_label_admission_drift_fails_closed_and_cleans_up(self) -> None:
+        runner = FakeKubectlRunner(self.fixture, storage_egress_label_mismatch=True)
+        with self.assertRaises(DomainError) as raised:
+            self._run(runner)
+        self.assertEqual("KUBERNETES_STORAGE_PROBE_POD_INVALID", raised.exception.code)
+        self.assertTrue(runner.created_manifests)
+        self.assertTrue(runner.deleted_probe_ids)
+
+    def test_regional_sts_environment_drift_fails_closed_and_cleans_up(self) -> None:
+        runner = FakeKubectlRunner(self.fixture, irsa_environment_mismatch=True)
         with self.assertRaises(DomainError) as raised:
             self._run(runner)
         self.assertEqual("KUBERNETES_STORAGE_PROBE_POD_INVALID", raised.exception.code)

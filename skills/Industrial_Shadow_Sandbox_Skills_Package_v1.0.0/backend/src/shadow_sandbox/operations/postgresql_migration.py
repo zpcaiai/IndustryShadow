@@ -205,20 +205,34 @@ def _protected_snapshot(
 
 
 CATALOG_QUERIES = (
-    "SELECT table_name,column_name,ordinal_position,data_type,is_nullable,column_default "
-    "FROM information_schema.columns WHERE table_schema='public' "
-    "ORDER BY table_name,ordinal_position",
-    "SELECT conrelid::regclass::text AS table_name,conname,contype,pg_get_constraintdef(oid) AS definition "
-    "FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY 1,2",
-    "SELECT schemaname,tablename,indexname,indexdef FROM pg_indexes "
-    "WHERE schemaname='public' ORDER BY tablename,indexname",
-    "SELECT schemaname,tablename,policyname,permissive,roles,cmd,qual,with_check "
-    "FROM pg_policies WHERE schemaname='public' ORDER BY tablename,policyname",
-    "SELECT event_object_table,trigger_name,event_manipulation,action_statement "
-    "FROM information_schema.triggers WHERE trigger_schema='public' "
-    "ORDER BY event_object_table,trigger_name,event_manipulation",
-    "SELECT sequence_name,data_type,start_value,minimum_value,maximum_value,increment,cycle_option "
-    "FROM information_schema.sequences WHERE sequence_schema='public' ORDER BY sequence_name",
+    (
+        "SELECT table_name,column_name,ordinal_position,data_type,is_nullable,column_default "
+        "FROM information_schema.columns WHERE table_schema='public' "
+        "ORDER BY table_name,ordinal_position"
+    ),
+    (
+        "SELECT conrelid::regclass::text AS table_name,conname,contype,"
+        "pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+        "WHERE connamespace='public'::regnamespace ORDER BY 1,2"
+    ),
+    (
+        "SELECT schemaname,tablename,indexname,indexdef FROM pg_indexes "
+        "WHERE schemaname='public' ORDER BY tablename,indexname"
+    ),
+    (
+        "SELECT schemaname,tablename,policyname,permissive,roles,cmd,qual,with_check "
+        "FROM pg_policies WHERE schemaname='public' ORDER BY tablename,policyname"
+    ),
+    (
+        "SELECT event_object_table,trigger_name,event_manipulation,action_statement "
+        "FROM information_schema.triggers WHERE trigger_schema='public' "
+        "ORDER BY event_object_table,trigger_name,event_manipulation"
+    ),
+    (
+        "SELECT sequence_name,data_type,start_value,minimum_value,maximum_value,increment,"
+        "cycle_option FROM information_schema.sequences WHERE sequence_schema='public' "
+        "ORDER BY sequence_name"
+    ),
 )
 
 

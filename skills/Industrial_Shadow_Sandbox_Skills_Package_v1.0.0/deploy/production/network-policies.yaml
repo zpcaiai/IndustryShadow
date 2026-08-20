@@ -84,9 +84,6 @@ spec:
       ports: [{protocol: TCP, port: 8010}]
     - from: [{podSelector: {matchLabels: {app: simulator-collector, collector-target: simulator}}}]
       ports: [{protocol: TCP, port: 4840}]
-  egress:
-    - to: [{ipBlock: {cidr: 198.51.100.30/32}}]
-      ports: [{protocol: TCP, port: 443}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -125,21 +122,27 @@ spec:
   egress:
     - to: [{ipBlock: {cidr: 198.51.100.20/32}}]
       ports: [{protocol: TCP, port: 5432}]
-    - to: [{ipBlock: {cidr: 198.51.100.30/32}}]
-      ports: [{protocol: TCP, port: 443}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
-metadata: {name: storage-identity-probe-egress}
+metadata:
+  name: storage-identity-probe-egress
+  annotations:
+    industrial-shadow-storage-egress-contract: '{"partition":"aws","region":"us-east-1","s3_cidrs":["198.51.100.30/32"],"s3_endpoint":"s3.us-east-1.amazonaws.com","schema_version":1,"sts_cidrs":["198.51.100.31/32"],"sts_endpoint":"sts.us-east-1.amazonaws.com"}'
+    industrial-shadow-storage-egress-contract-sha256: 4262ccaf1e3f486883a34edac477c5fed3a2378c696b313700a34b04b05f60e7
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: industrial-shadow-storage-probe
+      shadow-sandbox.io/storage-egress: regional-s3-sts
   policyTypes: [Egress]
   egress:
-    # Fail-closed TEST-NET placeholder. The signed target overlay must replace
-    # this with the exact S3 and regional STS HTTPS endpoint addresses.
+    # Rule order and every peer are bound by the canonical annotation above.
+    # The signed target overlay must replace the fail-closed contract and both
+    # rules with the approved regional S3 and STS host CIDRs, then recompute its
+    # SHA-256 digest. No additional peer or port is accepted.
     - to:
         - {ipBlock: {cidr: 198.51.100.30/32}}
+      ports: [{protocol: TCP, port: 443}]
+    - to:
         - {ipBlock: {cidr: 198.51.100.31/32}}
       ports: [{protocol: TCP, port: 443}]
