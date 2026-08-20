@@ -61,6 +61,7 @@ def run(command: list[str], timeout_seconds: int = 900) -> tuple[int, str]:
 
 def main() -> int:
     evidence_started_at = time.time()
+    initial_integrity_manifest = source_manifest()
     evidence_database = ROOT / ".runtime/evidence.db"
     # This file is a generated, disposable evidence fixture. Starting from an
     # empty database makes the evidence command deterministic and repeatable.
@@ -347,6 +348,16 @@ def main() -> int:
     }
     overall_exit = 0 if all(item["exit_code"] == 0 for item in results) else 1
     integrity_manifest = source_manifest()
+    if integrity_manifest != initial_integrity_manifest:
+        changed_paths = sorted(
+            path
+            for path in set(initial_integrity_manifest) | set(integrity_manifest)
+            if initial_integrity_manifest.get(path) != integrity_manifest.get(path)
+        )
+        print("EVIDENCE_SOURCE_CHANGED_DURING_RUN")
+        for path in changed_paths:
+            print(f"- {path}")
+        return 1
     integrity_digest = source_digest(integrity_manifest)
     for number in range(1, 25):
         directory = ROOT / f"docs/evidence/batch-{number:02d}"
@@ -461,6 +472,11 @@ def main() -> int:
         manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+    if overall_exit:
+        print("Evidence commands failed:")
+        for item in results:
+            if item["exit_code"] != 0:
+                print(f"- {item['name']}: exit {item['exit_code']}")
     return overall_exit
 
 

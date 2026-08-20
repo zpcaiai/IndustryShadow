@@ -60,6 +60,38 @@ run because the shared host is still inside an exclusive low-disk resource windo
 large pytest, npm, image-build, or Docker workload is started while that window is active.
 Those prior baselines are not presented as verification of the current tree.
 
+When the shared host cannot safely run the complete matrix, the repository-visible CI
+workflow provides an explicit GitHub-hosted evidence refresh instead of weakening the
+source-integrity gate:
+
+```sh
+gh workflow run ci.yml --ref main -f refresh_evidence=true
+```
+
+The manual job uses locked Python and frontend dependencies, pinned browser and Kubernetes
+tooling, two disposable PostgreSQL 16 services, and the same Python, web, browser, audit,
+render, benchmark, restore, and hardened-container commands used by `make evidence`. It
+compares the complete source manifest before and after those commands, revalidates all 24
+partial manifests, and uploads only each manifest plus the regular files it declares. The
+artifact name and its internal binding include the workflow run ID, run attempt, source
+SHA, and source digest. A failed or source-drifting run uploads no refresh artifact. An
+operator must independently validate the immutable run/artifact metadata and staged file
+hashes before importing only `docs/evidence/batch-*`; the workflow never creates the
+production closure input and does not convert local smoke into production acceptance.
+After independently matching the downloaded ZIP SHA-256 to the unique artifact returned by
+the GitHub API, verify the safely extracted staging directory with the same fail-closed
+reader used by CI:
+
+```sh
+python tools/stage_evidence_refresh.py \
+  --verify-dir /absolute/path/to/evidence-refresh-staging \
+  --expected-repository OWNER/REPOSITORY \
+  --expected-workflow-ref 'OWNER/REPOSITORY/.github/workflows/ci.yml@refs/heads/main' \
+  --expected-run-id RUN_ID \
+  --expected-run-attempt RUN_ATTEMPT \
+  --expected-head-sha SOURCE_COMMIT_SHA
+```
+
 For the real PostgreSQL adapter and RLS probe, point only at a disposable database owned by
 a migration role:
 

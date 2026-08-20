@@ -42,6 +42,7 @@ WORKFLOW_PATH_BINDINGS = {
 }
 
 ARTIFACT_BINDING_FRAGMENTS = {
+    "ci.yml": ("evidence-refresh-${{ github.run_id }}-${{ github.run_attempt }}",),
     "release.yml": (
         "release-verification-${{ github.run_id }}-${{ github.run_attempt }}",
         "immutable-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
@@ -219,10 +220,28 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
             f"context: {PACKAGE_RELATIVE}",
             f"file: {PACKAGE_RELATIVE}/deploy/compose/Dockerfile.backend",
             f"file: {PACKAGE_RELATIVE}/deploy/compose/Dockerfile.web",
+            "workflow_dispatch:",
+            "refresh_evidence:",
+            "SHADOW_TEST_RESTORE_POSTGRESQL_URL:",
+            "postgresql+psycopg://shadow_test:shadow_restore_password@127.0.0.1:5433/shadow_restore_drill",
+            'SHADOW_ALLOW_LOCAL_RESTORE_DRILL: "true"',
+            "azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d",
+            "version: v1.32.2",
+            "python tools/build_evidence.py",
+            "python tools/validate_implementation.py",
+            "python tools/stage_evidence_refresh.py",
+            f"path: {PACKAGE_RELATIVE}/artifacts/evidence-refresh-staging",
         )
         for fragment in required:
             if fragment not in content:
                 errors.append(f"ci.yml: missing root path contract {fragment}")
+        refresh_job = content.split("\n  evidence-refresh:\n", 1)
+        if len(refresh_job) != 2:
+            errors.append("ci.yml: missing evidence-refresh job")
+        elif "if: always()" in refresh_job[1]:
+            errors.append(
+                "ci.yml: failed evidence-refresh jobs must not upload artifacts"
+            )
     if root_name == "production-acceptance.yml":
         required = (
             (
@@ -247,7 +266,7 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
             "Prepare pristine run-bound OIDC browser journey target",
             "Collect exact live AWS storage policy digests read-only",
             "aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708",
-            'role-to-assume: ${{ env.SHADOW_S3_CONTROL_PLANE_CALLER_ARN }}',
+            "role-to-assume: ${{ env.SHADOW_S3_CONTROL_PLANE_CALLER_ARN }}",
             "role-skip-session-tagging: true",
             "unset-current-credentials: true",
             'test "$GITHUB_REF" = refs/heads/main',
@@ -255,7 +274,7 @@ def _validate_contract(root_name: str, content: str) -> list[str]:
             '--snapshot-sentinel-key "$SHADOW_SNAPSHOT_FORBIDDEN_SENTINEL_KEY"',
             '--caller-trust-repository "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY"',
             (
-                '--caller-trust-repository-owner-id '
+                "--caller-trust-repository-owner-id "
                 '"$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_OWNER_ID"'
             ),
             '--caller-trust-repository-id "$SHADOW_S3_CONTROL_PLANE_CALLER_TRUST_REPOSITORY_ID"',
