@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import tools.source_integrity as source_integrity_module
 import tools.stage_evidence_refresh as stage_module
 from tools.source_integrity import source_digest
 from tools.stage_evidence_refresh import (
@@ -103,6 +104,49 @@ def _verify(staging: Path) -> Path:
         run_attempt=GITHUB_ENV["GITHUB_RUN_ATTEMPT"],
         head_sha=GITHUB_ENV["GITHUB_SHA"],
     )
+
+
+def test_source_manifest_ignores_generated_metadata_but_detects_source_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "backend/src"
+    source_root.mkdir(parents=True)
+    source = source_root / "example.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(source_integrity_module, "ROOT", tmp_path)
+    monkeypatch.setattr(source_integrity_module, "SOURCE_PATHS", ("backend/src",))
+
+    baseline_manifest = source_integrity_module.source_manifest()
+    baseline_digest = source_integrity_module.source_digest(baseline_manifest)
+    generated_files = (
+        source_root / "example.egg-info/PKG-INFO",
+        source_root / "example.dist-info/METADATA",
+        source_root / "__pycache__/example.cpython-312.pyc",
+        source_root / ".pytest_cache/v/cache/nodeids",
+        source_root / ".ruff_cache/content",
+        source_root / ".mypy_cache/content",
+        source_root / ".pyright/content",
+        source_root / ".runtime/state.json",
+        source_root / ".venv/pyvenv.cfg",
+        source_root / "legacy.pyc",
+        source_root / ".coverage",
+    )
+    for generated in generated_files:
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_bytes(b"generated environment metadata")
+
+    generated_manifest = source_integrity_module.source_manifest()
+    assert generated_manifest == baseline_manifest
+    assert source_integrity_module.source_digest(generated_manifest) == baseline_digest
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    changed_manifest = source_integrity_module.source_manifest()
+    assert changed_manifest.keys() == baseline_manifest.keys()
+    assert (
+        changed_manifest["backend/src/example.py"]
+        != baseline_manifest["backend/src/example.py"]
+    )
+    assert source_integrity_module.source_digest(changed_manifest) != baseline_digest
 
 
 def test_stages_exact_sorted_digest_bound_files_and_verifies_read_only(

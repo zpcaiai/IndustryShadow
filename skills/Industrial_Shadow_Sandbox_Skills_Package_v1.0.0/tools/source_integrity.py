@@ -31,6 +31,37 @@ SOURCE_PATHS = (
     "web/tsconfig.json",
     "web/vite.config.ts",
 )
+GENERATED_SOURCE_DIRECTORY_NAMES = frozenset(
+    {
+        "__pycache__",
+        ".eggs",
+        ".mypy_cache",
+        ".pyright",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".runtime",
+        ".venv",
+        "venv",
+    }
+)
+GENERATED_SOURCE_DIRECTORY_SUFFIXES = (".dist-info", ".egg-info")
+GENERATED_SOURCE_FILE_SUFFIXES = (".pyc", ".pyd", ".pyo")
+
+
+def _is_generated_source_path(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    if any(
+        part in GENERATED_SOURCE_DIRECTORY_NAMES
+        or part.endswith(GENERATED_SOURCE_DIRECTORY_SUFFIXES)
+        for part in relative.parts
+    ):
+        return True
+    name = relative.name
+    return (
+        name == ".coverage"
+        or name.startswith(".coverage.")
+        or name.endswith(GENERATED_SOURCE_FILE_SUFFIXES)
+    )
 
 
 def source_manifest() -> dict[str, str]:
@@ -39,7 +70,7 @@ def source_manifest() -> dict[str, str]:
         candidate = ROOT / relative
         paths = [candidate] if candidate.is_file() else candidate.rglob("*")
         for path in paths:
-            if path.is_file() and "__pycache__" not in path.parts:
+            if not _is_generated_source_path(path) and path.is_file():
                 result[path.relative_to(ROOT).as_posix()] = hashlib.sha256(
                     path.read_bytes()
                 ).hexdigest()
