@@ -28,6 +28,7 @@ PYTHONPATH = ":".join(
 )
 if os.environ.get("PYTHONPATH"):
     PYTHONPATH = f"{PYTHONPATH}:{os.environ['PYTHONPATH']}"
+TRAILING_LOG_WHITESPACE = re.compile(r"[ \t]+(?=\r?\n|\Z)")
 
 
 def sha256(path: Path) -> str:
@@ -54,6 +55,12 @@ def redacted_diagnostic_tail(output: str, *, maximum_characters: int = 8_000) ->
         redacted,
     )
     return redacted[-maximum_characters:]
+
+
+def normalize_log_output(output: str) -> str:
+    """Remove only line-ending spaces and tabs while preserving the log framing."""
+
+    return TRAILING_LOG_WHITESPACE.sub("", output)
 
 
 def run(command: list[str], timeout_seconds: int = 900) -> tuple[int, str]:
@@ -391,7 +398,7 @@ def main() -> int:
         command_entries: list[dict[str, Any]] = []
         for item in results:
             path = directory / item["name"]
-            path.write_text(item["output"], encoding="utf-8")
+            path.write_bytes(normalize_log_output(item["output"]).encode("utf-8"))
             artifacts.append(
                 {"path": str(path.relative_to(ROOT)), "sha256": sha256(path)}
             )
