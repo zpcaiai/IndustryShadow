@@ -11,24 +11,15 @@ from shadow_sandbox.common.sqlalchemy_store import SqlAlchemyStore
 
 ROLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
-
-def _roles(value: str) -> tuple[str, ...]:
-    roles = tuple(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
-    if not roles or any(not ROLE_NAME.fullmatch(item) for item in roles):
-        raise DomainError("DATABASE_ROLE_INVALID", "database role list is invalid")
-    return roles
-
-
-def _one_role(value: str) -> str:
-    roles = _roles(value)
-    if len(roles) != 1:
-        raise DomainError("DATABASE_ROLE_INVALID", "exactly one database role is required")
-    return roles[0]
-
-
-def role_access_matrix(store: SqlAlchemyStore, role: str) -> dict[str, Any]:
-    return store.query(
-        """WITH requested(role_name) AS (VALUES (?))
+ROLE_ACCESS_MATRIX_SQL = """WITH requested(role_name) AS (VALUES (?)),
+                                  public_sequences AS MATERIALIZED (
+                                    SELECT sequence.oid
+                                      FROM pg_class sequence
+                                      JOIN pg_namespace namespace
+                                        ON namespace.oid=sequence.relnamespace
+                                     WHERE namespace.nspname='public'
+                                       AND sequence.relkind='S'
+                                  )
            SELECT has_database_privilege(role_name, current_database(), 'CONNECT')
                     AS database_connect,
                   has_database_privilege(role_name, current_database(), 'TEMP')
@@ -71,33 +62,40 @@ def role_access_matrix(store: SqlAlchemyStore, role: str) -> dict[str, Any]:
                        OR has_table_privilege(role_name, relation.oid, 'REFERENCES')
                        OR has_table_privilege(role_name, relation.oid, 'TRIGGER')))
                     AS table_elevated,
-                  (SELECT COUNT(*) FROM pg_class sequence
-                    JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace
-                   WHERE namespace.nspname='public' AND sequence.relkind='S')
-                    AS sequence_count,
-                  (SELECT COUNT(*) FROM pg_class sequence
-                    JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace
-                   WHERE namespace.nspname='public' AND sequence.relkind='S'
-                     AND has_sequence_privilege(role_name, sequence.oid, 'USAGE'))
+                  (SELECT COUNT(*) FROM public_sequences) AS sequence_count,
+                  (SELECT COUNT(*) FROM public_sequences sequence
+                    WHERE has_sequence_privilege(role_name, sequence.oid, 'USAGE'))
                     AS sequence_usage,
-                  (SELECT COUNT(*) FROM pg_class sequence
-                    JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace
-                   WHERE namespace.nspname='public' AND sequence.relkind='S'
-                     AND has_sequence_privilege(role_name, sequence.oid, 'SELECT'))
+                  (SELECT COUNT(*) FROM public_sequences sequence
+                    WHERE has_sequence_privilege(role_name, sequence.oid, 'SELECT'))
                     AS sequence_select,
-                  (SELECT COUNT(*) FROM pg_class sequence
-                    JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace
-                   WHERE namespace.nspname='public' AND sequence.relkind='S'
-                     AND has_sequence_privilege(role_name, sequence.oid, 'UPDATE'))
+                  (SELECT COUNT(*) FROM public_sequences sequence
+                    WHERE has_sequence_privilege(role_name, sequence.oid, 'UPDATE'))
                     AS sequence_update,
                   (SELECT COUNT(*) FROM pg_proc routine
                     JOIN pg_namespace namespace ON namespace.oid=routine.pronamespace
                    WHERE namespace.nspname='public'
                      AND has_function_privilege(role_name, routine.oid, 'EXECUTE'))
                     AS routine_execute
-             FROM requested""",
-        (role,),
-    )[0]
+             FROM requested"""
+
+
+def _roles(value: str) -> tuple[str, ...]:
+    roles = tuple(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
+    if not roles or any(not ROLE_NAME.fullmatch(item) for item in roles):
+        raise DomainError("DATABASE_ROLE_INVALID", "database role list is invalid")
+    return roles
+
+
+def _one_role(value: str) -> str:
+    roles = _roles(value)
+    if len(roles) != 1:
+        raise DomainError("DATABASE_ROLE_INVALID", "exactly one database role is required")
+    return roles[0]
+
+
+def role_access_matrix(store: SqlAlchemyStore, role: str) -> dict[str, Any]:
+    return store.query(ROLE_ACCESS_MATRIX_SQL, (role,))[0]
 
 
 def role_matrix_is_exact(row: Mapping[str, Any], *, read_write: bool) -> bool:
@@ -258,9 +256,7 @@ class DatabaseRoleConfigurator:
             )
         database = str(self.store.query("SELECT current_database() AS database")[0]["database"])
         quoted_database = database.replace('"', '""')
-        self.store.execute(
-            f'REVOKE CONNECT, TEMPORARY ON DATABASE "{quoted_database}" FROM PUBLIC'
-        )
+        self.store.execute(f'REVOKE CONNECT, TEMPORARY ON DATABASE "{quoted_database}" FROM PUBLIC')
         self.store.execute("REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC")
         self.store.execute("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC")
         self.store.execute("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC")
@@ -278,9 +274,7 @@ class DatabaseRoleConfigurator:
             self.store.execute(
                 f'REVOKE ALL PRIVILEGES ON DATABASE "{quoted_database}" FROM "{name}"'
             )
-            self.store.execute(
-                f'REVOKE ALL PRIVILEGES ON SCHEMA public FROM "{name}"'
-            )
+            self.store.execute(f'REVOKE ALL PRIVILEGES ON SCHEMA public FROM "{name}"')
             self.store.execute(
                 f'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM "{name}"'
             )
@@ -337,10 +331,7 @@ class DatabaseRoleConfigurator:
         self.store.execute(
             f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO "{self.backup_role}"'
         )
-        matrices = {
-            name: role_access_matrix(self.store, name)
-            for name in names
-        }
+        matrices = {name: role_access_matrix(self.store, name) for name in names}
         invalid = [
             name
             for name, matrix in matrices.items()
