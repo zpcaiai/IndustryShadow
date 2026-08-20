@@ -209,10 +209,16 @@ class OtProductionHardeningTests(unittest.TestCase):
             self.assertIn("collector-session-health", readiness_command)
             self.assertIn("collector-ingestion-health", readiness_command)
             self.assertIn("collector-session-health", liveness_command)
+            self.assertFalse(
+                any("secretRef" in source for source in container.get("envFrom", []))
+            )
             secret_refs.update(
-                source["secretRef"]["name"]
-                for source in container["envFrom"]
-                if "secretRef" in source
+                secret_ref["name"]
+                for item in container.get("env", [])
+                if isinstance(item.get("valueFrom"), dict)
+                and isinstance(
+                    secret_ref := item["valueFrom"].get("secretKeyRef"), dict
+                )
             )
             pki_secrets.update(
                 volume["secret"]["secretName"]

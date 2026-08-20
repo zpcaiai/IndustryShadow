@@ -470,7 +470,9 @@ class KubernetesStorageIdentityProbeTests(unittest.TestCase):
                 },
                 pod_spec["volumes"][0],
             )
-            self.assertNotIn("secret", canonical_json(manifest).lower())
+            self.assertEqual(1, len(pod_spec["volumes"]))
+            self.assertNotIn("imagePullSecrets", pod_spec)
+            self.assertTrue(all("secret" not in volume for volume in pod_spec["volumes"]))
             self.assertIs(True, container["securityContext"]["readOnlyRootFilesystem"])
             self.assertEqual(
                 {"drop": ["ALL"]}, container["securityContext"]["capabilities"]

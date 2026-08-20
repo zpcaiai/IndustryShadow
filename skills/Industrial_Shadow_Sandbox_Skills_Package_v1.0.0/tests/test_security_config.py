@@ -48,12 +48,9 @@ class SecurityConfigurationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(API_ROUTE_CONTRACT), actual)
             authorization_probe_path = "/api/v1/authorization-probe/{capability}"
             self.assertNotIn(authorization_probe_path, schema["paths"])
-            self.assertTrue(
-                any(
-                    getattr(route, "path", "") == authorization_probe_path
-                    and "GET" in (getattr(route, "methods", set()) or set())
-                    for route in app.routes
-                )
+            self.assertEqual(
+                "/api/v1/authorization-probe/viewer",
+                str(app.url_path_for("authorization_probe", capability="viewer")),
             )
             app.state.store.close()
 
