@@ -125,7 +125,7 @@ class PostgreSqlBackupSnapshot(AbstractContextManager["PostgreSqlBackupSnapshot"
             import psycopg
             from psycopg.rows import dict_row
 
-            connection = psycopg.connect(
+            connection = psycopg.Connection[dict[str, Any]].connect(
                 **self.connection_parameters,
                 autocommit=True,
                 row_factory=dict_row,
