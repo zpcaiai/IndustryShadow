@@ -104,8 +104,10 @@ The probe creates a temporary non-owner `NOBYPASSRLS` role and validates migrati
 tenant visibility, child rows, Outbox isolation, and workspace-scoped idempotency. Do not
 run it against an application database containing production data.
 
-For a local dump/restore integrity drill, create a separate empty database whose name
-contains `restore_drill`, keep both URLs on loopback, and opt in explicitly:
+For a local dump/restore integrity drill, use two distinct disposable PostgreSQL clusters.
+The source database name must explicitly contain `test`, `fixture`, or `smoke`; the separate
+empty target database name must contain `restore_drill`. Keep both URLs on loopback and opt
+in explicitly:
 
 ```sh
 SHADOW_TEST_POSTGRESQL_URL='postgresql+psycopg://.../shadow_test?sslmode=disable' \
@@ -113,13 +115,19 @@ SHADOW_TEST_RESTORE_POSTGRESQL_URL='postgresql+psycopg://.../shadow_restore_dril
 SHADOW_ALLOW_LOCAL_RESTORE_DRILL=true make postgres-restore-test
 ```
 
-The command refuses non-loopback URLs, a non-empty or ambiguously named target, a source
-equal to the target, and invocations without the exact confirmation flag. It first creates
-an exported-snapshot custom backup, then exercises the same version-bound receipt, catalog,
-row, RLS, archive-size, RPO, and RTO restore path used by the production gate. Its
-process-local object backend explicitly simulates version IDs, KMS, and Object Lock and the
-result carries that limitation. It is local evidence only and does not substitute for live
-S3/KMS/Object Lock or a managed PostgreSQL production gate.
+The command refuses non-loopback URLs, source and target databases on the same PostgreSQL
+cluster, a non-disposable source name, a non-empty or ambiguously named target, and
+invocations without the exact confirmation flag. Confirmation, cluster identity, and target
+emptiness are checked before any role, grant, backup, or restore mutation. It then creates
+matching disposable tenant, maintenance, and read-only `BYPASSRLS` backup roles in both
+local clusters, applies the exact runtime grant matrix, and runs the exported-snapshot dump
+through the backup role rather than either migration owner. The URLs must therefore identify
+disposable local administrators that may create and drop those temporary roles. Success and
+failure paths remove every temporary role and grant. The command then exercises the same
+version-bound receipt, catalog, row, RLS, archive-size, RPO, and RTO restore path used by the
+production gate. Its process-local object backend explicitly simulates version IDs, KMS, and
+Object Lock and the result carries that limitation. It is local evidence only and does not
+substitute for live S3/KMS/Object Lock or a managed PostgreSQL production gate.
 
 ## Deployment and release boundary
 
