@@ -175,10 +175,7 @@ class BackupRestoreReceipt:
         )
         archive_parts = archive.key.split("/")
         archive_name_digest = archive_parts[-1].removesuffix(".dump")
-        if (
-            len(archive_parts) != 3
-            or archive_name_digest != archive.sha256
-        ):
+        if len(archive_parts) != 3 or archive_name_digest != archive.sha256:
             raise DomainError(
                 "BACKUP_RECEIPT_INVALID",
                 "backup archive key is not bound to its checksum",
@@ -612,7 +609,7 @@ CATALOG_QUERIES: tuple[tuple[str, str], ...] = (
                   attribute.attgenerated::text AS generated_kind,
                   attribute.attstorage::text AS storage_kind,
                   attribute.attstattarget AS statistics_target,
-                  COALESCE(collation.collname, '') AS collation,
+                  COALESCE(collation_object.collname, '') AS collation,
                   COALESCE(pg_get_expr(default_value.adbin, default_value.adrelid, true), '')
                     AS default_expression
              FROM pg_attribute attribute
@@ -621,7 +618,8 @@ CATALOG_QUERIES: tuple[tuple[str, str], ...] = (
         LEFT JOIN pg_attrdef default_value
                ON default_value.adrelid=attribute.attrelid
               AND default_value.adnum=attribute.attnum
-        LEFT JOIN pg_collation collation ON collation.oid=attribute.attcollation
+        LEFT JOIN pg_collation collation_object
+               ON collation_object.oid=attribute.attcollation
             WHERE namespace.nspname='public'
               AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
               AND attribute.attnum > 0
@@ -780,13 +778,14 @@ CATALOG_SECURITY_QUERIES: tuple[tuple[str, str], ...] = (
                   type_object.typnotnull AS not_null,
                   format_type(type_object.typbasetype, type_object.typtypmod) AS base_type,
                   COALESCE(format_type(type_object.typelem, NULL), '') AS element_type,
-                  COALESCE(collation.collname, '') AS collation,
+                  COALESCE(collation_object.collname, '') AS collation,
                   COALESCE(type_object.typdefault, '') AS default_value,
                   owner.rolname AS owner
              FROM pg_type type_object
              JOIN pg_namespace namespace ON namespace.oid=type_object.typnamespace
              JOIN pg_roles owner ON owner.oid=type_object.typowner
-        LEFT JOIN pg_collation collation ON collation.oid=type_object.typcollation
+        LEFT JOIN pg_collation collation_object
+               ON collation_object.oid=type_object.typcollation
             WHERE namespace.nspname='public'
          ORDER BY type_object.typname COLLATE \"C\"""",
     ),

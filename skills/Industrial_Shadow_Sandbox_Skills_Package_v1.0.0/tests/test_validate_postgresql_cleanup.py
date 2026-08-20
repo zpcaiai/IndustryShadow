@@ -8,6 +8,10 @@ from unittest.mock import patch
 
 from shadow_sandbox.common import DomainError
 from shadow_sandbox.operations.database_roles import ROLE_ACCESS_MATRIX_SQL
+from shadow_sandbox.operations.restore_drill import (
+    CATALOG_QUERIES,
+    CATALOG_SECURITY_QUERIES,
+)
 
 from tools.postgresql_test_roles import temporary_postgresql_test_role
 from tools.validate_local_postgresql_restore import (
@@ -40,6 +44,13 @@ class _ClusterStore:
 
 
 class PostgreSqlValidatorCleanupTests(unittest.TestCase):
+    def test_catalog_queries_do_not_use_collation_as_a_table_alias(self) -> None:
+        catalog_sql = "\n".join(
+            sql for _name, sql in (*CATALOG_QUERIES, *CATALOG_SECURITY_QUERIES)
+        )
+        self.assertNotIn("collation.collname", catalog_sql)
+        self.assertEqual(2, catalog_sql.count("collation_object.collname"))
+
     def test_sequence_privilege_checks_only_use_materialized_sequence_oids(
         self,
     ) -> None:
