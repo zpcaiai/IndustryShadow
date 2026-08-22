@@ -29,6 +29,7 @@ PYTHONPATH = ":".join(
 if os.environ.get("PYTHONPATH"):
     PYTHONPATH = f"{PYTHONPATH}:{os.environ['PYTHONPATH']}"
 TRAILING_LOG_WHITESPACE = re.compile(r"[ \t]+(?=\r?\n|\Z)")
+ANSI_CSI_SEQUENCE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
 
 
 def sha256(path: Path) -> str:
@@ -61,6 +62,14 @@ def normalize_log_output(output: str) -> str:
     """Remove only line-ending spaces and tabs while preserving the log framing."""
 
     return TRAILING_LOG_WHITESPACE.sub("", output)
+
+
+def ansi_stripped_metric_count(output: str, pattern: str) -> int:
+    """Extract one count after removing CSI formatting from a parsing-only copy."""
+
+    plain_output = ANSI_CSI_SEQUENCE.sub("", output)
+    match = re.search(pattern, plain_output)
+    return int(match.group(1)) if match else 0
 
 
 def run(command: list[str], timeout_seconds: int = 900) -> tuple[int, str]:
@@ -262,28 +271,28 @@ def main() -> int:
             }
         )
     tests_output = results[0]["output"]
-    match = re.search(r"(\d+) passed", tests_output)
-    passed = int(match.group(1)) if match and results[0]["exit_code"] == 0 else 0
-    skipped_match = re.search(r"(\d+) skipped", tests_output)
-    skipped = int(skipped_match.group(1)) if skipped_match else 0
+    passed = (
+        ansi_stripped_metric_count(tests_output, r"(\d+)\s+passed")
+        if results[0]["exit_code"] == 0
+        else 0
+    )
+    skipped = ansi_stripped_metric_count(tests_output, r"(\d+)\s+skipped")
     frontend_test_result = next(
         item for item in results if item["name"] == "frontend-tests.log"
     )
-    frontend_match = re.search(
-        r"Tests\s+(\d+)\s+passed", frontend_test_result["output"]
-    )
     frontend_passed = (
-        int(frontend_match.group(1))
-        if frontend_match and frontend_test_result["exit_code"] == 0
+        ansi_stripped_metric_count(
+            frontend_test_result["output"], r"Tests\s+(\d+)\s+passed"
+        )
+        if frontend_test_result["exit_code"] == 0
         else 0
     )
     browser_test_result = next(
         item for item in results if item["name"] == "browser-e2e.log"
     )
-    browser_match = re.search(r"(\d+) passed", browser_test_result["output"])
     browser_passed = (
-        int(browser_match.group(1))
-        if browser_match and browser_test_result["exit_code"] == 0
+        ansi_stripped_metric_count(browser_test_result["output"], r"(\d+)\s+passed")
+        if browser_test_result["exit_code"] == 0
         else 0
     )
     demo_summary_path = ROOT / "artifacts/evidence-demo/summary.json"
