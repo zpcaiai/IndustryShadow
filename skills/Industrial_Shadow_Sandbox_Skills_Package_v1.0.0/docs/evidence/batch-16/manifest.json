@@ -1,62 +1,62 @@
 {
   "batch": "16",
   "status": "partial",
-  "generated_at_epoch": 1786210368.0748942,
-  "source_digest": "05fc79a723937f3d52da6ecdd42bb7a2713e53e54c97571ae321aca6571373f7",
-  "source_file_count": 425,
+  "generated_at_epoch": 1787373349.5493748,
+  "source_digest": "ed2083379d159164d44a7168751ca5ecca7cae108092c866ffd9b7840ec4ce2b",
+  "source_file_count": 457,
   "commands": [
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pytest -q",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m pytest -q",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/core-tests.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python implement-industrial-shadow-sandbox/scripts/validate_batch_contracts.py implement-industrial-shadow-sandbox",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python implement-industrial-shadow-sandbox/scripts/validate_batch_contracts.py implement-industrial-shadow-sandbox",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/skill-package-validation.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m shadow_sandbox.cli schemas --output schemas",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m shadow_sandbox.cli schemas --output schemas",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/schema-generation.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/production_gate.py benchmark_local --output artifacts/measured-benchmark/gate-evidence.json --summary artifacts/measured-benchmark/summary.json",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/production_gate.py benchmark_local --output artifacts/measured-benchmark/gate-evidence.json --summary artifacts/measured-benchmark/summary.json",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/measured-benchmark.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m shadow_sandbox.cli demo --database .runtime/evidence.db --output artifacts/evidence-demo",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m shadow_sandbox.cli demo --database .runtime/evidence.db --output artifacts/evidence-demo",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/synthetic-demo.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m ruff check backend/src services tests tools",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m ruff check backend/src services tests tools",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/python-lint.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pyright backend/src services",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m pyright backend/src services",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/python-typecheck.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/generate_frontend_client.py --check",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/generate_frontend_client.py --check",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/frontend-contract.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.lock",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.lock",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/python-dependency-audit.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.runtime.lock",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python -m pip_audit --strict --disable-pip --require-hashes -r backend/requirements.runtime.lock",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/python-runtime-dependency-audit.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/build_runtime_sbom.py --output artifacts/python-runtime-sbom.cdx.json",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/build_runtime_sbom.py --output artifacts/python-runtime-sbom.cdx.json",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/python-runtime-sbom.log"
     },
@@ -86,17 +86,17 @@
       "log": "docs/evidence/batch-16/deployment-render.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_container_runtime.py --build",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/validate_container_runtime.py --build",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/container-runtime-smoke.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_postgresql.py",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/validate_postgresql.py",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/postgresql-validation.log"
     },
     {
-      "command": "/Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/.venv_min/bin/python tools/validate_local_postgresql_restore.py --output artifacts/local-postgresql-restore-evidence.json",
+      "command": "/opt/hostedtoolcache/Python/3.12.14/x64/bin/python tools/validate_local_postgresql_restore.py --output artifacts/local-postgresql-restore-evidence.json",
       "exit_code": 0,
       "log": "docs/evidence/batch-16/local-postgresql-restore.log"
     }
@@ -104,7 +104,7 @@
   "artifacts": [
     {
       "path": "docs/evidence/batch-16/core-tests.log",
-      "sha256": "e287585aba0905fb78467ed8b6a3e63adc40b4c3422a6169b94afeb6bfe8269f"
+      "sha256": "7d2447d97e1f3d1d9acc84b34d3c4eb1924246eb4443e1f33bfb97a04de2c063"
     },
     {
       "path": "docs/evidence/batch-16/skill-package-validation.log",
@@ -116,7 +116,7 @@
     },
     {
       "path": "docs/evidence/batch-16/measured-benchmark.log",
-      "sha256": "138ea3997ab15d500b26fdb452cf33e6fb774b82e275aeb2f133d21e8f48a231"
+      "sha256": "8050f38cc41677505db7e62f41017143c15c1621fe18957f94d2f6c8c5c4e74b"
     },
     {
       "path": "docs/evidence/batch-16/synthetic-demo.log",
@@ -148,15 +148,15 @@
     },
     {
       "path": "docs/evidence/batch-16/frontend-tests.log",
-      "sha256": "f90158d6aef611266888e394c6d7b6e1d89b8440e7265531e8fd545801d68d4a"
+      "sha256": "92d4db3d582b08418cb0c771f6bfcf85316e12662128f5453e6371bfb6b844a7"
     },
     {
       "path": "docs/evidence/batch-16/browser-e2e.log",
-      "sha256": "3b7a2b2fb6a66d412c52eaa6f113ad89fe47e4c3a53009c1376a1a2dc536e555"
+      "sha256": "9ede9b1a34caa50bfe040dfdea900cc5f3d67e9c05f9d9d31f0068456b3f5066"
     },
     {
       "path": "docs/evidence/batch-16/frontend-build.log",
-      "sha256": "32367ea289322fff96f1d3f73601ee1425d0c71ffb955662edcaed8f867eaf09"
+      "sha256": "0700bd7a8f5392635775db6c57e74563a17a6e17e50331eed4a3346f3ea7ff62"
     },
     {
       "path": "docs/evidence/batch-16/frontend-audit.log",
@@ -168,7 +168,7 @@
     },
     {
       "path": "docs/evidence/batch-16/container-runtime-smoke.log",
-      "sha256": "5bffe6335a5ac9826e0baa8b0f0bdbd399d73c587e72fdc1c2bc7e3dbb339fb4"
+      "sha256": "227c13e48bcd466ac7af52e40cd1823a7ae5f477c5ef2e19366205c655c2abee"
     },
     {
       "path": "docs/evidence/batch-16/postgresql-validation.log",
@@ -176,7 +176,7 @@
     },
     {
       "path": "docs/evidence/batch-16/local-postgresql-restore.log",
-      "sha256": "0419967abe0daff8dd6473c1e1067adae154aef4047216f234b9a6551d2fdefd"
+      "sha256": "559f4c280b4736edbf440f4b5794b2db0b9e717b8d5da5047a68c15dd917394c"
     },
     {
       "path": "docs/evidence/batch-16/synthetic-demo-summary.json",
@@ -186,13 +186,13 @@
   "tests": [
     {
       "suite": "pytest-core-unit-contract-safety-production-adapters",
-      "passed": 72,
+      "passed": 251,
       "failed": 0,
       "skipped": 0
     },
     {
       "suite": "vitest-frontend-api-client",
-      "passed": 15,
+      "passed": 26,
       "failed": 0,
       "skipped": 0
     },

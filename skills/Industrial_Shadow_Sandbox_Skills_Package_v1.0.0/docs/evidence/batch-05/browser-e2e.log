@@ -3,17 +3,15 @@
 > industrial-shadow-sandbox-web@0.1.0 test:e2e
 > playwright test
 
-[WebServer] (node:54649) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
-[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
 
-Running 5 tests using 1 worker
+Running 6 tests using 1 worker
 
-(node:54651) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
-(Use `node --trace-warnings ...` to show where the warning was created)
-  ✓  1 e2e/personas-accessibility.spec.ts:47:1 › six human personas receive permission-derived navigation (908ms)
-  ✓  2 e2e/personas-accessibility.spec.ts:64:1 › direct forbidden route remains fail-closed (583ms)
-  ✓  3 e2e/personas-accessibility.spec.ts:70:1 › authentication configuration failure never exposes the application shell (464ms)
-  ✓  4 e2e/personas-accessibility.spec.ts:88:1 › core shell has no automated WCAG A/AA violations (931ms)
-  ✓  5 e2e/personas-accessibility.spec.ts:95:1 › keyboard skip link and Chinese industrial labels work (612ms)
+  ✓  1 e2e/personas-accessibility.spec.ts:47:1 › six human personas receive permission-derived navigation (860ms)
+  ✓  2 e2e/personas-accessibility.spec.ts:64:1 › direct forbidden route remains fail-closed (475ms)
+  ✓  3 e2e/personas-accessibility.spec.ts:70:1 › authentication configuration failure never exposes the application shell (440ms)
+  ✓  4 e2e/personas-accessibility.spec.ts:88:1 › core shell has no automated WCAG A/AA violations (1.1s)
+  ✓  5 e2e/personas-accessibility.spec.ts:95:1 › keyboard skip link and Chinese industrial labels work (560ms)
+  -  6 e2e/production-oidc.spec.ts:160:1 › six personas complete signed S256 PKCE login, API use, and logout
 
-  5 passed (4.8s)
+  1 skipped
+  5 passed (6.7s)

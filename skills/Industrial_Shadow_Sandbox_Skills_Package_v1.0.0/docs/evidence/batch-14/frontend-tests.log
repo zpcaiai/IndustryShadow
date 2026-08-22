@@ -4,11 +4,21 @@
 > vitest run
 
 
- RUN  v4.1.10 /Users/stephen/Documents/Projects/python/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/web
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.10 [39m[90m/home/runner/work/IndustryShadow/IndustryShadow/skills/Industrial_Shadow_Sandbox_Skills_Package_v1.0.0/web[39m
 
+ [32m✓[39m tests/api.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 46[2mms[22m[39m
+ [32m✓[39m tests/navigation-i18n.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 16[2mms[22m[39m
+ [32m✓[39m tests/secure-private-json.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m tests/generated-contract.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m tests/oidc.test.ts [2m([22m[2m14 tests[22m[2m)[22m[33m 2876[2mms[22m[39m
+     [33m[2m✓[22m[39m accepts a valid asymmetric signature and exact OIDC claims [33m 318[2mms[22m[39m
+     [33m[2m✓[22m[39m rejects an unknown kid [33m 545[2mms[22m[39m
+     [33m[2m✓[22m[39m rejects invalid issuer, audience, time, and nonce claims [33m 476[2mms[22m[39m
+     [33m[2m✓[22m[39m reloads the remote JWKS when a new kid appears [33m 580[2mms[22m[39m
+     [33m[2m✓[22m[39m normalizes an external return target to the application root [32m 300[2mms[22m[39m
 
- Test Files  4 passed (4)
-      Tests  15 passed (15)
-   Start at  01:33:12
-   Duration  200ms (transform 141ms, setup 0ms, import 196ms, tests 61ms, environment 1ms)
+[2m Test Files [22m [1m[32m5 passed[39m[22m[90m (5)[39m
+[2m      Tests [22m [1m[32m26 passed[39m[22m[90m (26)[39m
+[2m   Start at [22m 04:36:56
+[2m   Duration [22m 3.26s[2m (transform 276ms, setup 0ms, import 608ms, tests 2.95s, environment 2ms)[22m
 
